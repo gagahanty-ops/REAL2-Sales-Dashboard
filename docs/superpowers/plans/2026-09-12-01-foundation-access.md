@@ -26,6 +26,7 @@
 
 **Files:**
 - Create: `package.json`
+- Create: `.nvmrc`
 - Create: `pnpm-workspace.yaml`
 - Create: `tsconfig.base.json`
 - Create: `vitest.workspace.ts`
@@ -37,9 +38,13 @@
 - Create: `apps/worker/tsconfig.json`
 - Create: `apps/worker/src/main.ts`
 - Create: `packages/domain/package.json`
+- Create: `packages/domain/src/index.ts`
 - Create: `packages/db/package.json`
+- Create: `packages/db/src/index.ts`
 - Create: `packages/integrations/package.json`
+- Create: `packages/integrations/src/index.ts`
 - Create: `packages/testkit/package.json`
+- Create: `packages/testkit/src/index.ts`
 - Test: `tests/repo/workspace.test.mjs`
 
 **Interfaces:**
@@ -50,23 +55,29 @@
 
 ```js
 // tests/repo/workspace.test.mjs
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-test("workspace exposes every mandatory quality command", async () => {
-  const pkg = JSON.parse(await readFile(new URL("../../package.json", import.meta.url)));
-  for (const name of ["lint", "typecheck", "test", "test:contracts", "test:integration", "test:security", "test:e2e", "build"]) {
-    assert.equal(typeof pkg.scripts[name], "string", `missing script ${name}`);
-  }
+test("pnpm discovers both apps and every shared package", () => {
+  const result = spawnSync("pnpm", ["-r", "list", "--depth", "-1", "--json"], {
+    cwd: new URL("../..", import.meta.url),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const names = JSON.parse(result.stdout).map((entry) => entry.name).sort();
+  assert.deepEqual(names, [
+    "@real2/db", "@real2/domain", "@real2/integrations", "@real2/testkit",
+    "@real2/web", "@real2/worker", "real2-sales-dashboard",
+  ]);
 });
 ```
 
 - [ ] **Step 2: Run the test and verify the missing root package failure**
 
-Run: `node --test tests/repo/workspace.test.mjs`
+Run: `npx --yes -p node@22.23.2 -p pnpm@10.34.5 node --test tests/repo/workspace.test.mjs`
 
-Expected: FAIL with `ENOENT` for `package.json`.
+Expected: FAIL because pnpm cannot discover the seven expected workspace projects.
 
 - [ ] **Step 3: Create the workspace manifests and minimal processes**
 
@@ -74,8 +85,8 @@ Expected: FAIL with `ENOENT` for `package.json`.
 {
   "name": "real2-sales-dashboard",
   "private": true,
-  "packageManager": "pnpm@10",
-  "engines": { "node": ">=22 <23" },
+  "packageManager": "pnpm@10.34.5",
+  "engines": { "node": "22.x" },
   "scripts": {
     "dev": "pnpm --parallel --filter @real2/web --filter @real2/worker dev",
     "lint": "pnpm -r lint",
@@ -95,6 +106,8 @@ Expected: FAIL with `ENOENT` for `package.json`.
 }
 ```
 
+`.nvmrc` contains exactly `22.23.2`. Each workspace package defines `lint`, `typecheck`, and `build`; test-bearing packages also define `test`. Each shared package exports only its focused `src/index.ts` public surface.
+
 ```yaml
 # pnpm-workspace.yaml
 packages:
@@ -106,14 +119,14 @@ The web root renders `РЕАЛ ДВА — дашборд отдела прода
 
 - [ ] **Step 4: Install, test, typecheck, and build**
 
-Run: `corepack enable && pnpm install && node --test tests/repo/workspace.test.mjs && pnpm typecheck && pnpm build`
+Run: `npx --yes -p node@22.23.2 -p pnpm@10.34.5 sh -c 'pnpm install && node --test tests/repo/workspace.test.mjs && pnpm typecheck && pnpm build'`
 
 Expected: every command exits 0 and `pnpm-lock.yaml` is created.
 
 - [ ] **Step 5: Commit the scaffold**
 
 ```bash
-git add package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json vitest.workspace.ts apps packages tests/repo
+git add .nvmrc package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json vitest.workspace.ts apps packages tests/repo
 git commit -m "build: scaffold REAL2 workspace"
 ```
 
