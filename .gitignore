@@ -1,0 +1,21 @@
+# Dependencies and builds
+node_modules/
+.next/
+dist/
+coverage/
+playwright-report/
+test-results/
+
+# Local and generated files
+.DS_Store
+tmp/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*service-account*.json
+*oauth*.json
