@@ -5,5 +5,12 @@
     "declarationMap": true,
     "noEmit": false,
     "sourceMap": true
-  }
+  },
+  "exclude": [
+    "**/*.contract.test.ts",
+    "**/*.integration.test.ts",
+    "**/*.security.test.ts",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
 }

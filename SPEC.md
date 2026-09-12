@@ -25,7 +25,7 @@ MVP не изменяет amoCRM ни при каких пользователь
 | Web/API | Next.js 16, React 19, TypeScript 5.9 |
 | UI | Tailwind CSS 4, shadcn/ui, Recharts 3 |
 | Validation | Zod 4 |
-| Database | Supabase Pro, PostgreSQL 16, RLS, ежедневные резервные копии, без автопаузы |
+| Database | Supabase Pro, PostgreSQL 17, RLS, ежедневные резервные копии, без автопаузы |
 | Auth | Supabase Auth с JWT claims, проверяемыми сервером и PostgreSQL RLS |
 | Worker | Node.js 22 LTS, отдельный процесс с Postgres advisory lock |
 | Deployment | Docker Compose: `web`, `worker`; внешняя управляемая БД |

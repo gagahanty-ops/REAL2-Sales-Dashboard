@@ -1,0 +1,1 @@
+-- Deterministic fixtures are inserted by integration tests.

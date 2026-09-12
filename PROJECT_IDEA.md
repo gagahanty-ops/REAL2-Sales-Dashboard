@@ -77,7 +77,7 @@ Versioned dashboard snapshot
 
 - **Web:** Next.js 16, React 19, TypeScript — серверный рендеринг внутреннего дашборда, типизированные маршруты и единый проект для UI/API.
 - **UI:** Tailwind CSS, shadcn/ui, Recharts — проверенный стек существующего Sales Analytics Dashboard.
-- **Database/Auth:** Supabase Pro: PostgreSQL 16, Auth, RLS и ежедневные резервные копии; бесплатный тариф с автопаузой для production запрещён.
+- **Database/Auth:** Supabase Pro: PostgreSQL 17, Auth, RLS и ежедневные резервные копии; бесплатный тариф с автопаузой для production запрещён.
 - **Sync worker:** отдельный Node.js-процесс на сервере, запускающий инкрементальную синхронизацию каждые 5 минут и полную сверку ночью.
 - **amoCRM:** внешняя OAuth-интеграция; прикладной клиент допускает только GET.
 - **Google Sheets:** Google Sheets API через отдельный service account, которому предоставлен доступ только к таблице-копии.

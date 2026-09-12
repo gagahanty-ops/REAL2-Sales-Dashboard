@@ -236,12 +236,16 @@ git commit -m "feat: validate server configuration"
 ### Task 3: Create identity tables and deny-by-default RLS
 
 **Files:**
+- Create: `supabase/config.toml`
+- Create: `supabase/seed.sql`
 - Create: `supabase/migrations/0001_identity_and_controls.sql`
 - Create: `packages/db/src/client.ts`
 - Create: `packages/db/src/identity.ts`
-- Create: `packages/db/src/index.ts`
+- Modify: `packages/db/src/index.ts`
+- Modify: `packages/db/package.json`
 - Test: `packages/db/src/identity.integration.test.ts`
 - Test: `tests/security/rls.security.test.ts`
+- Test helper: `tests/helpers/local-db.ts`
 
 **Interfaces:**
 - Consumes: Supabase JWT `sub`; service DB URL.
