@@ -8,3 +8,14 @@ test("worker starts idle without contacting an external system", async () => {
 
   assert.deepEqual(result, { status: "idle", networkRequests: 0 });
 });
+
+test("worker refuses enabled network switches before integrations are configured", async () => {
+  await assert.rejects(
+    () =>
+      runWorkerOnce({
+        SYNC_ENABLED: true,
+        SHEET_PUBLISH_ENABLED: false,
+      }),
+    /Network integrations are not configured/,
+  );
+});

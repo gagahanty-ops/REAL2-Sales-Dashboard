@@ -150,10 +150,12 @@ git commit -m "build: scaffold REAL2 workspace"
 **Files:**
 - Create: `packages/domain/src/env.ts`
 - Create: `packages/domain/src/env.test.ts`
-- Create: `packages/domain/src/index.ts`
+- Modify: `packages/domain/src/index.ts`
+- Modify: `packages/domain/package.json`
 - Create: `.env.example`
 - Modify: `apps/web/src/app/page.tsx`
 - Modify: `apps/worker/src/main.ts`
+- Modify: `apps/worker/src/main.test.mts`
 
 **Interfaces:**
 - Consumes: process environment as `Record<string, string | undefined>`.
@@ -201,7 +203,7 @@ const booleanFlag = z.enum(["true", "false"]).default("false").transform((value)
 
 const serverEnvSchema = z.object({
   APP_URL: z.url(),
-  DATABASE_URL: z.url({ protocol: /^postgres(ql)?:$/ }),
+  DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
   SUPABASE_URL: z.url(),
   SUPABASE_ANON_KEY: z.string().min(8),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(8),
