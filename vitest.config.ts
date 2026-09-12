@@ -2,6 +2,9 @@ import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    // Database suites share one disposable local database. Serial files keep
+    // their destructive fixtures isolated and also make CI deterministic.
+    fileParallelism: false,
     projects: [
       {
         test: {

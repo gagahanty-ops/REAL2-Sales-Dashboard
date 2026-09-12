@@ -10,6 +10,7 @@
     "onlyBuiltDependencies": ["esbuild"]
   },
   "scripts": {
+    "bootstrap:admin": "tsx scripts/bootstrap-admin.ts",
     "dev": "pnpm --parallel --filter @real2/web --filter @real2/worker dev",
     "lint": "pnpm --filter './apps/**' --filter './packages/**' run lint",
     "typecheck": "pnpm --filter './apps/**' --filter './packages/**' run typecheck",
@@ -26,6 +27,7 @@
     "@types/node": "^22.19.1",
     "eslint": "^10.0.0",
     "postgres": "^3.4.7",
+    "tsx": "^4.20.6",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.48.1",
     "vitest": "^3.2.4"

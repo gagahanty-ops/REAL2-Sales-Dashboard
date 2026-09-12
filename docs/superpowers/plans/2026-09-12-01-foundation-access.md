@@ -6,7 +6,7 @@
 
 **Architecture:** The web and worker processes share small workspace packages. Supabase Auth establishes identity, PostgreSQL RLS enforces row scope, and every API response uses one safe envelope with a trace ID. No external amoCRM or Google credential is required in this plan.
 
-**Tech Stack:** Node.js 22 LTS, pnpm 10, Next.js 16, React 19, TypeScript 5.9, Zod 4, Supabase Pro/PostgreSQL 16, Vitest, PGlite, Playwright, Docker Compose.
+**Tech Stack:** Node.js 22 LTS, pnpm 10, Next.js 16, React 19, TypeScript 5.9, Zod 4, Supabase Pro/PostgreSQL 17, Vitest, Playwright, Docker Compose.
 
 **Spec:** `SPEC.md` sections 0 and M1; `SECURITY_READ_ONLY.md` sections 6–8.
 
