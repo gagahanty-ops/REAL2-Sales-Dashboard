@@ -34,7 +34,8 @@
 
 ## Источники проектных решений
 
-- методология: `/Users/arlandorizzi/Desktop/Дашборд/spec_driven_dev.pdf`;
+- методология: [`docs/reference/spec_driven_dev.pdf`](docs/reference/spec_driven_dev.pdf);
+- сохранённые исходные скриншоты: [`docs/reference/README.md`](docs/reference/README.md);
 - текущая воронка amoCRM и фильтры, предоставленные заказчиком;
 - ручная таблица «Контакт-центр РЕАЛДВА — показатели менеджеров»;
 - паттерны из проектов NORD NAILS, Sales Analytics Dashboard, ColdCRM, DesignService и Art Praktika.
