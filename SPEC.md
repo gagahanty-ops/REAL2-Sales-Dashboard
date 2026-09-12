@@ -2,7 +2,9 @@
 
 > Слой 2 по Spec-First Methodology.
 >
-> Версия: 0.1. Дата: 2026-09-12. Статус: ожидает утверждения заказчиком.
+> Версия: 1.0.1. Дата: 2026-09-12. Статус: утверждена заказчиком 2026-09-12.
+>
+> Техническое уточнение 1.0.1: в M4.2 добавлено хранилище quarantine, уже требовавшееся сценарием M4.6; бизнес-правила не изменены.
 >
 > Нормативные приложения: `METRICS_CATALOG.md` и `SECURITY_READ_ONLY.md`.
 
@@ -512,6 +514,18 @@ create table raw_amo_events (
   unique (account_id, amo_event_id)
 );
 
+create table raw_amo_quarantine (
+  id uuid primary key default gen_random_uuid(),
+  sync_run_id uuid not null references sync_runs(id),
+  stream text not null,
+  page_number integer not null check (page_number > 0),
+  reason_code text not null,
+  payload jsonb not null,
+  payload_sha256 text not null,
+  received_at timestamptz not null default now(),
+  unique (sync_run_id, stream, page_number, payload_sha256)
+);
+
 create table amo_api_audit (
   id uuid primary key default gen_random_uuid(),
   sync_run_id uuid references sync_runs(id),
@@ -530,6 +544,7 @@ create table amo_api_audit (
 
 - `raw_amo_objects(entity_type, external_id, received_at desc)`;
 - `raw_amo_events(amo_lead_id, event_at, amo_event_id)`;
+- `raw_amo_quarantine(sync_run_id, stream, page_number)`;
 - `sync_runs(status, started_at desc)`;
 - `amo_api_audit(sync_run_id, created_at)`.
 
