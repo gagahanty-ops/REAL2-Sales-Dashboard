@@ -1,0 +1,32 @@
+{
+  "name": "real2-sales-dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": "22.x"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @real2/web --filter @real2/worker dev",
+    "lint": "pnpm --filter './apps/**' --filter './packages/**' run lint",
+    "typecheck": "pnpm --filter './apps/**' --filter './packages/**' run typecheck",
+    "test": "node --test tests/repo/*.test.mjs apps/worker/src/*.test.mts && vitest run --project unit --passWithNoTests",
+    "test:contracts": "vitest run --project contracts --passWithNoTests",
+    "test:integration": "vitest run --project integration --passWithNoTests",
+    "test:security": "vitest run --project security --passWithNoTests",
+    "test:e2e": "playwright test",
+    "build": "pnpm --filter './apps/**' --filter './packages/**' run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@playwright/test": "^1.57.0",
+    "@types/node": "^22.19.1",
+    "eslint": "^10.0.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "^8.48.1",
+    "vitest": "^3.2.4"
+  }
+}

@@ -25,26 +25,41 @@
 ### Task 1: Scaffold the monorepo and executable quality commands
 
 **Files:**
+- Modify: `.gitignore`
 - Create: `package.json`
 - Create: `.nvmrc`
+- Create: `.npmrc`
 - Create: `pnpm-workspace.yaml`
 - Create: `tsconfig.base.json`
-- Create: `vitest.workspace.ts`
+- Create: `tsconfig.package.json`
+- Create: `eslint.config.mjs`
+- Create: `vitest.config.ts`
 - Create: `apps/web/package.json`
 - Create: `apps/web/tsconfig.json`
+- Create: `apps/web/next-env.d.ts`
+- Create: `apps/web/next.config.ts`
 - Create: `apps/web/src/app/layout.tsx`
 - Create: `apps/web/src/app/page.tsx`
 - Create: `apps/worker/package.json`
 - Create: `apps/worker/tsconfig.json`
+- Create: `apps/worker/tsconfig.build.json`
 - Create: `apps/worker/src/main.ts`
 - Create: `packages/domain/package.json`
 - Create: `packages/domain/src/index.ts`
+- Create: `packages/domain/tsconfig.json`
+- Create: `packages/domain/tsconfig.build.json`
 - Create: `packages/db/package.json`
 - Create: `packages/db/src/index.ts`
+- Create: `packages/db/tsconfig.json`
+- Create: `packages/db/tsconfig.build.json`
 - Create: `packages/integrations/package.json`
 - Create: `packages/integrations/src/index.ts`
+- Create: `packages/integrations/tsconfig.json`
+- Create: `packages/integrations/tsconfig.build.json`
 - Create: `packages/testkit/package.json`
 - Create: `packages/testkit/src/index.ts`
+- Create: `packages/testkit/tsconfig.json`
+- Create: `packages/testkit/tsconfig.build.json`
 - Test: `tests/repo/workspace.test.mjs`
 
 **Interfaces:**
@@ -126,7 +141,7 @@ Expected: every command exits 0 and `pnpm-lock.yaml` is created.
 - [ ] **Step 5: Commit the scaffold**
 
 ```bash
-git add .nvmrc package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json vitest.workspace.ts apps packages tests/repo
+git add .nvmrc package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json vitest.config.ts apps packages tests/repo
 git commit -m "build: scaffold REAL2 workspace"
 ```
 

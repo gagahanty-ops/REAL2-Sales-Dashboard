@@ -1,0 +1,22 @@
+{
+  "name": "@real2/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test src/*.test.mts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@real2/db": "workspace:*",
+    "@real2/domain": "workspace:*",
+    "@real2/integrations": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}
