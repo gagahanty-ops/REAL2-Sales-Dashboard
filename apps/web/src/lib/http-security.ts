@@ -1,3 +1,6 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
+
 import { getServerEnv } from "./server/runtime";
 import { AppError } from "@real2/domain";
 
@@ -27,10 +30,48 @@ export function requireSameOrigin(
   }
 }
 
-export function getClientIp(request: Request): string {
-  // Fetch Request does not expose the peer socket. Forwarding headers remain
-  // attacker-controlled until a later deployment establishes and verifies a
-  // closed trusted-proxy boundary, so they cannot participate in rate limits.
-  void request;
-  return "unknown";
+export type ClientIpOptions = Readonly<{
+  appUrl: string;
+  trustedProxySecret?: string;
+}>;
+
+function digest(value: string): Buffer {
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+function hasTrustedProxySecret(received: string, expected: string): boolean {
+  return timingSafeEqual(digest(received), digest(expected));
+}
+
+function defaultClientIpOptions(): ClientIpOptions {
+  const env = getServerEnv();
+  return {
+    appUrl: env.APP_URL,
+    ...(env.TRUSTED_PROXY_SECRET
+      ? { trustedProxySecret: env.TRUSTED_PROXY_SECRET }
+      : {}),
+  };
+}
+
+export function getClientIp(
+  request: Request,
+  options: ClientIpOptions = defaultClientIpOptions(),
+): string {
+  const appHost = new URL(options.appUrl).hostname;
+  if (appHost === "localhost" || appHost === "127.0.0.1" || appHost === "[::1]") {
+    return "loopback";
+  }
+
+  const receivedProxySecret = request.headers.get("x-real2-proxy-secret");
+  if (
+    !options.trustedProxySecret ||
+    !receivedProxySecret ||
+    !hasTrustedProxySecret(receivedProxySecret, options.trustedProxySecret)
+  ) {
+    throw new RequestSecurityError();
+  }
+
+  const clientIp = request.headers.get("x-real-ip")?.trim();
+  if (!clientIp || isIP(clientIp) === 0) throw new RequestSecurityError();
+  return clientIp;
 }

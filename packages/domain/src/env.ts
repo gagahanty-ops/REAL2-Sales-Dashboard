@@ -12,6 +12,7 @@ const serverEnvSchema = z
     SUPABASE_URL: z.url(),
     SUPABASE_ANON_KEY: z.string().min(8),
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(8),
+    TRUSTED_PROXY_SECRET: z.string().min(32).optional(),
     SYNC_ENABLED: booleanFlag,
     SHEET_PUBLISH_ENABLED: booleanFlag,
   })
@@ -23,6 +24,7 @@ const serverEnvKeys = [
   "SUPABASE_URL",
   "SUPABASE_ANON_KEY",
   "SUPABASE_SERVICE_ROLE_KEY",
+  "TRUSTED_PROXY_SECRET",
   "SYNC_ENABLED",
   "SHEET_PUBLISH_ENABLED",
 ] as const;

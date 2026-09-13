@@ -126,8 +126,11 @@ supabase stop --no-backup
 
 Перед production нужны HTTPS reverse proxy, точный `APP_URL`, управляемый
 Supabase/PostgreSQL без автопаузы, secret store и проверенное резервное
-копирование. До появления закрытой и проверенной trusted-proxy границы приложение
-намеренно игнорирует клиентские `X-Real-IP` и `X-Forwarded-For` в rate-limit.
-Секреты не передаются через Docker build arguments и не хранятся в репозитории.
-Исходная Google-таблица никогда не получает права service account; запись позже
-будет разрешена только в утверждённую копию.
+копирование. Локальный dev-сервер привязан к loopback. На любом нелокальном
+`APP_URL` login закрыт, пока reverse proxy не станет единственной точкой входа,
+не начнёт перезаписывать `X-Real-IP` и `X-Real2-Proxy-Secret`, а серверный secret
+store не задаст совпадающий `TRUSTED_PROXY_SECRET` длиной не менее 32 символов.
+Клиентский `X-Forwarded-For` не используется. Секреты не передаются через Docker
+build arguments и не хранятся в репозитории. Исходная Google-таблица никогда не
+получает права service account; запись позже будет разрешена только в
+утверждённую копию.

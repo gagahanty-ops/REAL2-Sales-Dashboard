@@ -34,4 +34,14 @@ describe("parseServerEnv", () => {
     expect(parseMalformedEnv).toThrow("DATABASE_URL");
     expect(parseMalformedEnv).not.toThrow("secret-value");
   });
+
+  it("accepts only a sufficiently long optional trusted proxy secret", () => {
+    expect(
+      parseServerEnv({ ...base, TRUSTED_PROXY_SECRET: "p".repeat(32) })
+        .TRUSTED_PROXY_SECRET,
+    ).toBe("p".repeat(32));
+    expect(() =>
+      parseServerEnv({ ...base, TRUSTED_PROXY_SECRET: "too-short" }),
+    ).toThrow("TRUSTED_PROXY_SECRET");
+  });
 });
