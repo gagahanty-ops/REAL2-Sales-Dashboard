@@ -2,6 +2,7 @@
   "name": "real2-sales-dashboard",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": "22.x"
@@ -13,15 +14,18 @@
     "bootstrap:admin": "tsx scripts/bootstrap-admin.ts",
     "dev": "pnpm --parallel --filter @real2/web --filter @real2/worker dev",
     "lint": "pnpm --filter './apps/**' --filter './packages/**' run lint",
-    "typecheck": "pnpm --filter './apps/**' --filter './packages/**' run typecheck",
+    "typecheck": "pnpm --filter './apps/**' --filter './packages/**' run typecheck && tsc --noEmit -p scripts/tsconfig.json",
     "test": "node --test tests/repo/*.test.mjs apps/worker/src/*.test.mts && vitest run --project unit --passWithNoTests",
     "test:contracts": "vitest run --project contracts --passWithNoTests",
     "test:integration": "vitest run --project integration --passWithNoTests",
     "test:security": "vitest run --project security --passWithNoTests",
     "test:e2e": "playwright test",
-    "build": "pnpm --filter './apps/**' --filter './packages/**' run build"
+    "build": "pnpm --filter './apps/**' --filter './packages/**' run build",
+    "check:secrets": "node scripts/check-tracked-secrets.mjs"
   },
   "devDependencies": {
+    "@real2/db": "workspace:*",
+    "@real2/domain": "workspace:*",
     "@real2/testkit": "workspace:*",
     "@eslint/js": "^10.0.0",
     "@playwright/test": "^1.57.0",
@@ -31,6 +35,7 @@
     "tsx": "^4.20.6",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.48.1",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "zod": "^4.0.0"
   }
 }

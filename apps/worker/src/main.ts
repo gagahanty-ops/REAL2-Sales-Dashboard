@@ -1,4 +1,5 @@
-import type { ServerEnv } from "@real2/domain";
+import { parseServerEnv, type ServerEnv } from "@real2/domain";
+import { pathToFileURL } from "node:url";
 
 export type WorkerIdleResult = Readonly<{
   status: "idle";
@@ -22,4 +23,23 @@ export async function runWorkerOnce(
   }
 
   return { status: "idle", networkRequests: 0 };
+}
+
+export async function runWorkerCli(
+  input: Record<string, string | undefined>,
+  write: (line: string) => void = (line) => process.stdout.write(`${line}\n`),
+): Promise<void> {
+  const env = parseServerEnv(input);
+  const result = await runWorkerOnce(env);
+  write(JSON.stringify(result));
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  runWorkerCli(process.env).catch(() => {
+    process.stderr.write("Worker failed safely\n");
+    process.exitCode = 1;
+  });
 }

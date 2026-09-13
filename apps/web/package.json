@@ -2,6 +2,7 @@
   "name": "@real2/web",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "lint": "eslint src next.config.ts",

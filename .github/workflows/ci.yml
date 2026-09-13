@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: supabase/postgres:17.6.1.167
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 54322:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+      SYNC_ENABLED: "false"
+      SHEET_PUBLISH_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+
+      - name: Reject tracked credential files
+        run: node scripts/check-tracked-secrets.mjs
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.117.0
+
+      - name: Apply disposable database migrations
+        run: supabase db reset --db-url "$TEST_DATABASE_URL" --no-seed --yes
+
+      - name: Verify source and contracts
+        run: |
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+          pnpm test:contracts
+          pnpm test:integration
+          pnpm test:security
+          supabase db lint --db-url "$TEST_DATABASE_URL"
+          pnpm build
+
+      - name: Verify Compose safety and images
+        run: |
+          docker compose config --quiet
+          docker compose build web
+          docker compose --profile worker build worker
+          docker compose up --wait web
+          curl --fail-with-body http://127.0.0.1:3000/api/health/live
+          docker compose --profile worker run --rm worker
+
+      - name: Stop containers
+        if: always()
+        run: docker compose --profile worker down --remove-orphans

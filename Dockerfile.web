@@ -1,0 +1,37 @@
+ARG NODE_VERSION=22.23.2
+
+FROM node:${NODE_VERSION}-bookworm-slim AS base
+ENV PNPM_HOME=/pnpm
+ENV PATH=/pnpm:${PATH}
+RUN corepack enable && corepack prepare pnpm@10.34.5 --activate
+WORKDIR /workspace
+
+FROM base AS dependencies
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY apps/web/package.json apps/web/package.json
+COPY apps/worker/package.json apps/worker/package.json
+COPY packages/db/package.json packages/db/package.json
+COPY packages/domain/package.json packages/domain/package.json
+COPY packages/integrations/package.json packages/integrations/package.json
+COPY packages/testkit/package.json packages/testkit/package.json
+RUN pnpm install --frozen-lockfile
+
+FROM dependencies AS build
+COPY . .
+RUN pnpm --filter @real2/web... run build
+
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+ENV SYNC_ENABLED=false
+ENV SHEET_PUBLISH_ENABLED=false
+
+COPY --from=build --chown=node:node /workspace/apps/web/.next/standalone ./
+COPY --from=build --chown=node:node /workspace/apps/web/.next/static ./apps/web/.next/static
+
+USER node
+EXPOSE 3000
+CMD ["node", "apps/web/server.js"]

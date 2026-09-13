@@ -14,6 +14,12 @@ importers:
       '@playwright/test':
         specifier: ^1.57.0
         version: 1.63.0
+      '@real2/db':
+        specifier: workspace:*
+        version: link:packages/db
+      '@real2/domain':
+        specifier: workspace:*
+        version: link:packages/domain
       '@real2/testkit':
         specifier: workspace:*
         version: link:packages/testkit
@@ -38,6 +44,9 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@22.20.2)(tsx@4.23.13)
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.2
 
   apps/web:
     dependencies:

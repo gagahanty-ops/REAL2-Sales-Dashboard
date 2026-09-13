@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { runWorkerOnce } from "./main.ts";
+import { runWorkerCli, runWorkerOnce } from "./main.ts";
 
 test("worker starts idle without contacting an external system", async () => {
   const result = await runWorkerOnce();
@@ -18,4 +18,25 @@ test("worker refuses enabled network switches before integrations are configured
       }),
     /Network integrations are not configured/,
   );
+});
+
+test("worker CLI validates disabled switches and emits a safe one-shot result", async () => {
+  const lines: string[] = [];
+
+  await runWorkerCli(
+    {
+      APP_URL: "http://localhost:3000",
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
+      SUPABASE_URL: "http://supabase:54321",
+      SUPABASE_ANON_KEY: "local-anon-key",
+      SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
+      SYNC_ENABLED: "false",
+      SHEET_PUBLISH_ENABLED: "false",
+    },
+    (line) => lines.push(line),
+  );
+
+  assert.deepEqual(lines.map((line) => JSON.parse(line)), [
+    { status: "idle", networkRequests: 0 },
+  ]);
 });
