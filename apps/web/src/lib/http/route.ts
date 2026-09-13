@@ -2,7 +2,7 @@ import { AppError, failure, success } from "@real2/domain";
 import { ulid } from "ulid";
 import { ZodError } from "zod";
 
-import { safeLogger } from "../logging/logger";
+import { normalizeLogPathname, safeLogger } from "../logging/logger";
 
 const ulidPattern = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
@@ -20,19 +20,9 @@ function requestTraceId(request: Request): string {
   return incoming && ulidPattern.test(incoming) ? incoming : ulid();
 }
 
-const dynamicPathSegment =
-  /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-9A-HJKMNP-TV-Z]{26})$/i;
-
 export function normalizeRequestPath(request: Request): string {
   try {
-    return new URL(request.url).pathname
-      .split("/")
-      .map((segment) =>
-        dynamicPathSegment.test(segment) || segment.length >= 32
-          ? ":id"
-          : segment,
-      )
-      .join("/");
+    return normalizeLogPathname(new URL(request.url).pathname);
   } catch {
     return "/invalid-url";
   }

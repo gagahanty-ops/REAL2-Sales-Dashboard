@@ -52,4 +52,27 @@ describe("safe structured logging", () => {
     ]);
     expect(capture.lines.join("\n")).not.toMatch(/amo-secret|999 111/i);
   });
+
+  it("defaults every allowlisted free-form string to redacted", () => {
+    const sensitive =
+      'Иван Иванов custom_field={"address":"Махачкала"} code=oauth-code-123';
+
+    expect(
+      sanitizeLog({
+        message: sensitive,
+        operation: sensitive,
+        method: sensitive,
+        normalized_path: `/${sensitive}`,
+        result: sensitive,
+        snapshot_version: sensitive,
+      }),
+    ).toEqual({
+      message: "[REDACTED]",
+      operation: "[REDACTED]",
+      method: "[REDACTED]",
+      normalized_path: "[REDACTED]",
+      result: "[REDACTED]",
+      snapshot_version: "[REDACTED]",
+    });
+  });
 });

@@ -63,7 +63,7 @@ jobs:
           pnpm test:contracts
           pnpm test:integration
           pnpm test:security
-          supabase db lint --db-url "$TEST_DATABASE_URL"
+          supabase db lint --db-url "$TEST_DATABASE_URL" --fail-on error
           pnpm build
 
       - name: Verify Compose safety and images

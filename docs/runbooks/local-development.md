@@ -106,7 +106,7 @@ pnpm test
 pnpm test:contracts
 pnpm test:integration
 pnpm test:security
-supabase db lint
+supabase db lint --fail-on error
 pnpm build
 docker compose config --quiet
 ```
@@ -126,6 +126,8 @@ supabase stop --no-backup
 
 Перед production нужны HTTPS reverse proxy, точный `APP_URL`, управляемый
 Supabase/PostgreSQL без автопаузы, secret store и проверенное резервное
-копирование. Секреты не передаются через Docker build arguments и не хранятся в
-репозитории. Исходная Google-таблица никогда не получает права service account;
-запись позже будет разрешена только в утверждённую копию.
+копирование. До появления закрытой и проверенной trusted-proxy границы приложение
+намеренно игнорирует клиентские `X-Real-IP` и `X-Forwarded-For` в rate-limit.
+Секреты не передаются через Docker build arguments и не хранятся в репозитории.
+Исходная Google-таблица никогда не получает права service account; запись позже
+будет разрешена только в утверждённую копию.

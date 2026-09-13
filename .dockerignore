@@ -17,11 +17,17 @@ playwright-report
 test-results
 *.log
 *.pem
+**/*.pem
 *.key
+**/*.key
 *.p12
+**/*.p12
 *.pfx
+**/*.pfx
 *oauth*.json
+**/*oauth*.json
 *service-account*.json
+**/*service-account*.json
 docs/reference
 supabase/.branches
 supabase/.temp

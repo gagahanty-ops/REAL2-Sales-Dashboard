@@ -43,6 +43,10 @@ test("CI uses pull request code without privileged target execution", async () =
   assert.doesNotMatch(workflow, /pull_request_target/);
   assert.match(workflow, /docker compose build web/);
   assert.match(workflow, /docker compose --profile worker build worker/);
+  assert.match(
+    workflow,
+    /supabase db lint --db-url "\$TEST_DATABASE_URL" --fail-on error/,
+  );
 });
 
 test("Docker build context excludes local credentials", async () => {
@@ -51,10 +55,12 @@ test("Docker build context excludes local credentials", async () => {
 
   for (const pattern of [
     ".env.*",
-    "*.pem",
-    "*.key",
-    "*oauth*.json",
-    "*service-account*.json",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*oauth*.json",
+    "**/*service-account*.json",
   ]) {
     assert.ok(patterns.has(pattern), `missing Docker ignore pattern: ${pattern}`);
   }

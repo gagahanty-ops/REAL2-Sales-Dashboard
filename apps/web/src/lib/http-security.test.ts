@@ -33,23 +33,14 @@ describe("requireSameOrigin", () => {
 });
 
 describe("getClientIp", () => {
-  it("prefers the proxy-verified real IP and bounds its length", () => {
-    const longIp = "1".repeat(100);
+  it("ignores client-controlled forwarding headers without a trusted proxy boundary", () => {
     const request = new Request("https://dashboard.real2.example", {
       headers: {
-        "x-real-ip": longIp,
+        "x-real-ip": "198.51.100.77",
         "x-forwarded-for": "203.0.113.10, 203.0.113.11",
       },
     });
 
-    expect(getClientIp(request)).toBe("1".repeat(64));
-  });
-
-  it("uses the first forwarded address when real IP is absent", () => {
-    const request = new Request("https://dashboard.real2.example", {
-      headers: { "x-forwarded-for": "203.0.113.10, 203.0.113.11" },
-    });
-
-    expect(getClientIp(request)).toBe("203.0.113.10");
+    expect(getClientIp(request)).toBe("unknown");
   });
 });

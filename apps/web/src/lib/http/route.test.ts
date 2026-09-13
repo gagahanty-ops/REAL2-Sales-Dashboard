@@ -59,6 +59,12 @@ describe("normalizeRequestPath", () => {
 
     expect(normalizeRequestPath(request)).toBe("/api/leads/:id/:id");
   });
+
+  it("replaces an unknown path segment instead of logging possible PII", () => {
+    const request = new Request("http://local/api/leads/ivan-ivanov");
+
+    expect(normalizeRequestPath(request)).toBe("/api/leads/:segment");
+  });
 });
 
 describe("readJson", () => {

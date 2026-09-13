@@ -28,9 +28,9 @@ export function requireSameOrigin(
 }
 
 export function getClientIp(request: Request): string {
-  const realIp = request.headers.get("x-real-ip")?.trim();
-  if (realIp) return realIp.slice(0, 64);
-
-  const forwardedIp = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  return (forwardedIp || "unknown").slice(0, 64);
+  // Fetch Request does not expose the peer socket. Forwarding headers remain
+  // attacker-controlled until a later deployment establishes and verifies a
+  // closed trusted-proxy boundary, so they cannot participate in rate limits.
+  void request;
+  return "unknown";
 }
