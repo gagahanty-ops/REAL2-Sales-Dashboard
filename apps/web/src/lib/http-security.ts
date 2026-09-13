@@ -1,11 +1,9 @@
 import { getServerEnv } from "./server/runtime";
+import { AppError } from "@real2/domain";
 
-export class RequestSecurityError extends Error {
-  readonly code = "E_FORBIDDEN" as const;
-  readonly status = 403 as const;
-
+export class RequestSecurityError extends AppError {
   constructor() {
-    super("E_FORBIDDEN");
+    super("E_FORBIDDEN", 403, "Запрос отклонён");
     this.name = "RequestSecurityError";
   }
 }

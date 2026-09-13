@@ -1,21 +1,14 @@
 import { requireActiveAppUser } from "@real2/db";
+import { AppError } from "@real2/domain";
 
 import type { SessionUser } from "./authorization";
 import { getDatabase } from "../server/runtime";
 import { createRequestSupabaseClient } from "../supabase/server";
 
-export class SessionAccessError extends Error {
-  readonly code: "E_UNAUTHENTICATED" | "E_FORBIDDEN";
-  readonly status: 401 | 403;
-
-  constructor(
-    code: SessionAccessError["code"],
-    status: SessionAccessError["status"],
-  ) {
-    super(code);
+export class SessionAccessError extends AppError {
+  constructor(code: "E_AUTH_REQUIRED" | "E_FORBIDDEN", status: 401 | 403) {
+    super(code, status);
     this.name = "SessionAccessError";
-    this.code = code;
-    this.status = status;
   }
 }
 
@@ -24,7 +17,7 @@ export async function requireUser(): Promise<SessionUser> {
   const { data, error } = await supabase.auth.getUser();
 
   if (error || !data.user) {
-    throw new SessionAccessError("E_UNAUTHENTICATED", 401);
+    throw new SessionAccessError("E_AUTH_REQUIRED", 401);
   }
 
   try {

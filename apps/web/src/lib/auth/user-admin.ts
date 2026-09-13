@@ -4,6 +4,7 @@ import {
   type AppUser,
   type Database,
 } from "@real2/db";
+import { AppError } from "@real2/domain";
 
 export type CreateManagedUserInput = Readonly<{
   email: string;
@@ -44,6 +45,32 @@ export class UserAdminError extends Error {
   }
 }
 
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "23505"
+  );
+}
+
+export function toUserAdminAppError(error: UserAdminError): AppError {
+  switch (error.code) {
+    case "E_NOT_FOUND":
+      return new AppError("E_NOT_FOUND", 404);
+    case "E_CONFLICT":
+      return new AppError("E_CONFLICT", 409);
+    case "E_LAST_ADMIN":
+      return new AppError(
+        "E_CONFLICT",
+        409,
+        "Нельзя отключить или понизить последнего администратора",
+      );
+    case "E_CONFIGURATION":
+      return new AppError("E_INTERNAL", 500);
+  }
+}
+
 export async function createManagedUser(
   db: Database,
   auth: ManagedAuthAdmin,
@@ -70,6 +97,9 @@ export async function createManagedUser(
     `;
   } catch (error) {
     await auth.deleteUser(authUser.id);
+    if (isUniqueConstraintError(error)) {
+      throw new UserAdminError("E_CONFLICT");
+    }
     throw error;
   }
 

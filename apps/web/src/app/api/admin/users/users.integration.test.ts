@@ -51,7 +51,7 @@ describe("admin user management", () => {
         role: "head",
         amoUserId: null,
       }),
-    ).rejects.toBeDefined();
+    ).rejects.toMatchObject({ code: "E_CONFLICT" });
     expect(auth.deleted).toEqual([auth.nextAuthUserId]);
   });
 

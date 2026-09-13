@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { requireActiveAppUser } from "@real2/db";
+import { AppError } from "@real2/domain";
 import { getClientIp, requireSameOrigin } from "../../../../lib/http-security";
 import { LoginRateLimiter } from "../../../../lib/auth/login-rate-limit";
 import {
@@ -9,6 +10,7 @@ import {
 } from "../../../../lib/auth/login-service";
 import { getDatabase } from "../../../../lib/server/runtime";
 import { createRequestSupabaseClient } from "../../../../lib/supabase/server";
+import { withRoute } from "../../../../lib/http/route";
 
 const loginSchema = z.strictObject({
   email: z.email().max(254),
@@ -17,14 +19,15 @@ const loginSchema = z.strictObject({
 
 const limiter = new LoginRateLimiter();
 
-export async function POST(request: Request): Promise<Response> {
-  try {
-    requireSameOrigin(request);
-    const parsed = loginSchema.safeParse(await request.json());
-    if (!parsed.success) throw new LoginError("E_INVALID_CREDENTIALS", 401);
+export const POST = withRoute(async (request) => {
+  requireSameOrigin(request);
+  const body = await request.json().catch(() => null);
+  const parsed = loginSchema.safeParse(body);
+  if (!parsed.success) throw new LoginError("E_INVALID_CREDENTIALS", 401);
 
-    const supabase = await createRequestSupabaseClient();
-    const user = await authenticateCredentials(
+  const supabase = await createRequestSupabaseClient();
+  try {
+    return await authenticateCredentials(
       { ...parsed.data, ip: getClientIp(request) },
       {
         limiter,
@@ -47,19 +50,14 @@ export async function POST(request: Request): Promise<Response> {
         },
       },
     );
-
-    return Response.json({ data: user });
   } catch (error) {
     if (error instanceof LoginError) {
-      return Response.json(
-        { error: { code: error.code, message: error.message } },
-        { status: error.status },
+      throw new AppError(
+        error.code === "E_RATE_LIMITED" ? "E_RATE_LIMITED" : "E_AUTH_REQUIRED",
+        error.status,
+        error.message,
       );
     }
-
-    return Response.json(
-      { error: { code: "E_FORBIDDEN", message: "Запрос отклонён" } },
-      { status: 403 },
-    );
+    throw error;
   }
-}
+});

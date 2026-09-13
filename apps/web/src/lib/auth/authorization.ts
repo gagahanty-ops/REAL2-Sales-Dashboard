@@ -1,4 +1,5 @@
 import type { AppRole } from "@real2/db";
+import { AppError } from "@real2/domain";
 
 export type SessionUser = Readonly<{
   id: string;
@@ -8,12 +9,9 @@ export type SessionUser = Readonly<{
   amoUserId: number | null;
 }>;
 
-export class AuthorizationError extends Error {
-  readonly code = "E_FORBIDDEN" as const;
-  readonly status = 403 as const;
-
+export class AuthorizationError extends AppError {
   constructor() {
-    super("E_FORBIDDEN");
+    super("E_FORBIDDEN", 403);
     this.name = "AuthorizationError";
   }
 }
