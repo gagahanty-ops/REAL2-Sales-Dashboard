@@ -30,6 +30,12 @@ test("worker CLI validates disabled switches and emits a safe one-shot result", 
       SUPABASE_URL: "http://supabase:54321",
       SUPABASE_ANON_KEY: "local-anon-key",
       SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
+      AMO_CLIENT_ID: "synthetic-client-id",
+      AMO_CLIENT_SECRET: "synthetic-client-secret",
+      AMO_REDIRECT_URI:
+        "https://dashboard.example.invalid/api/integrations/amo/callback",
+      TOKEN_ENCRYPTION_KEY:
+        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
       SYNC_ENABLED: "false",
       SHEET_PUBLISH_ENABLED: "false",
     },

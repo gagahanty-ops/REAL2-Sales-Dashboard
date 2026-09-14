@@ -5,6 +5,11 @@ const booleanFlag = z
   .default("false")
   .transform((value) => value === "true");
 
+const tokenEncryptionKey = z.string().refine((value) => {
+  const decoded = Buffer.from(value, "base64");
+  return decoded.byteLength === 32 && decoded.toString("base64") === value;
+});
+
 const serverEnvSchema = z
   .object({
     APP_URL: z.url(),
@@ -13,6 +18,10 @@ const serverEnvSchema = z
     SUPABASE_ANON_KEY: z.string().min(8),
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(8),
     TRUSTED_PROXY_SECRET: z.string().min(32).optional(),
+    AMO_CLIENT_ID: z.string().min(1),
+    AMO_CLIENT_SECRET: z.string().min(8),
+    AMO_REDIRECT_URI: z.url({ protocol: /^https$/ }),
+    TOKEN_ENCRYPTION_KEY: tokenEncryptionKey,
     SYNC_ENABLED: booleanFlag,
     SHEET_PUBLISH_ENABLED: booleanFlag,
   })
@@ -25,6 +34,10 @@ const serverEnvKeys = [
   "SUPABASE_ANON_KEY",
   "SUPABASE_SERVICE_ROLE_KEY",
   "TRUSTED_PROXY_SECRET",
+  "AMO_CLIENT_ID",
+  "AMO_CLIENT_SECRET",
+  "AMO_REDIRECT_URI",
+  "TOKEN_ENCRYPTION_KEY",
   "SYNC_ENABLED",
   "SHEET_PUBLISH_ENABLED",
 ] as const;

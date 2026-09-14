@@ -13,3 +13,21 @@ export {
   type SystemControl,
   type SystemControlKey,
 } from "./identity.js";
+export {
+  consumeOAuthState,
+  createAmoConnection,
+  createOAuthState,
+  disableAmoConnection,
+  findDueAmoConnectionIds,
+  getAmoConnectionCredentials,
+  getSafeAmoConnectionStatus,
+  purgeExpiredOAuthStates,
+  withLockedAmoConnection,
+  type AmoConnectionCredentials,
+  type AmoConnectionStatusValue,
+  type CreatedOAuthState,
+  type CreateAmoConnectionInput,
+  type LockedAmoConnectionActions,
+  type OAuthState,
+  type SafeAmoConnectionStatus,
+} from "./amo-connections.js";

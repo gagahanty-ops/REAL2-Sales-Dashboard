@@ -13,7 +13,30 @@ const adminDb = createAdminDb();
 const allUsers = Object.values(testUsers);
 
 beforeEach(async () => {
+  await adminDb`delete from public.oauth_states`;
+  await adminDb`delete from public.amo_connections`;
   await resetAndSeedUsers(adminDb, allUsers);
+  await adminDb`
+    insert into public.amo_connections (
+      account_id,
+      subdomain,
+      base_url,
+      access_token_ciphertext,
+      refresh_token_ciphertext,
+      token_expires_at,
+      status,
+      installed_by
+    ) values (
+      555151,
+      '555151',
+      'https://555151.amocrm.ru',
+      ${Buffer.alloc(64)},
+      ${Buffer.alloc(64)},
+      '2026-09-12T13:00:00.000Z',
+      'active',
+      ${testUsers.admin.id}
+    )
+  `;
 });
 
 afterAll(async () => {
@@ -71,6 +94,65 @@ describe("identity RLS deny-by-default rules", () => {
   it("does not allow a manager to update even their own row", async () => {
     await expect(
       updateOwnNameAsManager(adminDb, testUsers.managerOne),
+    ).rejects.toMatchObject({ code: "42501" });
+  });
+});
+
+describe("amoCRM credential RLS", () => {
+  it("lets an admin read only the safe connection projection", async () => {
+    await expect(
+      adminDb.begin(async (transaction) => {
+        await transaction.unsafe("set local role authenticated");
+        await transaction`
+          select set_config(
+            'request.jwt.claim.sub',
+            ${testUsers.admin.authUserId},
+            true
+          )
+        `;
+        return transaction<{
+          account_id: string;
+          subdomain: string;
+          status: string;
+        }[]>`
+          select account_id, subdomain, status
+          from public.amo_connections
+        `;
+      }),
+    ).resolves.toEqual([
+      { account_id: "555151", subdomain: "555151", status: "active" },
+    ]);
+  });
+
+  it("does not grant user-facing roles token or OAuth-state access", async () => {
+    await expect(
+      adminDb.begin(async (transaction) => {
+        await transaction.unsafe("set local role authenticated");
+        await transaction`
+          select set_config(
+            'request.jwt.claim.sub',
+            ${testUsers.admin.authUserId},
+            true
+          )
+        `;
+        await transaction`
+          select access_token_ciphertext from public.amo_connections
+        `;
+      }),
+    ).rejects.toMatchObject({ code: "42501" });
+
+    await expect(
+      adminDb.begin(async (transaction) => {
+        await transaction.unsafe("set local role authenticated");
+        await transaction`
+          select set_config(
+            'request.jwt.claim.sub',
+            ${testUsers.admin.authUserId},
+            true
+          )
+        `;
+        await transaction`select state_hash from public.oauth_states`;
+      }),
     ).rejects.toMatchObject({ code: "42501" });
   });
 });

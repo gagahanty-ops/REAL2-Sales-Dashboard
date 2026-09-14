@@ -8,6 +8,9 @@ const workspaceAliases = {
   "@real2/domain": fileURLToPath(
     new URL("./packages/domain/src/index.ts", import.meta.url),
   ),
+  "@real2/integrations": fileURLToPath(
+    new URL("./packages/integrations/src/index.ts", import.meta.url),
+  ),
   "@real2/testkit": fileURLToPath(
     new URL("./packages/testkit/src/index.ts", import.meta.url),
   ),

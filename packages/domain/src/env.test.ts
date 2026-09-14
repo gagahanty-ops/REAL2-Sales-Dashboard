@@ -8,6 +8,12 @@ const base = {
   SUPABASE_URL: "http://localhost:54321",
   SUPABASE_ANON_KEY: "local-anon-key",
   SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
+  AMO_CLIENT_ID: "synthetic-client-id",
+  AMO_CLIENT_SECRET: "synthetic-client-secret",
+  AMO_REDIRECT_URI:
+    "https://dashboard.example.invalid/api/integrations/amo/callback",
+  TOKEN_ENCRYPTION_KEY:
+    "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
 };
 
 describe("parseServerEnv", () => {
@@ -43,5 +49,30 @@ describe("parseServerEnv", () => {
     expect(() =>
       parseServerEnv({ ...base, TRUSTED_PROXY_SECRET: "too-short" }),
     ).toThrow("TRUSTED_PROXY_SECRET");
+  });
+
+  it("accepts the server-only amoCRM OAuth configuration", () => {
+    const env = parseServerEnv(base);
+
+    expect(env).toMatchObject({
+      AMO_CLIENT_ID: "synthetic-client-id",
+      AMO_CLIENT_SECRET: "synthetic-client-secret",
+      AMO_REDIRECT_URI:
+        "https://dashboard.example.invalid/api/integrations/amo/callback",
+      TOKEN_ENCRYPTION_KEY:
+        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
+    });
+  });
+
+  it("requires an HTTPS redirect and an exactly 32-byte encryption key", () => {
+    expect(() =>
+      parseServerEnv({ ...base, AMO_REDIRECT_URI: "http://example.invalid/callback" }),
+    ).toThrow("AMO_REDIRECT_URI");
+    expect(() =>
+      parseServerEnv({
+        ...base,
+        TOKEN_ENCRYPTION_KEY: Buffer.alloc(31).toString("base64"),
+      }),
+    ).toThrow("TOKEN_ENCRYPTION_KEY");
   });
 });
