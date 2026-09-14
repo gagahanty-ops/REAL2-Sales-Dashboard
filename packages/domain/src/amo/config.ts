@@ -226,12 +226,12 @@ export function validatePipelineConfig(
 
   if (!pipeline) {
     reasons.push("pipeline_not_confirmed");
-  } else if (pipeline.name !== EXPECTED_PIPELINE_NAME) {
-    if (activeConfig?.pipelineId !== pipeline.id) {
-      reasons.push("pipeline_not_confirmed");
-    } else if (activeConfig.pipelineName !== pipeline.name) {
+  } else if (activeConfig?.pipelineId === pipeline.id) {
+    if (activeConfig.pipelineName !== pipeline.name) {
       warnings.push("pipeline_name_changed");
     }
+  } else if (pipeline.name !== EXPECTED_PIPELINE_NAME) {
+    reasons.push("pipeline_not_confirmed");
   }
 
   const applicationStatus = pipeline?.statuses.find(
@@ -239,15 +239,15 @@ export function validatePipelineConfig(
   );
   if (!applicationStatus) {
     reasons.push("application_status_not_confirmed");
-  } else if (applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME) {
-    if (
-      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
-      activeConfig.applicationStatusId !== applicationStatus.id
-    ) {
-      reasons.push("application_status_not_confirmed");
-    } else if (activeConfig.applicationStatusName !== applicationStatus.name) {
+  } else if (
+    activeConfig?.pipelineId === parsedCandidate.pipelineId &&
+    activeConfig.applicationStatusId === applicationStatus.id
+  ) {
+    if (activeConfig.applicationStatusName !== applicationStatus.name) {
       warnings.push("application_status_name_changed");
     }
+  } else if (applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME) {
+    reasons.push("application_status_not_confirmed");
   }
 
   const wonStatus = pipeline?.statuses.find(
@@ -255,15 +255,15 @@ export function validatePipelineConfig(
   );
   if (!wonStatus) {
     reasons.push("won_status_not_confirmed");
-  } else if (wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
-    if (
-      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
-      activeConfig.wonStatusId !== wonStatus.id
-    ) {
-      reasons.push("won_status_not_confirmed");
-    } else if (activeConfig.wonStatusName !== wonStatus.name) {
+  } else if (
+    activeConfig?.pipelineId === parsedCandidate.pipelineId &&
+    activeConfig.wonStatusId === wonStatus.id
+  ) {
+    if (activeConfig.wonStatusName !== wonStatus.name) {
       warnings.push("won_status_name_changed");
     }
+  } else if (wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
+    reasons.push("won_status_not_confirmed");
   }
 
   if (parsedCandidate.applicationStatusId === parsedCandidate.wonStatusId) {

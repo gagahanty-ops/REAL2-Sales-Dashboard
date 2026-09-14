@@ -159,6 +159,47 @@ describe("validatePipelineConfig", () => {
     });
   });
 
+  it("warns when previously confirmed renamed IDs return to the canonical names", () => {
+    const canonical = validatePipelineConfig(candidate, fixtureDiscovery());
+    if (!canonical.valid) throw new Error("fixture must validate");
+    const renamed = validatePipelineConfig(
+      candidate,
+      fixtureDiscovery({
+        pipelines: [
+          {
+            id: candidate.pipelineId,
+            name: "РЕАЛ ДВА — новое имя",
+            statuses: [
+              { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
+              { id: candidate.wonStatusId, name: "Продажа — новое имя" },
+            ],
+          },
+        ],
+      }),
+      { activeConfig: canonical.resolved },
+    );
+    if (!renamed.valid) throw new Error("same-ID rename must validate with warnings");
+
+    expect(
+      validatePipelineConfig(candidate, fixtureDiscovery(), {
+        activeConfig: renamed.resolved,
+      }),
+    ).toMatchObject({
+      valid: true,
+      requiresNameConfirmation: true,
+      warnings: [
+        "pipeline_name_changed",
+        "application_status_name_changed",
+        "won_status_name_changed",
+      ],
+      resolved: {
+        pipelineName: "РЕАЛ ДВА",
+        applicationStatusName: "Завершение (самовывоз или доставка)",
+        wonStatusName: "Успешно реализовано",
+      },
+    });
+  });
+
   it.each([
     [
       "pipeline",

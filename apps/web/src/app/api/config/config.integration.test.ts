@@ -488,6 +488,139 @@ describe("pipeline configuration routes", () => {
     ]);
   });
 
+  it("requires confirmation when renamed IDs return to their canonical names", async () => {
+    const originalAmo = new AmoDiscoveryMock();
+    vi.stubGlobal("fetch", originalAmo.fetch);
+    const initialValidationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const initialValidation = (await initialValidationResponse.json()) as {
+      data: { metadataChecksum: string };
+    };
+    const initialActivationResponse = await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        candidate,
+        channelRules: INITIAL_CHANNEL_RULES,
+        metadataChecksum: initialValidation.data.metadataChecksum,
+        expectedActiveConfigId: null,
+      }),
+    );
+    const initialActivation = (await initialActivationResponse.json()) as {
+      data: { configId: string };
+    };
+
+    const renamedAmo = new AmoDiscoveryMock({
+      pipelines: [{ id: candidate.pipelineId, name: "РЕАЛ ДВА — новое имя" }],
+      statuses: [
+        { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
+        { id: candidate.wonStatusId, name: "Продажа — новое имя" },
+      ],
+    });
+    vi.stubGlobal("fetch", renamedAmo.fetch);
+    const renamedValidationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const renamedValidation = (await renamedValidationResponse.json()) as {
+      data: { metadataChecksum: string };
+    };
+    const renamedActivationResponse = await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        candidate,
+        channelRules: INITIAL_CHANNEL_RULES,
+        metadataChecksum: renamedValidation.data.metadataChecksum,
+        expectedActiveConfigId: initialActivation.data.configId,
+        confirmNameChanges: true,
+      }),
+    );
+    const renamedActivation = (await renamedActivationResponse.json()) as {
+      data: { configId: string };
+    };
+
+    const revertedAmo = new AmoDiscoveryMock();
+    vi.stubGlobal("fetch", revertedAmo.fetch);
+    const revertedValidationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const revertedValidation = (await revertedValidationResponse.json()) as {
+      data: {
+        valid: boolean;
+        metadataChecksum: string;
+        requiresNameConfirmation: boolean;
+        warnings: string[];
+      };
+    };
+
+    expect(revertedValidationResponse.status).toBe(200);
+    expect(revertedValidation.data).toMatchObject({
+      valid: true,
+      requiresNameConfirmation: true,
+      warnings: [
+        "pipeline_name_changed",
+        "application_status_name_changed",
+        "won_status_name_changed",
+      ],
+    });
+
+    const reversalBody = {
+      candidate,
+      channelRules: INITIAL_CHANNEL_RULES,
+      metadataChecksum: revertedValidation.data.metadataChecksum,
+      expectedActiveConfigId: renamedActivation.data.configId,
+    };
+    const unconfirmed = await activateRoute(
+      sameOriginPost("/api/config/activate", reversalBody),
+    );
+    expect(unconfirmed.status).toBe(422);
+
+    const confirmed = await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        ...reversalBody,
+        confirmNameChanges: true,
+      }),
+    );
+    const confirmedBody = (await confirmed.json()) as {
+      data: { version: number };
+    };
+    expect(confirmed.status).toBe(200);
+    expect(confirmedBody.data.version).toBe(3);
+    await expect(
+      adminDb<{
+        version: number;
+        pipeline_name: string;
+        application_status_name: string;
+        won_status_name: string;
+        is_active: boolean;
+      }[]>`
+        select version, pipeline_name, application_status_name,
+          won_status_name, is_active
+        from public.pipeline_configs
+        order by version
+      `,
+    ).resolves.toEqual([
+      {
+        version: 1,
+        pipeline_name: "РЕАЛ ДВА",
+        application_status_name: "Завершение (самовывоз или доставка)",
+        won_status_name: "Успешно реализовано",
+        is_active: false,
+      },
+      {
+        version: 2,
+        pipeline_name: "РЕАЛ ДВА — новое имя",
+        application_status_name: "Завершение — новое имя",
+        won_status_name: "Продажа — новое имя",
+        is_active: false,
+      },
+      {
+        version: 3,
+        pipeline_name: "РЕАЛ ДВА",
+        application_status_name: "Завершение (самовывоз или доставка)",
+        won_status_name: "Успешно реализовано",
+        is_active: true,
+      },
+    ]);
+  });
+
   it("activates editable exact source-field, tag, and integration mappings", async () => {
     const amo = new AmoDiscoveryMock();
     vi.stubGlobal("fetch", amo.fetch);

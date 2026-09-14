@@ -190,3 +190,84 @@ Relevant output:
 
 - Encountered channel values and counts remain truthfully empty. `/api/config/channel-values` still returns no fabricated aggregate because the immutable raw table is not available until Task 5.
 - No production ID, live amoCRM credential, real network call, Google API, or protected original Sheet was used. All amended integration evidence is synthetic and local.
+
+## Fix round 2
+
+### Summary
+
+- Corrected same-ID name-drift validation to compare every subsequent live name with the currently active stored name before considering the canonical initial name.
+- Canonical Russian names remain mandatory when there is no previously confirmed binding for the selected ID.
+- A confirmed renamed pipeline/status returning to its canonical name now emits the same three warning codes as the forward rename and requires `confirmNameChanges: true` before activation.
+- The reversal activation remains checksum-fresh and bound to the expected active configuration ID, and creates a third immutable version only after confirmation.
+
+### Covering tests
+
+- `packages/domain/src/amo/config.test.ts` — `warns when previously confirmed renamed IDs return to the canonical names` covers the stored-name comparison for pipeline, application status, and won status.
+- `apps/web/src/app/api/config/config.integration.test.ts` — `requires confirmation when renamed IDs return to their canonical names` exercises original version → confirmed renamed version → canonical reversal through the real validate/activate routes and local PostgreSQL transaction. It proves validate warns, unconfirmed activation returns 422, confirmed activation succeeds as version 3, history remains immutable, and only version 3 is active.
+
+### RED evidence
+
+With only the two reversal regressions added:
+
+```text
+node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts --project unit --silent
+node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration --silent
+```
+
+- Domain: 1 failed / 12 passed. The reversal returned `requiresNameConfirmation: false` and `warnings: []` instead of all three name-change warnings.
+- Config integration: 1 failed / 13 passed with the same missing reversal warnings at the validate route boundary.
+
+### GREEN evidence and exact commands
+
+Every package-manager invocation used:
+
+```text
+export PATH=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/node/bin:$PATH
+REAL2_PNPM=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/pnpm/bin/pnpm.cjs
+```
+
+Focused GREEN:
+
+```text
+node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts --project unit --silent
+node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration --silent
+```
+
+- Domain: 13/13 passed.
+- Config integration: 14/14 passed.
+
+Fresh completion verification:
+
+```text
+node "$REAL2_PNPM" exec supabase db reset
+node "$REAL2_PNPM" test
+node "$REAL2_PNPM" exec vitest run --project integration --silent
+node "$REAL2_PNPM" exec vitest run --project security --silent
+node "$REAL2_PNPM" lint
+node "$REAL2_PNPM" typecheck
+node "$REAL2_PNPM" build
+node "$REAL2_PNPM" check:secrets
+git diff --check
+```
+
+Relevant output:
+
+- Node `v22.23.2`; local Supabase reset reapplied migrations `0001` through `0004` successfully.
+- Repository/worker checks: 12/12 passed; Vitest unit: 76/76 passed across 13 files.
+- Full integration: 44/44 passed across 5 files.
+- Security: 15/15 passed across RLS and log-redaction suites.
+- Lint and typecheck passed for all six workspace packages plus scripts.
+- All packages and the Next.js production application built successfully; static generation completed 17/17 and all config/settings/quality routes were present.
+- Tracked-secret scan and whitespace check exited 0.
+
+### Self-review
+
+- For an existing binding, the branch order is now ID match → stored-name comparison. This catches renamed → canonical, renamed → another rename, and canonical → renamed equally.
+- Canonical-name validation is reached only when the live entity has no matching active binding, preserving the guarded initial setup and explicit selection of a different API-confirmed ID.
+- Route inputs already project the active stored pipeline/status names into validation; the new route regression proves those names survive the database/public boundary and control both validation and activation confirmation.
+- No transaction, checksum, active-state lock, channel-rule, RLS, or external-network behavior changed in this round.
+
+### Concerns / follow-up boundary
+
+- Encountered channel counts remain deferred to Task 5 as previously documented; this round does not alter that truthful empty state.
+- Verification used only synthetic fixtures and the local database. No live amoCRM request or credential was used.
