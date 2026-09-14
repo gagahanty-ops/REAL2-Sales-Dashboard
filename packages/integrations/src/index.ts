@@ -13,6 +13,12 @@ export {
   type AmoTokenPair,
 } from "./amo/oauth.js";
 export { amoFetch } from "./amo/transport.js";
+export {
+  createAmoTokenProvider,
+  refreshConnection,
+  refreshDueConnections,
+  type RefreshAmoTokenDependencies,
+} from "./amo/refresh.js";
 export type {
   AmoAuditEntry,
   AmoAuditSink,

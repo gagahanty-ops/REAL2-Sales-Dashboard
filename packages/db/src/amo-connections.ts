@@ -76,6 +76,11 @@ type AmoConnectionRow = {
   updated_at: Date;
 };
 
+type SafeAmoConnectionRow = Omit<
+  AmoConnectionRow,
+  "access_token_ciphertext" | "refresh_token_ciphertext"
+>;
+
 export type LockedAmoConnectionActions = Readonly<{
   rotateTokens(input: {
     accessTokenCiphertext: Uint8Array;
@@ -131,6 +136,22 @@ function safeProjection(
     refreshedAt: connection.refreshedAt,
     disabledAt: connection.disabledAt,
     updatedAt: connection.updatedAt,
+  };
+}
+
+function mapSafeConnection(row: SafeAmoConnectionRow): SafeAmoConnectionStatus {
+  return {
+    id: row.id,
+    accountId: safeAccountId(row.account_id),
+    subdomain: row.subdomain,
+    baseUrl: row.base_url,
+    tokenExpiresAt: row.token_expires_at,
+    status: row.status,
+    installedBy: row.installed_by,
+    installedAt: row.installed_at,
+    refreshedAt: row.refreshed_at,
+    disabledAt: row.disabled_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -278,6 +299,30 @@ export async function getSafeAmoConnectionStatus(
   connectionId: string,
 ): Promise<SafeAmoConnectionStatus> {
   return safeProjection(await getAmoConnectionCredentials(db, connectionId));
+}
+
+export async function getCurrentSafeAmoConnectionStatus(
+  db: Database,
+): Promise<SafeAmoConnectionStatus | null> {
+  const [row] = await db<SafeAmoConnectionRow[]>`
+    select
+      id,
+      account_id,
+      subdomain,
+      base_url,
+      token_expires_at,
+      status,
+      installed_by,
+      installed_at,
+      refreshed_at,
+      disabled_at,
+      updated_at
+    from public.amo_connections
+    where base_url = 'https://555151.amocrm.ru'
+    order by updated_at desc, id
+    limit 1
+  `;
+  return row ? mapSafeConnection(row) : null;
 }
 
 export async function findDueAmoConnectionIds(

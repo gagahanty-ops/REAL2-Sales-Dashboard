@@ -13,6 +13,7 @@
   "dependencies": {
     "@real2/db": "workspace:*",
     "@real2/domain": "workspace:*",
+    "@real2/integrations": "workspace:*",
     "@supabase/ssr": "^0.8.0",
     "@supabase/supabase-js": "^2.90.0",
     "next": "^16.0.0",

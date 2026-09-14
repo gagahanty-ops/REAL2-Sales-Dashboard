@@ -21,6 +21,7 @@ export {
   disableAmoConnection,
   findDueAmoConnectionIds,
   getAmoConnectionCredentials,
+  getCurrentSafeAmoConnectionStatus,
   getSafeAmoConnectionStatus,
   purgeExpiredOAuthStates,
   withLockedAmoConnection,

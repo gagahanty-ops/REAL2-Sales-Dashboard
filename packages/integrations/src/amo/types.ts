@@ -35,7 +35,7 @@ export interface AmoFetchRequest<T> {
   schema: ZodType<T>;
   traceId: string;
   tokenProvider: AmoTokenProvider;
-  fetchFn: AmoFetchFn;
+  fetchFn?: AmoFetchFn;
   auditSink: AmoAuditSink;
   body?: BodyInit | null;
   headers?: HeadersInit;

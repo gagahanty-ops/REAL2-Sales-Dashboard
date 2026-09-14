@@ -166,6 +166,65 @@ p {
   background: rgb(255 107 121 / 16%);
 }
 
+.amo-integration {
+  display: grid;
+  gap: 18px;
+  max-width: 720px;
+}
+
+.integration-heading,
+.card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.integration-heading h2 {
+  margin-bottom: 6px;
+}
+
+.integration-heading .muted {
+  margin-bottom: 0;
+}
+
+.integration-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.integration-details div {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0a2130;
+}
+
+.integration-details dt {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.integration-details dd {
+  margin: 0;
+  font-weight: 700;
+}
+
+@media (max-width: 620px) {
+  .integration-heading,
+  .card-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .integration-details {
+    grid-template-columns: 1fr;
+  }
+}
+
 .form-success {
   color: #dfffc8;
   background: rgb(151 231 88 / 14%);

@@ -16,7 +16,7 @@ import {
   createAmoTokenProvider,
   refreshConnection,
   refreshDueConnections,
-} from "../../../../apps/worker/src/jobs/refresh-amo-token";
+} from "./refresh";
 import { localDatabaseUrl, resetAndSeedUsers, testUsers } from "../../../../tests/helpers/local-db";
 import { decryptToken, encryptToken } from "./crypto";
 import { exchangeAuthorizationCode } from "./oauth";

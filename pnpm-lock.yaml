@@ -56,6 +56,9 @@ importers:
       '@real2/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@real2/integrations':
+        specifier: workspace:*
+        version: link:../../packages/integrations
       '@supabase/ssr':
         specifier: ^0.8.0
         version: 0.8.0(@supabase/supabase-js@2.116.0)
@@ -118,6 +121,9 @@ importers:
 
   packages/integrations:
     dependencies:
+      '@real2/db':
+        specifier: workspace:*
+        version: link:../db
       '@real2/domain':
         specifier: workspace:*
         version: link:../domain

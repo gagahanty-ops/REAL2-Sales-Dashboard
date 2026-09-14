@@ -15,6 +15,7 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
+    "@real2/db": "workspace:*",
     "@real2/domain": "workspace:*",
     "zod": "^4.0.0"
   }
