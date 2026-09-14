@@ -1,8 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState } from "react";
 
-import type { PublicAmoConnectionStatus } from "../lib/amo/admin";
+import {
+  isAmoConnectionActive,
+  type PublicAmoConnectionStatus,
+} from "../lib/amo/public-status";
 
 type ApiBody = {
   data?: { authorizationUrl?: string };
@@ -64,15 +67,19 @@ export function AmoIntegrationManager({
         setError(body.error?.message ?? "Не удалось обновить подключение");
         return;
       }
-      const statusResponse = await fetch("/api/integrations/amo/status");
-      const statusBody = (await readApi(statusResponse)) as ApiBody & {
-        data?: PublicAmoConnectionStatus | null;
-      };
-      if (statusResponse.ok) setStatus(statusBody.data ?? null);
       setMessage(successMessage);
     } catch {
       setError("Сервис временно недоступен. Повторите попытку");
     } finally {
+      try {
+        const statusResponse = await fetch("/api/integrations/amo/status");
+        const statusBody = (await readApi(statusResponse)) as ApiBody & {
+          data?: PublicAmoConnectionStatus | null;
+        };
+        if (statusResponse.ok) setStatus(statusBody.data ?? null);
+      } catch {
+        // Keep the last safe projection when a status reload is unavailable.
+      }
       setPending(null);
     }
   }
@@ -104,10 +111,10 @@ export function AmoIntegrationManager({
         <button className="button" disabled={pending !== null} onClick={startConnection} type="button">
           {pending === "start" ? "Открываем…" : status ? "Переподключить" : "Подключить"}
         </button>
-        <button className="button button-secondary" disabled={!status || pending !== null} onClick={() => updateConnection("refresh", "Токен обновлён на сервере")} type="button">
+        <button className="button button-secondary" disabled={!isAmoConnectionActive(status) || pending !== null} onClick={() => updateConnection("refresh", "Проверка чтения завершена")} type="button">
           {pending === "refresh" ? "Проверяем…" : "Проверить чтение"}
         </button>
-        <button className="button button-danger" disabled={!status || pending !== null} onClick={() => updateConnection("disconnect", "Интеграция отключена. Последний снимок сохранён")} type="button">
+        <button className="button button-danger" disabled={!isAmoConnectionActive(status) || pending !== null} onClick={() => updateConnection("disconnect", "Интеграция отключена. Последний снимок сохранён")} type="button">
           {pending === "disconnect" ? "Отключаем…" : "Отключить"}
         </button>
       </div>

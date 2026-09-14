@@ -12,7 +12,12 @@ export const POST = withRoute(async (request) => {
   const admin = requireRole(await requireUser(), ["admin"]);
   requireSameOrigin(request);
   const env = getServerEnv();
-  const state = await createOAuthState(getDatabase(), admin.id);
+  const state = await createOAuthState(
+    getDatabase(),
+    admin.id,
+    new Date(),
+    "/settings/integrations/amo",
+  );
   const authorizationUrl = new URL(AMO_AUTHORIZE_URL);
   authorizationUrl.searchParams.set("client_id", env.AMO_CLIENT_ID);
   authorizationUrl.searchParams.set("redirect_uri", env.AMO_REDIRECT_URI);

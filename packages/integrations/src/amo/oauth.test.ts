@@ -87,6 +87,7 @@ async function insertConnection(overrides: {
       overrides.tokenExpiresAt ?? new Date(now.getTime() + 5 * 60_000),
     status: "active",
     installedBy: testUsers.admin.id,
+    lastCheckedAt: now,
   });
 }
 

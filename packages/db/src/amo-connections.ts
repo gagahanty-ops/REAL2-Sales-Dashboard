@@ -33,6 +33,7 @@ export type SafeAmoConnectionStatus = Readonly<{
   installedBy: string;
   installedAt: Date;
   refreshedAt: Date | null;
+  lastCheckedAt: Date | null;
   disabledAt: Date | null;
   updatedAt: Date;
 }>;
@@ -52,6 +53,7 @@ export type CreateAmoConnectionInput = Readonly<{
   tokenExpiresAt: Date;
   status: AmoConnectionStatusValue;
   installedBy: string;
+  lastCheckedAt: Date;
 }>;
 
 type OAuthStateRow = {
@@ -72,6 +74,7 @@ type AmoConnectionRow = {
   installed_by: string;
   installed_at: Date;
   refreshed_at: Date | null;
+  last_checked_at: Date | null;
   disabled_at: Date | null;
   updated_at: Date;
 };
@@ -89,6 +92,7 @@ export type LockedAmoConnectionActions = Readonly<{
     refreshedAt: Date;
   }): Promise<void>;
   markReauthRequired(at: Date): Promise<void>;
+  markCheckedAt(checkedAt: Date): Promise<void>;
 }>;
 
 function stateHash(value: string): string {
@@ -116,6 +120,7 @@ function mapConnection(row: AmoConnectionRow): AmoConnectionCredentials {
     installedBy: row.installed_by,
     installedAt: row.installed_at,
     refreshedAt: row.refreshed_at,
+    lastCheckedAt: row.last_checked_at,
     disabledAt: row.disabled_at,
     updatedAt: row.updated_at,
   };
@@ -134,6 +139,7 @@ function safeProjection(
     installedBy: connection.installedBy,
     installedAt: connection.installedAt,
     refreshedAt: connection.refreshedAt,
+    lastCheckedAt: connection.lastCheckedAt,
     disabledAt: connection.disabledAt,
     updatedAt: connection.updatedAt,
   };
@@ -150,6 +156,7 @@ function mapSafeConnection(row: SafeAmoConnectionRow): SafeAmoConnectionStatus {
     installedBy: row.installed_by,
     installedAt: row.installed_at,
     refreshedAt: row.refreshed_at,
+    lastCheckedAt: row.last_checked_at,
     disabledAt: row.disabled_at,
     updatedAt: row.updated_at,
   };
@@ -173,6 +180,7 @@ async function findConnection(
       installed_by,
       installed_at,
       refreshed_at,
+      last_checked_at,
       disabled_at,
       updated_at
     from public.amo_connections
@@ -263,7 +271,8 @@ export async function createAmoConnection(
       refresh_token_ciphertext,
       token_expires_at,
       status,
-      installed_by
+      installed_by,
+      last_checked_at
     ) values (
       ${input.accountId},
       ${input.subdomain},
@@ -272,7 +281,8 @@ export async function createAmoConnection(
       ${Buffer.from(input.refreshTokenCiphertext)},
       ${input.tokenExpiresAt},
       ${input.status},
-      ${input.installedBy}
+      ${input.installedBy},
+      ${input.lastCheckedAt}
     )
     returning *
   `;
@@ -315,6 +325,7 @@ export async function getCurrentSafeAmoConnectionStatus(
       installed_by,
       installed_at,
       refreshed_at,
+      last_checked_at,
       disabled_at,
       updated_at
     from public.amo_connections
@@ -375,6 +386,13 @@ export async function withLockedAmoConnection<T>(
         await transaction`
           update public.amo_connections
           set status = 'reauth_required', updated_at = ${at}
+          where id = ${connectionId}
+        `;
+      },
+      async markCheckedAt(checkedAt) {
+        await transaction`
+          update public.amo_connections
+          set last_checked_at = ${checkedAt}, updated_at = ${checkedAt}
           where id = ${connectionId}
         `;
       },

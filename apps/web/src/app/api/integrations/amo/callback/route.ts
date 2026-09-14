@@ -10,23 +10,23 @@ import {
   decodeTokenEncryptionKey,
   encryptToken,
   exchangeAuthorizationCode,
-  type AmoAuditEntry,
-  type AmoAuditSink,
 } from "@real2/integrations";
 import { z } from "zod";
 
 import { requireRole } from "../../../../../lib/auth/authorization";
 import { requireUser } from "../../../../../lib/auth/require-user";
 import { withRoute } from "../../../../../lib/http/route";
-import { safeLogger } from "../../../../../lib/logging/logger";
 import {
   getDatabase,
   getServerEnv,
 } from "../../../../../lib/server/runtime";
+import {
+  AMO_BASE_URL,
+  amoAccountSchema,
+  assertAmoAccountBinding,
+} from "../../../../../lib/amo/account";
+import { createAmoAdminAuditSink } from "../../../../../lib/amo/audit";
 
-const AMO_BASE_URL = "https://555151.amocrm.ru";
-const AMO_ACCOUNT_ID = 555_151;
-const AMO_SUBDOMAIN = "555151";
 const SAFE_REDIRECTS = new Set([
   "/settings/integrations",
   "/settings/integrations/amo",
@@ -36,32 +36,6 @@ const callbackSchema = z.strictObject({
   code: z.string().min(1).max(4_096),
   state: z.string().min(1).max(512),
 });
-
-const accountSchema = z.object({
-  id: z.number().int().positive(),
-  subdomain: z.string().regex(/^[a-z0-9-]+$/),
-});
-
-function auditSink(): AmoAuditSink {
-  return {
-    record(entry: AmoAuditEntry) {
-      const completed = entry.result === "success";
-      const log = completed ? safeLogger.info : safeLogger.error;
-      log({
-        message: completed ? "request completed" : "request failed",
-        operation: "http_request",
-        method: entry.method,
-        normalized_path: entry.normalizedPath,
-        ...(entry.responseStatus !== undefined
-          ? { status: entry.responseStatus }
-          : {}),
-        duration_ms: entry.durationMs,
-        trace_id: entry.traceId,
-        result: entry.result,
-      });
-    },
-  };
-}
 
 function safeRedirect(redirectAfter: string, appUrl: string): Response {
   if (!SAFE_REDIRECTS.has(redirectAfter)) {
@@ -89,7 +63,7 @@ export const GET = withRoute(async (request, context) => {
 
   const env = getServerEnv();
   const transport = {
-    auditSink: auditSink(),
+    auditSink: createAmoAdminAuditSink(),
     traceId: context.traceId,
   };
   const tokenPair = await exchangeAuthorizationCode(input.code, {
@@ -100,7 +74,7 @@ export const GET = withRoute(async (request, context) => {
   const account = await amoFetch({
     method: "GET",
     url: `${AMO_BASE_URL}/api/v4/account`,
-    schema: accountSchema,
+    schema: amoAccountSchema,
     traceId: context.traceId,
     tokenProvider: {
       async getAccessToken() {
@@ -111,13 +85,7 @@ export const GET = withRoute(async (request, context) => {
     redirect: "error",
   });
 
-  if (
-    account.id !== AMO_ACCOUNT_ID ||
-    account.subdomain !== AMO_SUBDOMAIN ||
-    `${account.subdomain}.amocrm.ru` !== new URL(AMO_BASE_URL).hostname
-  ) {
-    throw new AppError("E_CONFLICT", 409);
-  }
+  assertAmoAccountBinding(account);
 
   const existing = await getCurrentSafeAmoConnectionStatus(db);
   if (
@@ -158,6 +126,7 @@ export const GET = withRoute(async (request, context) => {
         tokenExpiresAt,
         refreshedAt: now,
       });
+      await actions.markCheckedAt(now);
     });
   } else {
     await createAmoConnection(db, {
@@ -169,6 +138,7 @@ export const GET = withRoute(async (request, context) => {
       tokenExpiresAt,
       status: "active",
       installedBy: admin.id,
+      lastCheckedAt: now,
     });
   }
 

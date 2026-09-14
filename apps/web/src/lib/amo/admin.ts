@@ -4,13 +4,9 @@ import {
   type SafeAmoConnectionStatus,
 } from "@real2/db";
 
-export type PublicAmoConnectionStatus = Readonly<{
-  accountId: number;
-  subdomain: string;
-  status: SafeAmoConnectionStatus["status"];
-  expiresAt: string;
-  lastCheckedAt: string;
-}>;
+import type { PublicAmoConnectionStatus } from "./public-status";
+
+export type { PublicAmoConnectionStatus } from "./public-status";
 
 export function toPublicAmoConnectionStatus(
   connection: SafeAmoConnectionStatus,
@@ -21,10 +17,11 @@ export function toPublicAmoConnectionStatus(
     status: connection.status,
     expiresAt: connection.tokenExpiresAt.toISOString(),
     lastCheckedAt: (
-      connection.refreshedAt ?? connection.installedAt
+      connection.lastCheckedAt ?? connection.installedAt
     ).toISOString(),
   };
 }
+
 
 export async function getCurrentPublicAmoConnectionStatus(
   db: Database,

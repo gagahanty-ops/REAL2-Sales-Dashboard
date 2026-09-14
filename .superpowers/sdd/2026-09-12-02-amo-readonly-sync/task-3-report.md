@@ -101,3 +101,75 @@ passed
   redirect; no credential material is present in that URL.
 - Production installation, live credentials, and owner confirmation of amoCRM
   support remain deliberately out of scope and were not attempted.
+
+## Fix round 1
+
+### Review fixes
+
+- `start` now creates a state whose redirect target is explicitly
+  `/settings/integrations/amo`; an integration test consumes that exact state
+  through callback and verifies the resulting local redirect.
+- The unsupported assumption that account ID equals subdomain number was
+  removed. First install accepts any positive account ID returned from the
+  fixed-host/fixed-subdomain account GET; reconnect and refreshed read checks
+  compare that returned ID with the stored binding. Fixtures use account ID
+  `4242` with subdomain `555151` to prove the distinction.
+- Refresh now performs its guarded OAuth POST through the reviewed locked
+  refresh implementation, then performs guarded `GET /api/v4/account` with
+  the refreshed server-only token. It validates the host/subdomain and stored
+  account ID before marking `last_checked_at`.
+- Migration `0003_amo_read_check.sql` adds the safe check timestamp. Callback
+  sets it after its verified account GET; failed refreshed reads leave it
+  unchanged. The public status projection exposes only its ISO timestamp.
+- Callback and refresh now share `createAmoAdminAuditSink`, preserving the
+  same redacted audit mapping.
+- The client reloads the safe status projection after every refresh/disconnect
+  outcome and enables refresh/disconnect only for an `active` connection. The
+  browser-safe status type/helper is separate from the DB-backed server mapper.
+
+### RED / GREEN evidence
+
+The amended integration cases were run before the fixes and failed as expected:
+
+```text
+10 failed / 29 total
+first start callback: expected 303, received 409
+first install with account ID 4242/subdomain 555151: expected 303, received 409
+```
+
+After applying migration `0003` to the local synthetic Supabase database, the
+following commands completed successfully with the mandated Node/pnpm runtime:
+
+```text
+supabase db reset
+Applied migrations 0001, 0002, 0003
+
+node "$REAL2_PNPM" test:integration -- apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
+4 files passed; 30 integration tests passed
+
+node "$REAL2_PNPM" test:security
+2 files passed; 13 security tests passed
+
+node "$REAL2_PNPM" test
+11 unit files / 60 tests passed; 12 repository-worker tests passed
+
+node "$REAL2_PNPM" lint
+passed
+
+node "$REAL2_PNPM" typecheck
+passed
+
+node "$REAL2_PNPM" build
+passed; web routes and settings page compiled
+
+node "$REAL2_PNPM" check:secrets
+passed
+```
+
+Covering test files include
+`apps/web/src/app/api/integrations/amo/oauth.integration.test.ts` (actual
+start state, distinct account ID, refreshed account GET, wrong refreshed
+binding, and reauth status),
+`apps/web/src/components/amo-integration-manager.test.tsx` (disabled and
+reauth action availability), `packages/integrations/src/amo/oauth.test.ts`,
+and the existing RLS/log-redaction security tests.

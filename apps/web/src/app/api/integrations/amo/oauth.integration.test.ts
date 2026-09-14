@@ -26,6 +26,7 @@ const syntheticTokenPair = {
   refreshToken: "synthetic-refresh-callback",
   expiresInSeconds: 3_600,
 } as const;
+const syntheticAccountId = 4_242;
 
 const adminDb = createAdminDb();
 
@@ -95,6 +96,11 @@ class AmoMock {
   queueAccount(account: { id: number; subdomain: string }): void {
     this.responses.push(Response.json(account));
   }
+
+  queueResponse(response: Response): void {
+    this.responses.push(response);
+  }
+
 }
 
 function callbackRequest(state: string, code: string): Request {
@@ -141,7 +147,7 @@ afterAll(async () => {
 });
 
 describe("amoCRM OAuth administration", () => {
-  it("creates an admin-bound one-time state and a safe authorization URL", async () => {
+  it("uses the start-created state to return to the implemented settings page", async () => {
     const response = await startRoute(
       sameOriginPost("/api/integrations/amo/start"),
     );
@@ -162,10 +168,26 @@ describe("amoCRM OAuth administration", () => {
     expect(authorizationUrl.searchParams.get("state")).toMatch(/^[\w-]{43}$/);
     expect(authorizationUrl.searchParams.get("client_secret")).toBeNull();
 
+    const amoMock = new AmoMock();
+    amoMock.queueTokenPair(syntheticTokenPair);
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+    vi.stubGlobal("fetch", amoMock.fetch);
+    const callback = await callbackRoute(
+      callbackRequest(authorizationUrl.searchParams.get("state")!, "synthetic-auth-code"),
+    );
+
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe(
+      "https://dashboard.example.test/settings/integrations/amo",
+    );
+
     const [state] = await adminDb<{ created_by: string; consumed_at: Date | null }[]>`
       select created_by, consumed_at from public.oauth_states
     `;
-    expect(state).toEqual({ created_by: testUsers.admin.id, consumed_at: null });
+    expect(state).toMatchObject({
+      created_by: testUsers.admin.id,
+      consumed_at: expect.any(Date),
+    });
   });
 
   it("rejects an OAuth result bound to a different account", async () => {
@@ -183,19 +205,19 @@ describe("amoCRM OAuth administration", () => {
     expect(await connectionCount()).toBe(0);
   });
 
-  it("rejects the unexpected numeric account ID before saving tokens", async () => {
+  it("accepts a verified account ID that differs from the fixed subdomain", async () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 999, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
 
     const response = await callbackRoute(
       callbackRequest(state.value, "synthetic-auth-code"),
     );
 
-    expect(response.status).toBe(409);
-    expect(await connectionCount()).toBe(0);
+    expect(response.status).toBe(303);
+    expect(await connectionCount()).toBe(1);
   });
 
   it("rejects reinstallation when the verified numeric account ID changes", async () => {
@@ -203,7 +225,7 @@ describe("amoCRM OAuth administration", () => {
     const secondState = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     amoMock.queueTokenPair(syntheticTokenPair);
     amoMock.queueAccount({ id: 999, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
@@ -224,7 +246,7 @@ describe("amoCRM OAuth administration", () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
     session.user.role = "head";
 
@@ -245,7 +267,7 @@ describe("amoCRM OAuth administration", () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
 
     const accepted = await callbackRoute(
@@ -269,7 +291,7 @@ describe("amoCRM OAuth administration", () => {
     );
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -313,7 +335,7 @@ describe("amoCRM OAuth administration", () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
 
@@ -333,7 +355,7 @@ describe("amoCRM OAuth administration", () => {
       "subdomain",
     ]);
     expect(body.data).toMatchObject({
-      accountId: 555_151,
+      accountId: syntheticAccountId,
       subdomain: "555151",
       status: "active",
     });
@@ -348,12 +370,13 @@ describe("amoCRM OAuth administration", () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     amoMock.queueTokenPair({
       ...syntheticTokenPair,
       accessToken: "synthetic-access-refreshed",
       refreshToken: "synthetic-refresh-refreshed",
     });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
 
@@ -367,14 +390,72 @@ describe("amoCRM OAuth administration", () => {
       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
       ["https://555151.amocrm.ru/api/v4/account", "GET"],
       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+      ["https://555151.amocrm.ru/api/v4/account", "GET"],
     ]);
+  });
+
+  it("does not report a successful read check when the refreshed token sees another account", async () => {
+    const state = await createOAuthState(adminDb, testUsers.admin.id);
+    const amoMock = new AmoMock();
+    amoMock.queueTokenPair(syntheticTokenPair);
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+    amoMock.queueTokenPair({
+      ...syntheticTokenPair,
+      accessToken: "synthetic-access-refreshed",
+      refreshToken: "synthetic-refresh-refreshed",
+    });
+    amoMock.queueAccount({ id: 999, subdomain: "555151" });
+    vi.stubGlobal("fetch", amoMock.fetch);
+    await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
+    const [before] = await adminDb<{ last_checked_at: Date }[]>`
+      select last_checked_at from public.amo_connections
+    `;
+
+    const response = await refreshRoute(
+      sameOriginPost("/api/integrations/amo/refresh"),
+    );
+
+    expect(response.status).toBe(409);
+    const [after] = await adminDb<{ last_checked_at: Date }[]>`
+      select last_checked_at from public.amo_connections
+    `;
+    expect(after?.last_checked_at).toEqual(before?.last_checked_at);
+    expect(amoMock.requests.map(({ url, init }) => [url, init.method])).toEqual([
+      ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+      ["https://555151.amocrm.ru/api/v4/account", "GET"],
+      ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+      ["https://555151.amocrm.ru/api/v4/account", "GET"],
+    ]);
+  });
+
+  it("exposes reauth_required after a failed refresh for the client status reload", async () => {
+    const state = await createOAuthState(adminDb, testUsers.admin.id);
+    const amoMock = new AmoMock();
+    amoMock.queueTokenPair(syntheticTokenPair);
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+    amoMock.queueResponse(new Response(null, { status: 500 }));
+    vi.stubGlobal("fetch", amoMock.fetch);
+    await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
+
+    const refresh = await refreshRoute(
+      sameOriginPost("/api/integrations/amo/refresh"),
+    );
+    const status = await statusRoute(
+      new Request("https://dashboard.example.test/api/integrations/amo/status"),
+    );
+
+    expect(refresh.status).toBe(502);
+    expect((await status.json() as { data: { status: string } }).data.status).toBe(
+      "reauth_required",
+    );
+    expect(amoMock.requests).toHaveLength(3);
   });
 
   it("disconnects locally without an amoCRM business request", async () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
+    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
 
