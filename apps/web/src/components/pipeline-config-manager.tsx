@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
 type Discovery = Readonly<{
   pipelines: readonly Readonly<{
@@ -37,6 +37,17 @@ type Validation = Readonly<{
   valid: boolean;
   metadataChecksum: string;
   reasons?: readonly string[];
+  warnings?: readonly string[];
+  requiresNameConfirmation?: boolean;
+}>;
+
+type CurrentConfig = Readonly<{
+  configId: string;
+  pipelineId: number;
+  applicationStatusId: number;
+  wonStatusId: number;
+  sourceFieldId: number | null;
+  channelRules: readonly ChannelRule[];
 }>;
 
 type ApiBody<T> = {
@@ -56,7 +67,10 @@ export function PipelineConfigManager({
 }: Readonly<{ initialChannelRules: readonly ChannelRule[] }>) {
   const [discovery, setDiscovery] = useState<Discovery | null>(null);
   const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [expectedActiveConfigId, setExpectedActiveConfigId] = useState<string | null>(null);
+  const [channelRules, setChannelRules] = useState(initialChannelRules);
   const [validation, setValidation] = useState<Validation | null>(null);
+  const [confirmNameChanges, setConfirmNameChanges] = useState(false);
   const [pending, setPending] = useState<"discovery" | "validate" | "activate" | null>(
     "discovery",
   );
@@ -68,28 +82,45 @@ export function PipelineConfigManager({
 
     async function loadDiscovery() {
       try {
-        const response = await fetch("/api/config/discovery");
-        const body = await readApi<Discovery>(response);
-        if (!response.ok || !body.data) {
+        const [response, currentResponse] = await Promise.all([
+          fetch("/api/config/discovery"),
+          fetch("/api/config/current"),
+        ]);
+        const [body, currentBody] = await Promise.all([
+          readApi<Discovery>(response),
+          readApi<CurrentConfig | null>(currentResponse),
+        ]);
+        if (!response.ok || !body.data || !currentResponse.ok) {
           if (!cancelled) setError(body.error?.message ?? "Метаданные amoCRM недоступны");
           return;
         }
+        const current = currentBody.data ?? null;
 
         const preferredPipeline =
+          body.data.pipelines.find((pipeline) => pipeline.id === current?.pipelineId) ??
           body.data.pipelines.find((pipeline) => pipeline.name === "РЕАЛ ДВА") ??
           body.data.pipelines[0];
-        const applicationStatus = preferredPipeline?.statuses.find(
-          (status) => status.name === expectedApplicationName,
-        );
-        const wonStatus = preferredPipeline?.statuses.find(
-          (status) => status.name === expectedWonName,
-        );
+        const applicationStatus = current
+          ? preferredPipeline?.statuses.find(
+              (status) => status.id === current.applicationStatusId,
+            )
+          : preferredPipeline?.statuses.find(
+              (status) => status.name === expectedApplicationName,
+            );
+        const wonStatus = current
+          ? preferredPipeline?.statuses.find((status) => status.id === current.wonStatusId)
+          : preferredPipeline?.statuses.find((status) => status.name === expectedWonName);
         const sourceField = body.data.leadCustomFields.find(
-          (field) => field.name === "Источник сделки",
+          (field) =>
+            current
+              ? field.id === current.sourceFieldId
+              : field.name === "Источник сделки",
         );
 
         if (!cancelled) {
           setDiscovery(body.data);
+          setExpectedActiveConfigId(current?.configId ?? null);
+          setChannelRules(current?.channelRules ?? initialChannelRules);
           if (preferredPipeline && applicationStatus && wonStatus) {
             setCandidate({
               pipelineId: preferredPipeline.id,
@@ -110,7 +141,7 @@ export function PipelineConfigManager({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [initialChannelRules]);
 
   const selectedPipeline = useMemo(
     () => discovery?.pipelines.find((pipeline) => pipeline.id === candidate?.pipelineId),
@@ -126,11 +157,13 @@ export function PipelineConfigManager({
       channelFieldId: candidate?.channelFieldId ?? null,
     });
     setValidation(null);
+    setConfirmNameChanges(false);
   }
 
   function updateCandidate(change: Partial<Candidate>) {
     setCandidate((current) => (current ? { ...current, ...change } : null));
     setValidation(null);
+    setConfirmNameChanges(false);
     setMessage(null);
   }
 
@@ -151,8 +184,11 @@ export function PipelineConfigManager({
         return;
       }
       setValidation(body.data);
+      setConfirmNameChanges(false);
       if (!body.data.valid) {
         setError("ID и имена не подтверждены live-метаданными amoCRM");
+      } else if (body.data.requiresNameConfirmation) {
+        setMessage("ID сохранены, но имена изменились. Проверьте и подтвердите новые имена.");
       } else {
         setMessage("ID, имена и принадлежность этапов подтверждены");
       }
@@ -174,11 +210,17 @@ export function PipelineConfigManager({
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           candidate,
-          channelRules: initialChannelRules,
+          channelRules,
           metadataChecksum: validation.metadataChecksum,
+          expectedActiveConfigId,
+          confirmNameChanges,
         }),
       });
-      const body = await readApi<{ version: number }>(response);
+      const body = await readApi<{
+        configId: string;
+        version: number;
+        channelRules: readonly ChannelRule[];
+      }>(response);
       if (!response.ok || !body.data) {
         setError(body.error?.message ?? "Конфигурация не активирована");
         return;
@@ -186,7 +228,10 @@ export function PipelineConfigManager({
       setMessage(
         `Версия ${body.data.version} активирована. Пересчёт поставлен в очередь; текущий снимок не изменён.`,
       );
+      setExpectedActiveConfigId(body.data.configId);
+      setChannelRules(body.data.channelRules);
       setValidation(null);
+      setConfirmNameChanges(false);
     } catch {
       setError("Сервис временно недоступен. Повторите попытку");
     } finally {
@@ -275,10 +320,29 @@ export function PipelineConfigManager({
           <button className="button button-secondary" disabled={pending !== null} onClick={validate} type="button">
             {pending === "validate" ? "Проверяем…" : "Проверить по API"}
           </button>
-          <button className="button" disabled={!validation?.valid || pending !== null} onClick={activate} type="button">
+          <button
+            className="button"
+            disabled={
+              !validation?.valid ||
+              (validation.requiresNameConfirmation && !confirmNameChanges) ||
+              pending !== null
+            }
+            onClick={activate}
+            type="button"
+          >
             {pending === "activate" ? "Активируем…" : "Активировать новую версию"}
           </button>
         </div>
+        {validation?.requiresNameConfirmation ? (
+          <label className="confirmation-field">
+            <input
+              checked={confirmNameChanges}
+              onChange={(event) => setConfirmNameChanges(event.target.checked)}
+              type="checkbox"
+            />
+            Подтверждаю новые имена при сохранённых ID воронки и этапов
+          </label>
+        ) : null}
       </section>
       {error ? <p className="form-error" role="alert">{error}</p> : null}
       {message ? <p className="form-success" aria-live="polite">{message}</p> : null}

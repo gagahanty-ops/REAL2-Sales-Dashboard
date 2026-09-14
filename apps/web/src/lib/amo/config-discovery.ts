@@ -2,7 +2,12 @@ import {
   getCurrentSafeAmoConnectionStatus,
   type Database,
 } from "@real2/db";
-import { AppError, type AmoConfigDiscovery, type ServerEnv } from "@real2/domain";
+import {
+  amoConfigDiscoverySchema,
+  AppError,
+  type AmoConfigDiscovery,
+  type ServerEnv,
+} from "@real2/domain";
 import {
   amoFetch,
   createAmoTokenProvider,
@@ -136,9 +141,9 @@ export async function discoverAmoConfigMetadata(
     }),
   ]);
 
-  return {
+  return amoConfigDiscoverySchema.parse({
     pipelines: pipelineStatuses,
     leadCustomFields: customFieldsResponse._embedded.custom_fields,
     users: usersResponse._embedded.users,
-  };
+  });
 }

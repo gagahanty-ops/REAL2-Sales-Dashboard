@@ -66,19 +66,31 @@ const candidate = {
 class AmoDiscoveryMock {
   readonly requests: Array<{ url: string; init: RequestInit }> = [];
 
+  constructor(
+    private readonly metadata: Readonly<{
+      pipelines?: readonly Readonly<{ id: number; name: string }>[];
+      statuses?: readonly Readonly<{ id: number; name: string }>[];
+      customFields?: readonly Readonly<{ id: number; name: string }>[];
+    }> = {},
+  ) {}
+
   readonly fetch = vi.fn(async (input: string | URL, init: RequestInit) => {
     this.requests.push({ url: String(input), init });
     const url = new URL(String(input));
 
     if (url.pathname === "/api/v4/leads/pipelines") {
       return Response.json({
-        _embedded: { pipelines: [{ id: 10_243_278, name: "РЕАЛ ДВА" }] },
+        _embedded: {
+          pipelines: this.metadata.pipelines ?? [
+            { id: 10_243_278, name: "РЕАЛ ДВА" },
+          ],
+        },
       });
     }
     if (url.pathname === "/api/v4/leads/pipelines/10243278/statuses") {
       return Response.json({
         _embedded: {
-          statuses: [
+          statuses: this.metadata.statuses ?? [
             { id: 11, name: "Завершение (самовывоз или доставка)" },
             { id: 99, name: "Успешно реализовано" },
           ],
@@ -87,7 +99,11 @@ class AmoDiscoveryMock {
     }
     if (url.pathname === "/api/v4/leads/custom_fields") {
       return Response.json({
-        _embedded: { custom_fields: [{ id: 77, name: "Источник сделки" }] },
+        _embedded: {
+          custom_fields: this.metadata.customFields ?? [
+            { id: 77, name: "Источник сделки" },
+          ],
+        },
       });
     }
     if (url.pathname === "/api/v4/users") {
@@ -269,6 +285,22 @@ describe("pipeline configuration routes", () => {
     );
   });
 
+  it("rejects duplicate discovery IDs before exposing order-dependent metadata", async () => {
+    const amo = new AmoDiscoveryMock({
+      pipelines: [
+        { id: 10_243_278, name: "РЕАЛ ДВА" },
+        { id: 10_243_278, name: "Conflicting duplicate" },
+      ],
+    });
+    vi.stubGlobal("fetch", amo.fetch);
+
+    const response = await discoveryRoute(
+      new Request("https://dashboard.example.test/api/config/discovery"),
+    );
+
+    expect(response.status).toBe(422);
+  });
+
   it("requires API-confirmed IDs and names before accepting a candidate", async () => {
     const amo = new AmoDiscoveryMock();
     vi.stubGlobal("fetch", amo.fetch);
@@ -305,6 +337,7 @@ describe("pipeline configuration routes", () => {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
       }),
     );
     const activation = (await activationResponse.json()) as {
@@ -325,6 +358,194 @@ describe("pipeline configuration routes", () => {
     ).resolves.toEqual([{ status: "queued" }]);
   });
 
+  it("lets only one concurrent activation consume the same expected active state", async () => {
+    const amo = new AmoDiscoveryMock();
+    vi.stubGlobal("fetch", amo.fetch);
+    const validationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const validation = (await validationResponse.json()) as {
+      data: { metadataChecksum: string };
+    };
+    const requestBody = {
+      candidate,
+      channelRules: INITIAL_CHANNEL_RULES,
+      metadataChecksum: validation.data.metadataChecksum,
+      expectedActiveConfigId: null,
+    };
+
+    const responses = await Promise.all([
+      activateRoute(sameOriginPost("/api/config/activate", requestBody)),
+      activateRoute(sameOriginPost("/api/config/activate", requestBody)),
+    ]);
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+    await expect(
+      adminDb<{ version: number; is_active: boolean }[]>`
+        select version, is_active from public.pipeline_configs order by version
+      `,
+    ).resolves.toEqual([{ version: 1, is_active: true }]);
+  });
+
+  it("warns on same-ID renames and requires explicit confirmation before storing them", async () => {
+    const originalAmo = new AmoDiscoveryMock();
+    vi.stubGlobal("fetch", originalAmo.fetch);
+    const initialValidationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const initialValidation = (await initialValidationResponse.json()) as {
+      data: { metadataChecksum: string };
+    };
+    const initialActivation = await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        candidate,
+        channelRules: INITIAL_CHANNEL_RULES,
+        metadataChecksum: initialValidation.data.metadataChecksum,
+        expectedActiveConfigId: null,
+      }),
+    );
+    const initial = (await initialActivation.json()) as {
+      data: { configId: string };
+    };
+
+    const renamedAmo = new AmoDiscoveryMock({
+      pipelines: [{ id: candidate.pipelineId, name: "РЕАЛ ДВА — новое имя" }],
+      statuses: [
+        { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
+        { id: candidate.wonStatusId, name: "Продажа — новое имя" },
+      ],
+    });
+    vi.stubGlobal("fetch", renamedAmo.fetch);
+    const renamedValidationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const renamedValidation = (await renamedValidationResponse.json()) as {
+      data: {
+        valid: boolean;
+        metadataChecksum: string;
+        requiresNameConfirmation: boolean;
+        warnings: string[];
+      };
+    };
+
+    expect(renamedValidationResponse.status).toBe(200);
+    expect(renamedValidation.data).toMatchObject({
+      valid: true,
+      requiresNameConfirmation: true,
+      warnings: [
+        "pipeline_name_changed",
+        "application_status_name_changed",
+        "won_status_name_changed",
+      ],
+    });
+
+    const activationBody = {
+      candidate,
+      channelRules: INITIAL_CHANNEL_RULES,
+      metadataChecksum: renamedValidation.data.metadataChecksum,
+      expectedActiveConfigId: initial.data.configId,
+    };
+    const unconfirmed = await activateRoute(
+      sameOriginPost("/api/config/activate", activationBody),
+    );
+    expect(unconfirmed.status).toBe(422);
+
+    const confirmed = await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        ...activationBody,
+        confirmNameChanges: true,
+      }),
+    );
+    expect(confirmed.status).toBe(200);
+    await expect(
+      adminDb<{
+        version: number;
+        pipeline_name: string;
+        application_status_name: string;
+        won_status_name: string;
+        is_active: boolean;
+      }[]>`
+        select version, pipeline_name, application_status_name,
+          won_status_name, is_active
+        from public.pipeline_configs
+        order by version
+      `,
+    ).resolves.toEqual([
+      {
+        version: 1,
+        pipeline_name: "РЕАЛ ДВА",
+        application_status_name: "Завершение (самовывоз или доставка)",
+        won_status_name: "Успешно реализовано",
+        is_active: false,
+      },
+      {
+        version: 2,
+        pipeline_name: "РЕАЛ ДВА — новое имя",
+        application_status_name: "Завершение — новое имя",
+        won_status_name: "Продажа — новое имя",
+        is_active: true,
+      },
+    ]);
+  });
+
+  it("activates editable exact source-field, tag, and integration mappings", async () => {
+    const amo = new AmoDiscoveryMock();
+    vi.stubGlobal("fetch", amo.fetch);
+    const validationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const validation = (await validationResponse.json()) as {
+      data: { metadataChecksum: string };
+    };
+    const editableRules = [
+      ...INITIAL_CHANNEL_RULES,
+      {
+        priority: INITIAL_CHANNEL_RULES.length + 1,
+        matchType: "source_field_exact" as const,
+        matchValue: "Synthetic source",
+        normalizedChannel: "unknown" as const,
+      },
+      {
+        priority: INITIAL_CHANNEL_RULES.length + 2,
+        matchType: "tag_exact" as const,
+        matchValue: "Synthetic tag",
+        normalizedChannel: "telegram" as const,
+      },
+      {
+        priority: INITIAL_CHANNEL_RULES.length + 3,
+        matchType: "integration_source_exact" as const,
+        matchValue: "Synthetic integration",
+        normalizedChannel: "whatsapp" as const,
+      },
+    ];
+
+    const response = await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        candidate,
+        channelRules: editableRules,
+        metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(
+      adminDb<{ match_type: string; match_value: string }[]>`
+        select match_type, match_value
+        from public.channel_rules
+        where match_value like 'Synthetic %'
+        order by priority
+      `,
+    ).resolves.toEqual([
+      { match_type: "source_field_exact", match_value: "Synthetic source" },
+      { match_type: "tag_exact", match_value: "Synthetic tag" },
+      {
+        match_type: "integration_source_exact",
+        match_value: "Synthetic integration",
+      },
+    ]);
+  });
+
   it("leaves the prior active version intact when activation has a stale checksum", async () => {
     const amo = new AmoDiscoveryMock();
     vi.stubGlobal("fetch", amo.fetch);
@@ -334,19 +555,22 @@ describe("pipeline configuration routes", () => {
     const validation = (await validationResponse.json()) as {
       data: { metadataChecksum: string };
     };
-    await activateRoute(
+    const firstActivation = await activateRoute(
       sameOriginPost("/api/config/activate", {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
       }),
     );
+    const first = (await firstActivation.json()) as { data: { configId: string } };
 
     const rejected = await activateRoute(
       sameOriginPost("/api/config/activate", {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: "0".repeat(64),
+        expectedActiveConfigId: first.data.configId,
       }),
     );
 
@@ -379,6 +603,7 @@ describe("pipeline configuration routes", () => {
         candidate: noSourceFieldCandidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
       }),
     );
 
@@ -403,13 +628,15 @@ describe("pipeline configuration routes", () => {
     const validation = (await validationResponse.json()) as {
       data: { metadataChecksum: string };
     };
-    await activateRoute(
+    const firstActivation = await activateRoute(
       sameOriginPost("/api/config/activate", {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
       }),
     );
+    const first = (await firstActivation.json()) as { data: { configId: string } };
 
     session.user.id = "10000000-0000-4000-8000-000000000099";
     const rejected = await activateRoute(
@@ -417,6 +644,7 @@ describe("pipeline configuration routes", () => {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: first.data.configId,
       }),
     );
 
@@ -442,6 +670,7 @@ describe("pipeline configuration routes", () => {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
       }),
     );
 
@@ -474,6 +703,7 @@ describe("pipeline configuration routes", () => {
         candidate,
         channelRules: INITIAL_CHANNEL_RULES,
         metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
       }),
     );
     session.user.role = "head";

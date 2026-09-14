@@ -39,6 +39,18 @@ export default async function ConfigQualityPage() {
           channelFieldId: config.sourceFieldId,
         },
         discovery,
+        {
+          activeConfig: {
+            pipelineId: config.pipelineId,
+            pipelineName: config.pipelineName,
+            applicationStatusId: config.applicationStatusId,
+            applicationStatusName: config.applicationStatusName,
+            wonStatusId: config.wonStatusId,
+            wonStatusName: config.wonStatusName,
+            channelFieldId: config.sourceFieldId,
+            channelFieldName: null,
+          },
+        },
       );
     } catch {
       // The page remains a safe stored projection when live metadata is unavailable.
@@ -47,6 +59,7 @@ export default async function ConfigQualityPage() {
   const liveReasons = liveValidation && !liveValidation.valid
     ? liveValidation.reasons
     : [];
+  const liveWarnings = liveValidation?.valid ? liveValidation.warnings : [];
 
   return (
     <AppShell user={user}>
@@ -88,9 +101,9 @@ export default async function ConfigQualityPage() {
               </span>
             </div>
             <dl className="quality-list">
-              <div><dt>Воронка</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("pipeline_not_confirmed")) : "не проверено"}</dd></div>
-              <div><dt>Этап заявки</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("application_status_not_confirmed")) : "не проверено"}</dd></div>
-              <div><dt>Успешный статус</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("won_status_not_confirmed")) : "не проверено"}</dd></div>
+              <div><dt>Воронка</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("pipeline_not_confirmed") && !liveWarnings.includes("pipeline_name_changed")) : "не проверено"}</dd></div>
+              <div><dt>Этап заявки</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("application_status_not_confirmed") && !liveWarnings.includes("application_status_name_changed")) : "не проверено"}</dd></div>
+              <div><dt>Успешный статус</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("won_status_not_confirmed") && !liveWarnings.includes("won_status_name_changed")) : "не проверено"}</dd></div>
               <div><dt>Поле источника</dt><dd>{config.sourceFieldId === null ? "не используется" : liveValidation ? validationLabel(!liveReasons.includes("channel_field_not_confirmed")) : "не проверено"}</dd></div>
               <div className="checksum-row"><dt>Checksum</dt><dd><code>{config.metadataChecksum}</code></dd></div>
             </dl>

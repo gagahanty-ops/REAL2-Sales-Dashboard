@@ -3,22 +3,12 @@ import { redirect } from "next/navigation";
 import { getActivePipelineConfig, getCurrentSafeAmoConnectionStatus } from "@real2/db";
 
 import { AppShell } from "../../../components/app-shell";
+import { ChannelRulesManager } from "../../../components/channel-rules-manager";
 import { requireRole } from "../../../lib/auth/authorization";
 import { requireUser } from "../../../lib/auth/require-user";
 import { getDatabase } from "../../../lib/server/runtime";
 
 export const dynamic = "force-dynamic";
-
-const channelLabels: Record<string, string> = {
-  phone_uis: "Телефон / UIS",
-  whatsapp: "WhatsApp",
-  avito: "Avito",
-  instagram: "Instagram",
-  site: "Сайт",
-  telegram: "Telegram",
-  max: "MAX",
-  unknown: "Неизвестно",
-};
 
 export default async function ChannelSettingsPage() {
   let user;
@@ -44,31 +34,31 @@ export default async function ChannelSettingsPage() {
         </div>
         {config ? <span className="status-chip">версия {config.version}</span> : null}
       </div>
-      <section className="panel">
-        <h2>Активные правила</h2>
-        {!config ? (
+      {!config ? (
+        <section className="panel">
+          <h2>Активные правила</h2>
           <p className="muted">Сначала активируйте конфигурацию воронки.</p>
-        ) : (
-          <div className="config-table-wrap">
-            <table className="config-table">
-              <thead>
-                <tr><th>Приоритет</th><th>Источник</th><th>Точное значение</th><th>Канал</th><th>Состояние</th></tr>
-              </thead>
-              <tbody>
-                {config.channelRules.map((rule) => (
-                  <tr key={`${rule.matchType}:${rule.matchValue}`}>
-                    <td>{rule.priority}</td>
-                    <td>{rule.matchType}</td>
-                    <td>{rule.matchValue}</td>
-                    <td>{channelLabels[rule.normalizedChannel] ?? rule.normalizedChannel}</td>
-                    <td><span className={`status-chip${rule.isActive ? "" : " inactive"}`}>{rule.isActive ? "mapped" : "inactive"}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
+        </section>
+      ) : (
+        <ChannelRulesManager
+          initialConfig={{
+            configId: config.id,
+            version: config.version,
+            candidate: {
+              pipelineId: config.pipelineId,
+              applicationStatusId: config.applicationStatusId,
+              wonStatusId: config.wonStatusId,
+              channelFieldId: config.sourceFieldId,
+            },
+            channelRules: config.channelRules.map((rule) => ({
+              priority: rule.priority,
+              matchType: rule.matchType,
+              matchValue: rule.matchValue,
+              normalizedChannel: rule.normalizedChannel,
+            })),
+          }}
+        />
+      )}
       <section className="panel">
         <h2>Встреченные значения</h2>
         <p className="muted">

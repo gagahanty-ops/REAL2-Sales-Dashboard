@@ -40,11 +40,31 @@ const pipelineStatusSchema = z.strictObject({
   name: z.string().min(1).max(500),
 });
 
-const pipelineDiscoverySchema = z.strictObject({
-  id: z.number().int().positive(),
-  name: z.string().min(1).max(500),
-  statuses: z.array(pipelineStatusSchema),
-});
+function duplicateIdIndexes(values: readonly { id: number }[]): number[] {
+  const seen = new Set<number>();
+  const duplicates: number[] = [];
+  values.forEach((value, index) => {
+    if (seen.has(value.id)) duplicates.push(index);
+    seen.add(value.id);
+  });
+  return duplicates;
+}
+
+const pipelineDiscoverySchema = z
+  .strictObject({
+    id: z.number().int().positive(),
+    name: z.string().min(1).max(500),
+    statuses: z.array(pipelineStatusSchema),
+  })
+  .superRefine((pipeline, context) => {
+    for (const index of duplicateIdIndexes(pipeline.statuses)) {
+      context.addIssue({
+        code: "custom",
+        message: "duplicate status id",
+        path: ["statuses", index, "id"],
+      });
+    }
+  });
 
 const customFieldSchema = z.strictObject({
   id: z.number().int().positive(),
@@ -56,11 +76,28 @@ const amoUserSchema = z.strictObject({
   name: z.string().min(1).max(500),
 });
 
-export const amoConfigDiscoverySchema = z.strictObject({
-  pipelines: z.array(pipelineDiscoverySchema),
-  leadCustomFields: z.array(customFieldSchema),
-  users: z.array(amoUserSchema),
-});
+export const amoConfigDiscoverySchema = z
+  .strictObject({
+    pipelines: z.array(pipelineDiscoverySchema),
+    leadCustomFields: z.array(customFieldSchema),
+    users: z.array(amoUserSchema),
+  })
+  .superRefine((discovery, context) => {
+    for (const index of duplicateIdIndexes(discovery.pipelines)) {
+      context.addIssue({
+        code: "custom",
+        message: "duplicate pipeline id",
+        path: ["pipelines", index, "id"],
+      });
+    }
+    for (const index of duplicateIdIndexes(discovery.leadCustomFields)) {
+      context.addIssue({
+        code: "custom",
+        message: "duplicate custom field id",
+        path: ["leadCustomFields", index, "id"],
+      });
+    }
+  });
 
 export type AmoConfigDiscovery = z.infer<typeof amoConfigDiscoverySchema>;
 
@@ -89,6 +126,8 @@ export type PipelineConfigValidation =
       valid: true;
       metadataChecksum: string;
       resolved: ResolvedPipelineConfig;
+      warnings: readonly PipelineConfigWarning[];
+      requiresNameConfirmation: boolean;
     }>
   | Readonly<{
       valid: false;
@@ -96,6 +135,15 @@ export type PipelineConfigValidation =
       metadataChecksum: string;
       reasons: readonly string[];
     }>;
+
+export type PipelineConfigWarning =
+  | "pipeline_name_changed"
+  | "application_status_name_changed"
+  | "won_status_name_changed";
+
+export type PipelineConfigValidationContext = Readonly<{
+  activeConfig?: ResolvedPipelineConfig | null;
+}>;
 
 type RequiredChannelMapping = Readonly<{
   matchValue: string;
@@ -164,34 +212,58 @@ export function checksumAmoConfigDiscovery(discovery: AmoConfigDiscovery): strin
 export function validatePipelineConfig(
   candidate: PipelineConfigCandidate,
   discovery: AmoConfigDiscovery,
+  context: PipelineConfigValidationContext = {},
 ): PipelineConfigValidation {
   const parsedCandidate = pipelineConfigCandidateSchema.parse(candidate);
   const parsedDiscovery = amoConfigDiscoverySchema.parse(discovery);
   const metadataChecksum = checksumAmoConfigDiscovery(parsedDiscovery);
   const reasons: string[] = [];
+  const warnings: PipelineConfigWarning[] = [];
+  const activeConfig = context.activeConfig ?? null;
   const pipeline = parsedDiscovery.pipelines.find(
     (item) => item.id === parsedCandidate.pipelineId,
   );
 
-  if (!pipeline || pipeline.name !== EXPECTED_PIPELINE_NAME) {
+  if (!pipeline) {
     reasons.push("pipeline_not_confirmed");
+  } else if (pipeline.name !== EXPECTED_PIPELINE_NAME) {
+    if (activeConfig?.pipelineId !== pipeline.id) {
+      reasons.push("pipeline_not_confirmed");
+    } else if (activeConfig.pipelineName !== pipeline.name) {
+      warnings.push("pipeline_name_changed");
+    }
   }
 
   const applicationStatus = pipeline?.statuses.find(
     (item) => item.id === parsedCandidate.applicationStatusId,
   );
-  if (
-    !applicationStatus ||
-    applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME
-  ) {
+  if (!applicationStatus) {
     reasons.push("application_status_not_confirmed");
+  } else if (applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME) {
+    if (
+      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
+      activeConfig.applicationStatusId !== applicationStatus.id
+    ) {
+      reasons.push("application_status_not_confirmed");
+    } else if (activeConfig.applicationStatusName !== applicationStatus.name) {
+      warnings.push("application_status_name_changed");
+    }
   }
 
   const wonStatus = pipeline?.statuses.find(
     (item) => item.id === parsedCandidate.wonStatusId,
   );
-  if (!wonStatus || wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
+  if (!wonStatus) {
     reasons.push("won_status_not_confirmed");
+  } else if (wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
+    if (
+      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
+      activeConfig.wonStatusId !== wonStatus.id
+    ) {
+      reasons.push("won_status_not_confirmed");
+    } else if (activeConfig.wonStatusName !== wonStatus.name) {
+      warnings.push("won_status_name_changed");
+    }
   }
 
   if (parsedCandidate.applicationStatusId === parsedCandidate.wonStatusId) {
@@ -218,6 +290,8 @@ export function validatePipelineConfig(
   return {
     valid: true,
     metadataChecksum,
+    warnings,
+    requiresNameConfirmation: warnings.length > 0,
     resolved: {
       pipelineId: pipeline.id,
       pipelineName: pipeline.name,

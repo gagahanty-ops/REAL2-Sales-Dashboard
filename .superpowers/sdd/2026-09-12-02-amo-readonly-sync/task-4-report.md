@@ -89,3 +89,104 @@ pnpm check:secrets
 - `GET /api/config/channel-values` truthfully returns an empty list until Task 4+ raw/sync storage exists; the channel screen communicates this empty state. It does not fabricate counts from catalog defaults.
 - A live `/quality/config` comparison requires an active server-side amoCRM connection. If metadata is unavailable, the screen falls back to the stored safe projection and explicitly reports the live check as unavailable.
 - No production ID has been activated. First activation remains blocked until the named pipeline/statuses and optional source field are confirmed by the guarded API discovery flow.
+
+## Fix round 1
+
+### Summary
+
+- Bound every activation request to `expectedActiveConfigId` and compare that value with the active row while holding the connection advisory lock and configuration row locks. Concurrent or stale requests that validated the same checksum can no longer both create versions; the loser receives `E_CONFLICT` / HTTP 409.
+- Added an ID-preserving metadata rename path. Initial setup still requires `РЕАЛ ДВА`, `Завершение (самовывоз или доставка)`, and `Успешно реализовано`. After those IDs have been confirmed, a changed live name produces explicit warning codes and `requiresNameConfirmation`; activation stores the new names only when the admin submits `confirmNameChanges: true`.
+- Replaced the static channel-rule table with an admin editor for exact source-field, tag, and integration-source rules. It edits priority, exact value, and normalized channel; rejects empty values, duplicate exact keys, duplicate priorities, and source-order inversions before submission; revalidates live metadata; and activates a new immutable version with the edited payload.
+- Preserved customized rules when a later pipeline version is activated from the pipeline screen instead of resetting to catalog defaults. Both settings screens update their expected active ID after success.
+- Rejected duplicate pipeline IDs, duplicate status IDs within a pipeline, and duplicate lead-custom-field IDs at the aggregate discovery schema boundary, including identical and conflicting duplicates. Guarded discovery now parses the aggregate before returning it, eliminating response-order-dependent `.find()` behavior.
+- Updated the read-only quality page to evaluate live metadata against the active confirmed names, so a pending rename is displayed as drift while an already-confirmed renamed version no longer remains permanently invalid.
+
+### Files changed
+
+- `packages/domain/src/amo/config.ts`
+- `packages/domain/src/amo/config.test.ts`
+- `packages/db/src/amo-config.ts`
+- `apps/web/src/lib/amo/config-discovery.ts`
+- `apps/web/src/lib/amo/config-public.ts`
+- `apps/web/src/app/api/config/validate/route.ts`
+- `apps/web/src/app/api/config/activate/route.ts`
+- `apps/web/src/app/api/config/config.integration.test.ts`
+- `apps/web/src/components/pipeline-config-manager.tsx`
+- `apps/web/src/components/channel-rules-manager.tsx`
+- `apps/web/src/components/channel-rules-manager.test.tsx`
+- `apps/web/src/app/settings/channels/page.tsx`
+- `apps/web/src/app/quality/config/page.tsx`
+- `apps/web/src/app/globals.css`
+- `.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md`
+
+### Covering tests
+
+- `packages/domain/src/amo/config.test.ts`: initial-name enforcement, same-ID rename warnings, resolved renamed names, and duplicate pipeline/status/custom-field rejection.
+- `apps/web/src/app/api/config/config.integration.test.ts`: aggregate duplicate-discovery rejection; concurrent same-checksum activation with exactly one 200 and one 409; validate/activate rename warning and explicit confirmation; immutable storage of renamed names; activation of edited exact source-field/tag/integration rules; rollback and stale-checksum behavior.
+- `apps/web/src/components/channel-rules-manager.test.tsx`: editable controls for all three exact evidence sources, expected-active-ID payload binding, and duplicate/priority/order client validation.
+- `tests/security/rls.security.test.ts` and `tests/security/log-redaction.security.test.ts`: unchanged RLS/default-deny and safe-log guarantees after the new public config ID and activation contract.
+
+### RED evidence
+
+1. `node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts --project unit` — 4 failed / 8 passed: same-ID rename stayed invalid and duplicate pipeline/status/custom-field IDs were accepted.
+2. `node "$REAL2_PNPM" exec vitest run apps/web/src/components/channel-rules-manager.test.tsx --project unit` — suite failed because the editable channel-rule component and payload helpers did not exist.
+3. `node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration` — 9 failed / 4 passed before production wiring: duplicate discovery returned 200, activation did not accept the state binding, rename validation stayed invalid, and the editable three-source payload could not activate.
+4. The first affected lint run reported one unused editor destructuring binding; it was removed before final verification.
+
+### GREEN evidence and exact commands
+
+Every package-manager invocation used:
+
+```text
+export PATH=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/node/bin:$PATH
+REAL2_PNPM=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/pnpm/bin/pnpm.cjs
+```
+
+Fresh database and focused regressions:
+
+```text
+node "$REAL2_PNPM" exec supabase db reset
+node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts apps/web/src/components/channel-rules-manager.test.tsx --project unit --silent
+node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration --silent
+```
+
+Relevant output:
+
+- Node `v22.23.2`; Supabase reset successfully reapplied migrations `0001` through `0004` on the local PostgreSQL 17 stack.
+- Focused unit: 2 files passed, 15 tests passed.
+- Focused config integration: 1 file passed, 13 tests passed.
+
+Full affected verification:
+
+```text
+node "$REAL2_PNPM" test
+node "$REAL2_PNPM" exec vitest run --project integration --silent
+node "$REAL2_PNPM" exec vitest run --project security --silent
+node "$REAL2_PNPM" lint
+node "$REAL2_PNPM" typecheck
+node "$REAL2_PNPM" build
+node "$REAL2_PNPM" check:secrets
+git diff --check
+```
+
+Relevant output:
+
+- Repository/worker checks: 12/12 passed; Vitest unit: 75/75 passed across 13 files.
+- Full integration: 43/43 passed across 5 files.
+- Security: 15/15 passed across RLS and log-redaction suites.
+- All six workspace package lint and typecheck tasks passed; scripts typecheck passed.
+- All packages and the Next.js production application built successfully; all 17 pages were generated and the config/settings/quality routes were present.
+- Tracked-secret scan and whitespace check exited 0.
+
+### Self-review
+
+- The stale-state comparison occurs after the transaction advisory lock and after locking every configuration row for the connection. A `Promise.all` route regression produced `[200, 409]` and exactly one version, demonstrating that a shared fresh checksum is insufficient without the one-use active-state binding.
+- Name drift is allowed only when the relevant pipeline/status ID belongs to the active confirmed selection. A different or initially unconfirmed ID with a non-required name remains `E_CONFIG_INCOMPLETE`. Confirmation is checked after a fresh discovery/checksum comparison and before any write.
+- Edited channel rules remain server-authoritative: Zod constrains exact match types/channels, domain validation enforces catalog defaults/duplicates/priorities/source order, SQL independently enforces unique keys/priorities, and the transaction inserts an immutable new version.
+- The current configuration UUID is intentionally exposed only as a safe optimistic-concurrency token; connection IDs, actor IDs, credentials, ciphertext, and private validation details remain excluded.
+- Activation still inserts only a queued recalculation request and does not touch the current snapshot. Both external switches remain false.
+
+### Concerns / follow-up boundary
+
+- Encountered channel values and counts remain truthfully empty. `/api/config/channel-values` still returns no fabricated aggregate because the immutable raw table is not available until Task 5.
+- No production ID, live amoCRM credential, real network call, Google API, or protected original Sheet was used. All amended integration evidence is synthetic and local.

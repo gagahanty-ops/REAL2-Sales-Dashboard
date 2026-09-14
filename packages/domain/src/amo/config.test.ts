@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { AppError } from "../errors.js";
 import {
+  amoConfigDiscoverySchema,
   INITIAL_CHANNEL_RULES,
   validateChannelRules,
   validatePipelineConfig,
@@ -116,6 +117,84 @@ describe("validatePipelineConfig", () => {
     expect(reordered).toMatchObject({ valid: true });
     if (!ordered.valid || !reordered.valid) throw new Error("fixture must validate");
     expect(reordered.metadataChecksum).toBe(ordered.metadataChecksum);
+  });
+
+  it("reports same-ID name drift as a warning only after the IDs were previously confirmed", () => {
+    const original = validatePipelineConfig(candidate, fixtureDiscovery());
+    if (!original.valid) throw new Error("fixture must validate");
+    const renamedDiscovery = fixtureDiscovery({
+      pipelines: [
+        {
+          id: candidate.pipelineId,
+          name: "РЕАЛ ДВА — новое имя",
+          statuses: [
+            { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
+            { id: candidate.wonStatusId, name: "Продажа — новое имя" },
+          ],
+        },
+      ],
+    });
+
+    expect(validatePipelineConfig(candidate, renamedDiscovery)).toMatchObject({
+      valid: false,
+      code: "E_CONFIG_INCOMPLETE",
+    });
+    expect(
+      validatePipelineConfig(candidate, renamedDiscovery, {
+        activeConfig: original.resolved,
+      }),
+    ).toMatchObject({
+      valid: true,
+      requiresNameConfirmation: true,
+      warnings: [
+        "pipeline_name_changed",
+        "application_status_name_changed",
+        "won_status_name_changed",
+      ],
+      resolved: {
+        pipelineName: "РЕАЛ ДВА — новое имя",
+        applicationStatusName: "Завершение — новое имя",
+        wonStatusName: "Продажа — новое имя",
+      },
+    });
+  });
+
+  it.each([
+    [
+      "pipeline",
+      fixtureDiscovery({
+        pipelines: [
+          ...fixtureDiscovery().pipelines,
+          { id: 10_243_278, name: "Conflicting duplicate", statuses: [] },
+        ],
+      }),
+    ],
+    [
+      "status",
+      fixtureDiscovery({
+        pipelines: [
+          {
+            ...fixtureDiscovery().pipelines[0]!,
+            statuses: [
+              ...fixtureDiscovery().pipelines[0]!.statuses,
+              { id: 11, name: "Conflicting duplicate" },
+            ],
+          },
+        ],
+      }),
+    ],
+    [
+      "custom field",
+      fixtureDiscovery({
+        leadCustomFields: [
+          { id: 77, name: "Источник сделки" },
+          { id: 77, name: "Источник сделки" },
+        ],
+      }),
+    ],
+  ])("rejects duplicate %s IDs before response order can affect selection", (_label, discovery) => {
+    expect(() => amoConfigDiscoverySchema.parse(discovery)).toThrow();
+    expect(() => validatePipelineConfig(candidate, discovery)).toThrow();
   });
 });
 

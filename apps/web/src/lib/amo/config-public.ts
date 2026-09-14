@@ -1,6 +1,7 @@
 import type { ActivePipelineConfig } from "@real2/db";
 
 export type PublicPipelineConfig = Readonly<{
+  configId: string;
   pipelineId: number;
   pipelineName: string;
   applicationStatusId: number;
@@ -32,6 +33,7 @@ export function toPublicPipelineConfig(
   config: ActivePipelineConfig,
 ): PublicPipelineConfig {
   return {
+    configId: config.id,
     pipelineId: config.pipelineId,
     pipelineName: config.pipelineName,
     applicationStatusId: config.applicationStatusId,

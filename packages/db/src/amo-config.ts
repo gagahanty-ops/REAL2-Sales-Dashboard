@@ -72,6 +72,7 @@ export type ActiveChannelRule = Readonly<{
 
 export type ActivatePipelineConfigInput = Readonly<{
   amoConnectionId: string;
+  expectedActiveConfigId: string | null;
   candidate: ResolvedPipelineConfig;
   channelRules: readonly ChannelRuleCandidate[];
   metadataChecksum: string;
@@ -237,12 +238,20 @@ export async function activatePipelineConfig(
         throw new AppError("E_CONFIG_INCOMPLETE", 422);
       }
 
-      await transaction`
-        select id
+      const lockedConfigs = await transaction<{
+        id: string;
+        is_active: boolean;
+      }[]>`
+        select id, is_active
         from public.pipeline_configs
         where amo_connection_id = ${input.amoConnectionId}
         for update
       `;
+      const currentActiveConfigId =
+        lockedConfigs.find((config) => config.is_active)?.id ?? null;
+      if (currentActiveConfigId !== input.expectedActiveConfigId) {
+        throw new AppError("E_CONFLICT", 409);
+      }
 
       const [versionRow] = await transaction<{ version: number }[]>`
         select coalesce(max(version), 0) + 1 as version
