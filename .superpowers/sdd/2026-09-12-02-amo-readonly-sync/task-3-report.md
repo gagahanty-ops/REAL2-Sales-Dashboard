@@ -173,3 +173,75 @@ binding, and reauth status),
 `apps/web/src/components/amo-integration-manager.test.tsx` (disabled and
 reauth action availability), `packages/integrations/src/amo/oauth.test.ts`,
 and the existing RLS/log-redaction security tests.
+
+## Fix round 2
+
+### Review fix
+
+- The locked shared refresh primitive now requires a server-side validation
+  callback and invokes it after the OAuth refresh exchange but before rotating
+  ciphertext, setting `active`, or advancing `last_checked_at`.
+- The admin refresh route supplies that callback. It permits only the fixed
+  amoCRM host, performs exactly one guarded `GET /api/v4/account` with the
+  newly returned server-only access token, and checks the fixed subdomain plus
+  the stored account ID.
+- A failed exchange or account validation remains fail-closed: the transaction
+  preserves the prior ciphertext and check timestamp, then marks the
+  connection `reauth_required`. The newly returned token pair is therefore
+  neither stored as `active` nor useable.
+- The callback is mandatory in the shared dependency type, so worker/token
+  provider callers cannot rotate a pair without deliberately supplying the
+  equivalent server-only validation policy.
+
+### RED / GREEN evidence
+
+The new wrong-account refresh regression was written first in
+`apps/web/src/app/api/integrations/amo/oauth.integration.test.ts`. Before the
+transaction-boundary change it failed as expected because the route rejected
+the account after committing the rotated pair:
+
+```text
+expected 502 to be 409
+```
+
+After the fix, all commands below completed with the mandated Node/pnpm
+runtime and synthetic local Supabase fixtures only:
+
+```text
+node "$REAL2_PNPM" test:integration -- apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
+4 files passed; 30 integration tests passed
+
+node "$REAL2_PNPM" exec vitest run --project unit -- packages/integrations/src/amo/oauth.test.ts
+11 unit files passed; 60 unit tests passed
+
+node "$REAL2_PNPM" test:security
+2 security files passed; 13 security tests passed
+
+node "$REAL2_PNPM" lint
+passed
+
+node "$REAL2_PNPM" --filter @real2/integrations build
+passed
+
+node "$REAL2_PNPM" typecheck
+passed
+
+node "$REAL2_PNPM" build
+passed; web routes and settings page compiled
+
+node "$REAL2_PNPM" check:secrets
+passed
+```
+
+The focused regression asserts that a refreshed token whose guarded account
+GET returns a mismatched numeric account ID results in `502`/`reauth_required`,
+keeps both previous ciphertext values byte-for-byte, and does not advance
+`last_checked_at`.
+
+### Concerns
+
+- This fail-closed state deliberately retains the previous encrypted pair for
+  local audit/reinstallation continuity, but `reauth_required` prevents the
+  token provider from returning either prior or newly returned material. A
+  failed OAuth refresh may already have invalidated the old refresh token, so
+  administrator reauthorization is required before any further use.

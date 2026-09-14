@@ -16,6 +16,7 @@ import {
   createAmoTokenProvider,
   refreshConnection,
   refreshDueConnections,
+  type RefreshedAccessTokenValidator,
 } from "./refresh";
 import { localDatabaseUrl, resetAndSeedUsers, testUsers } from "../../../../tests/helpers/local-db";
 import { decryptToken, encryptToken } from "./crypto";
@@ -30,6 +31,9 @@ const oauthConfig = {
   clientSecret: "synthetic-client-secret",
   redirectUri: "https://dashboard.example.invalid/api/integrations/amo/callback",
 } as const;
+
+const validateRefreshedAccessToken: RefreshedAccessTokenValidator = async () =>
+  undefined;
 
 const adminDb = postgres(localDatabaseUrl, { max: 4 });
 
@@ -291,6 +295,7 @@ describe("token rotation", () => {
       encryptionKey,
       oauthConfig,
       transport,
+      validateRefreshedAccessToken,
     };
 
     const firstPromise = refreshConnection(connection.id, dependencies, now);
@@ -323,6 +328,7 @@ describe("token rotation", () => {
       encryptionKey,
       oauthConfig,
       transport,
+      validateRefreshedAccessToken,
     };
 
     await refreshConnection(connection.id, dependencies, now);
@@ -341,7 +347,13 @@ describe("token rotation", () => {
 
     const refresh = refreshConnection(
       connection.id,
-      { db: adminDb, encryptionKey, oauthConfig, transport },
+      {
+        db: adminDb,
+        encryptionKey,
+        oauthConfig,
+        transport,
+        validateRefreshedAccessToken,
+      },
       now,
     );
 
@@ -356,6 +368,7 @@ describe("token rotation", () => {
       encryptionKey,
       oauthConfig,
       transport,
+      validateRefreshedAccessToken,
       now: () => now,
     });
     await expect(provider.getAccessToken()).rejects.toEqual(
@@ -378,7 +391,13 @@ describe("token rotation", () => {
 
     await expect(
       refreshDueConnections(
-        { db: adminDb, encryptionKey, oauthConfig, transport },
+        {
+          db: adminDb,
+          encryptionKey,
+          oauthConfig,
+          transport,
+          validateRefreshedAccessToken,
+        },
         now,
       ),
     ).resolves.toEqual([due.id]);
@@ -395,6 +414,7 @@ describe("token rotation", () => {
       encryptionKey,
       oauthConfig,
       transport,
+      validateRefreshedAccessToken,
       now: () => now,
     });
 

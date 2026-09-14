@@ -8,7 +8,7 @@ import {
   vi,
 } from "vitest";
 
-import { createOAuthState } from "@real2/db";
+import { createOAuthState, getAmoConnectionCredentials } from "@real2/db";
 import {
   createAdminDb,
   resetAndSeedUsers,
@@ -394,7 +394,7 @@ describe("amoCRM OAuth administration", () => {
     ]);
   });
 
-  it("does not report a successful read check when the refreshed token sees another account", async () => {
+  it("fails closed without persisting mismatched refreshed credentials", async () => {
     const state = await createOAuthState(adminDb, testUsers.admin.id);
     const amoMock = new AmoMock();
     amoMock.queueTokenPair(syntheticTokenPair);
@@ -407,6 +407,13 @@ describe("amoCRM OAuth administration", () => {
     amoMock.queueAccount({ id: 999, subdomain: "555151" });
     vi.stubGlobal("fetch", amoMock.fetch);
     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
+    const [connection] = await adminDb<{ id: string }[]>`
+      select id from public.amo_connections
+    `;
+    const beforeCredentials = await getAmoConnectionCredentials(
+      adminDb,
+      connection!.id,
+    );
     const [before] = await adminDb<{ last_checked_at: Date }[]>`
       select last_checked_at from public.amo_connections
     `;
@@ -415,7 +422,18 @@ describe("amoCRM OAuth administration", () => {
       sameOriginPost("/api/integrations/amo/refresh"),
     );
 
-    expect(response.status).toBe(409);
+    expect(response.status).toBe(502);
+    const afterCredentials = await getAmoConnectionCredentials(
+      adminDb,
+      connection!.id,
+    );
+    expect(afterCredentials.status).toBe("reauth_required");
+    expect(afterCredentials.accessTokenCiphertext).toEqual(
+      beforeCredentials.accessTokenCiphertext,
+    );
+    expect(afterCredentials.refreshTokenCiphertext).toEqual(
+      beforeCredentials.refreshTokenCiphertext,
+    );
     const [after] = await adminDb<{ last_checked_at: Date }[]>`
       select last_checked_at from public.amo_connections
     `;

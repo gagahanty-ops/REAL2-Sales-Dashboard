@@ -2,6 +2,7 @@ import {
   findDueAmoConnectionIds,
   getAmoConnectionCredentials,
   withLockedAmoConnection,
+  type AmoConnectionCredentials,
   type Database,
 } from "@real2/db";
 import { AppError } from "@real2/domain";
@@ -17,11 +18,17 @@ import type { AmoTokenProvider } from "./types";
 const REFRESH_WINDOW_MS = 10 * 60_000;
 const inFlightRefreshes = new Map<string, Promise<string>>();
 
+export type RefreshedAccessTokenValidator = (
+  accessToken: string,
+  connection: Pick<AmoConnectionCredentials, "accountId" | "subdomain" | "baseUrl">,
+) => Promise<void>;
+
 export type RefreshAmoTokenDependencies = Readonly<{
   db: Database;
   encryptionKey: TokenEncryptionKey;
   oauthConfig: AmoOAuthConfig;
   transport: AmoOAuthTransport;
+  validateRefreshedAccessToken: RefreshedAccessTokenValidator;
 }>;
 
 type TokenProviderDependencies = RefreshAmoTokenDependencies &
@@ -92,6 +99,10 @@ async function refreshConnectionLocked(
           dependencies.oauthConfig,
           dependencies.transport,
         );
+        await dependencies.validateRefreshedAccessToken(
+          tokenPair.accessToken,
+          connection,
+        );
         const tokenExpiresAt = new Date(
           now.getTime() + tokenPair.expiresInSeconds * 1_000,
         );
@@ -108,6 +119,7 @@ async function refreshConnectionLocked(
           tokenExpiresAt,
           refreshedAt: now,
         });
+        await actions.markCheckedAt(now);
 
         return { ok: true, accessToken: tokenPair.accessToken };
       } catch {

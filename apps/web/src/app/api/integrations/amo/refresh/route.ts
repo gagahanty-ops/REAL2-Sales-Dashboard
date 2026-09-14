@@ -1,7 +1,4 @@
-import {
-  getCurrentSafeAmoConnectionStatus,
-  withLockedAmoConnection,
-} from "@real2/db";
+import { getCurrentSafeAmoConnectionStatus } from "@real2/db";
 import { AppError } from "@real2/domain";
 import {
   amoFetch,
@@ -32,7 +29,7 @@ export const POST = withRoute(async (request, context) => {
 
   const env = getServerEnv();
   const auditSink = createAmoAdminAuditSink();
-  const accessToken = await refreshConnection(connection.id, {
+  await refreshConnection(connection.id, {
     db,
     encryptionKey: decodeTokenEncryptionKey(env.TOKEN_ENCRYPTION_KEY),
     oauthConfig: {
@@ -41,33 +38,25 @@ export const POST = withRoute(async (request, context) => {
       redirectUri: env.AMO_REDIRECT_URI,
     },
     transport: { auditSink, traceId: context.traceId },
-  });
-  const account = await amoFetch({
-    method: "GET",
-    url: `${AMO_BASE_URL}/api/v4/account`,
-    schema: amoAccountSchema,
-    traceId: context.traceId,
-    tokenProvider: {
-      async getAccessToken() {
-        return accessToken;
-      },
+    async validateRefreshedAccessToken(accessToken, lockedConnection) {
+      if (lockedConnection.baseUrl !== AMO_BASE_URL) {
+        throw new AppError("E_CONFLICT", 409);
+      }
+      const account = await amoFetch({
+        method: "GET",
+        url: `${AMO_BASE_URL}/api/v4/account`,
+        schema: amoAccountSchema,
+        traceId: context.traceId,
+        tokenProvider: {
+          async getAccessToken() {
+            return accessToken;
+          },
+        },
+        auditSink,
+        redirect: "error",
+      });
+      assertAmoAccountBinding(account, lockedConnection.accountId);
     },
-    auditSink,
-    redirect: "error",
-  });
-  assertAmoAccountBinding(account, connection.accountId);
-
-  const checkedAt = new Date();
-  await withLockedAmoConnection(db, connection.id, async (locked, actions) => {
-    if (
-      locked.status !== "active" ||
-      locked.accountId !== account.id ||
-      locked.subdomain !== account.subdomain ||
-      locked.baseUrl !== AMO_BASE_URL
-    ) {
-      throw new AppError("E_CONFLICT", 409);
-    }
-    await actions.markCheckedAt(checkedAt);
   });
 
   return { refreshed: true };

@@ -17,6 +17,7 @@ export {
   createAmoTokenProvider,
   refreshConnection,
   refreshDueConnections,
+  type RefreshedAccessTokenValidator,
   type RefreshAmoTokenDependencies,
 } from "./amo/refresh.js";
 export type {
