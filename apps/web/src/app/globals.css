@@ -263,6 +263,17 @@ p {
   gap: 12px;
 }
 
+.header-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.app-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
 .user-identity {
   flex-direction: column;
   align-items: flex-end;
@@ -313,6 +324,68 @@ p {
 .settings-grid {
   display: grid;
   gap: 24px;
+}
+
+.config-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.config-actions {
+  margin-top: 20px;
+}
+
+.config-table-wrap {
+  overflow-x: auto;
+}
+
+.config-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.config-table th,
+.config-table td {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.config-table th {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.quality-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.quality-list div {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0a2130;
+}
+
+.quality-list dt {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.quality-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.quality-list .checksum-row {
+  grid-column: 1 / -1;
 }
 
 .panel {
@@ -405,8 +478,14 @@ p {
   }
 
   .user-form,
-  .user-card {
+  .user-card,
+  .config-form,
+  .quality-list {
     grid-template-columns: 1fr;
+  }
+
+  .quality-list .checksum-row {
+    grid-column: auto;
   }
 
   .card-actions {

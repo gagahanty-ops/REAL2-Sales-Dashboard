@@ -22,7 +22,15 @@ export function AppShell({
         </Link>
         <div className="header-actions">
           {user.role === "admin" ? (
-            <Link href="/settings/users">Пользователи</Link>
+            <nav className="app-nav" aria-label="Администрирование">
+              <Link href="/settings/pipeline">Воронка</Link>
+              <Link href="/settings/channels">Каналы</Link>
+              <Link href="/settings/integrations/amo">amoCRM</Link>
+              <Link href="/settings/users">Пользователи</Link>
+            </nav>
+          ) : null}
+          {user.role === "admin" || user.role === "head" ? (
+            <Link href="/quality/config">Качество</Link>
           ) : null}
           <div className="user-identity">
             <span>{user.fullName}</span>

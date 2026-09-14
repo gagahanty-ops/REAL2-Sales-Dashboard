@@ -16,6 +16,9 @@ const adminDb = createAdminDb();
 const allUsers = Object.values(testUsers);
 
 beforeEach(async () => {
+  await adminDb.unsafe(
+    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+  );
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
   await resetAndSeedUsers(adminDb, allUsers);
@@ -155,6 +158,97 @@ describe("amoCRM credential RLS", () => {
           )
         `;
         await transaction`select state_hash from public.oauth_states`;
+      }),
+    ).rejects.toMatchObject({ code: "42501" });
+  });
+});
+
+describe("pipeline configuration RLS", () => {
+  async function visibleConfigVersions(authUserId: string): Promise<number[]> {
+    return adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role authenticated");
+      await transaction`
+        select set_config('request.jwt.claim.sub', ${authUserId}, true)
+      `;
+      const rows = await transaction<{ version: number }[]>`
+        select version from public.pipeline_configs order by version
+      `;
+      return rows.map((row) => row.version);
+    });
+  }
+
+  it("shows only the active safe projection to admin and head and hides it from managers", async () => {
+    const [connection] = await adminDb<{ id: string }[]>`
+      select id from public.amo_connections limit 1
+    `;
+    if (!connection) throw new Error("amoCRM fixture connection is missing");
+
+    await adminDb`
+      insert into public.pipeline_configs (
+        amo_connection_id,
+        pipeline_id,
+        pipeline_name,
+        application_status_id,
+        application_status_name,
+        won_status_id,
+        won_status_name,
+        source_field_id,
+        version,
+        is_active,
+        confirmed_by
+      ) values
+        (
+          ${connection.id}, 10243278, 'РЕАЛ ДВА', 11,
+          'Завершение (самовывоз или доставка)', 99,
+          'Успешно реализовано', 77, 1, false, ${testUsers.admin.id}
+        ),
+        (
+          ${connection.id}, 10243278, 'РЕАЛ ДВА', 11,
+          'Завершение (самовывоз или доставка)', 99,
+          'Успешно реализовано', 77, 2, true, ${testUsers.admin.id}
+        )
+    `;
+
+    await expect(
+      visibleConfigVersions(testUsers.admin.authUserId),
+    ).resolves.toEqual([2]);
+    await expect(
+      visibleConfigVersions(testUsers.head.authUserId),
+    ).resolves.toEqual([2]);
+    await expect(
+      visibleConfigVersions(testUsers.managerOne.authUserId),
+    ).resolves.toEqual([]);
+  });
+
+  it("does not grant authenticated users direct writes to configuration history", async () => {
+    await expect(
+      adminDb.begin(async (transaction) => {
+        await transaction.unsafe("set local role authenticated");
+        await transaction`
+          select set_config(
+            'request.jwt.claim.sub',
+            ${testUsers.admin.authUserId},
+            true
+          )
+        `;
+        await transaction`
+          insert into public.pipeline_configs (
+            amo_connection_id,
+            pipeline_id,
+            pipeline_name,
+            application_status_id,
+            application_status_name,
+            won_status_id,
+            won_status_name,
+            version,
+            confirmed_by
+          ) select
+            id, 10243278, 'РЕАЛ ДВА', 11,
+            'Завершение (самовывоз или доставка)', 99,
+            'Успешно реализовано', 1, ${testUsers.admin.id}
+          from public.amo_connections
+          limit 1
+        `;
       }),
     ).rejects.toMatchObject({ code: "42501" });
   });

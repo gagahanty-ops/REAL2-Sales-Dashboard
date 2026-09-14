@@ -33,3 +33,10 @@ export {
   type OAuthState,
   type SafeAmoConnectionStatus,
 } from "./amo-connections.js";
+export {
+  activatePipelineConfig,
+  getActivePipelineConfig,
+  type ActivatePipelineConfigInput,
+  type ActiveChannelRule,
+  type ActivePipelineConfig,
+} from "./amo-config.js";
