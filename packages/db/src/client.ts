@@ -13,6 +13,19 @@ export function createDbClient(
   });
 }
 
+export function createServiceWorkerDbClient(
+  databaseUrl: string,
+  options: Options<Record<string, never>> = {},
+): Database {
+  return createDbClient(databaseUrl, {
+    ...options,
+    connection: {
+      ...options.connection,
+      role: "service_worker",
+    },
+  });
+}
+
 export async function closeDbClient(db: Database): Promise<void> {
   await db.end({ timeout: 5 });
 }

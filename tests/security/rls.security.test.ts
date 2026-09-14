@@ -1,7 +1,10 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
+import { closeDbClient, createServiceWorkerDbClient } from "@real2/db";
+
 import {
   createAdminDb,
+  localDatabaseUrl,
   resetAndSeedUsers,
   testUsers,
   updateOwnNameAsManager,
@@ -154,5 +157,22 @@ describe("amoCRM credential RLS", () => {
         await transaction`select state_hash from public.oauth_states`;
       }),
     ).rejects.toMatchObject({ code: "42501" });
+  });
+});
+
+describe("worker database scope", () => {
+  it("connects as service_worker and cannot read application-user rows", async () => {
+    const workerDb = createServiceWorkerDbClient(localDatabaseUrl);
+
+    try {
+      await expect(workerDb<{ current_user: string }[]>`
+        select current_user
+      `).resolves.toEqual([{ current_user: "service_worker" }]);
+      await expect(workerDb`select id from public.app_users`).rejects.toMatchObject({
+        code: "42501",
+      });
+    } finally {
+      await closeDbClient(workerDb);
+    }
   });
 });

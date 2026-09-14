@@ -1,6 +1,7 @@
 export {
   closeDbClient,
   createDbClient,
+  createServiceWorkerDbClient,
   type Database,
 } from "./client.js";
 export {

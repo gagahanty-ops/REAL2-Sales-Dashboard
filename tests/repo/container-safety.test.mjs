@@ -13,6 +13,13 @@ test("Compose keeps both external network switches literally disabled", async ()
 
   assert.match(compose, /SYNC_ENABLED:\s*["']false["']/);
   assert.match(compose, /SHEET_PUBLISH_ENABLED:\s*["']false["']/);
+  assert.match(compose, /AMO_CLIENT_ID:\s*["']synthetic-client-id["']/);
+  assert.match(compose, /AMO_CLIENT_SECRET:\s*["']synthetic-client-secret-change-before-use["']/);
+  assert.match(
+    compose,
+    /AMO_REDIRECT_URI:\s*["']https:\/\/dashboard\.example\.invalid\/api\/integrations\/amo\/callback["']/,
+  );
+  assert.match(compose, /TOKEN_ENCRYPTION_KEY:\s*["']bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=["']/);
   assert.doesNotMatch(compose, /(?:SYNC_ENABLED|SHEET_PUBLISH_ENABLED):[^\n]*\$\{/);
   assert.doesNotMatch(compose, /123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks/);
   assert.match(compose, /127\.0\.0\.1:\$\{WEB_PORT:-3000\}:3000/);

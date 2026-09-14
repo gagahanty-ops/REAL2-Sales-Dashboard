@@ -6,6 +6,10 @@ x-runtime-environment: &runtime-environment
   SUPABASE_URL: "http://host.docker.internal:54321"
   SUPABASE_ANON_KEY: "${REAL2_SUPABASE_ANON_KEY:-local-anon-key}"
   SUPABASE_SERVICE_ROLE_KEY: "${REAL2_SUPABASE_SERVICE_ROLE_KEY:-local-service-role-key}"
+  AMO_CLIENT_ID: "synthetic-client-id"
+  AMO_CLIENT_SECRET: "synthetic-client-secret-change-before-use"
+  AMO_REDIRECT_URI: "https://dashboard.example.invalid/api/integrations/amo/callback"
+  TOKEN_ENCRYPTION_KEY: "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE="
   SYNC_ENABLED: "false"
   SHEET_PUBLISH_ENABLED: "false"
 

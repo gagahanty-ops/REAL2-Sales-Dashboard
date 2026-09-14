@@ -1,3 +1,9 @@
+import {
+  closeDbClient,
+  createServiceWorkerDbClient,
+  purgeExpiredOAuthStates,
+  type Database,
+} from "@real2/db";
 import { parseServerEnv, type ServerEnv } from "@real2/domain";
 import { pathToFileURL } from "node:url";
 
@@ -15,6 +21,18 @@ const disabledNetworkSwitches: WorkerNetworkSwitches = {
   SHEET_PUBLISH_ENABLED: false,
 };
 
+export type WorkerCliDependencies = Readonly<{
+  createWorkerDbClient(databaseUrl: string): Database;
+  purgeExpiredOAuthStates(db: Database): Promise<number>;
+  closeDbClient(db: Database): Promise<void>;
+}>;
+
+const workerCliDependencies: WorkerCliDependencies = {
+  createWorkerDbClient: createServiceWorkerDbClient,
+  purgeExpiredOAuthStates,
+  closeDbClient,
+};
+
 export async function runWorkerOnce(
   switches: WorkerNetworkSwitches = disabledNetworkSwitches,
 ): Promise<WorkerIdleResult> {
@@ -28,10 +46,18 @@ export async function runWorkerOnce(
 export async function runWorkerCli(
   input: Record<string, string | undefined>,
   write: (line: string) => void = (line) => process.stdout.write(`${line}\n`),
+  dependencies: WorkerCliDependencies = workerCliDependencies,
 ): Promise<void> {
   const env = parseServerEnv(input);
-  const result = await runWorkerOnce(env);
-  write(JSON.stringify(result));
+  const db = dependencies.createWorkerDbClient(env.DATABASE_URL);
+
+  try {
+    await dependencies.purgeExpiredOAuthStates(db);
+    const result = await runWorkerOnce(env);
+    write(JSON.stringify(result));
+  } finally {
+    await dependencies.closeDbClient(db);
+  }
 }
 
 if (
