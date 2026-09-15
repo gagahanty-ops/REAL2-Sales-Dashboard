@@ -1,6 +1,5 @@
-import { getLatestSyncRun, listSyncRuns } from "@real2/db";
+import { enqueueSyncWork, getLatestSyncRun, listSyncRuns } from "@real2/db";
 import { AppError, success } from "@real2/domain";
-import { runSync } from "@real2/worker/amo-sync";
 import { z } from "zod";
 
 import { requireRole } from "../../../lib/auth/authorization";
@@ -22,7 +21,7 @@ export const GET = withRoute(async (request) => {
 
 export const POST = withRoute(async (request, context) => {
   requireSameOrigin(request);
-  requireRole(await requireUser(), ["admin"]);
+  const user = requireRole(await requireUser(), ["admin"]);
   const input = manualSyncSchema.parse(await readJson(request));
   const latest = await getLatestSyncRun(getDatabase());
   if (
@@ -37,17 +36,17 @@ export const POST = withRoute(async (request, context) => {
     );
   }
 
-  const result = await runSync("manual");
-  if ("kind" in result) throw new AppError("E_CONFIG_INCOMPLETE", 422);
-  if (result.status === "locked") {
-    throw new AppError("E_SYNC_LOCKED", 409);
-  }
+  const queued = await enqueueSyncWork(getDatabase(), {
+    traceId: context.traceId,
+    kind: "manual",
+    requestedBy: user.id,
+  });
   return Response.json(
     success(
       {
-        runId: result.runId,
-        traceId: result.traceId,
-        status: result.status,
+        requestId: queued.id,
+        traceId: queued.traceId,
+        status: "queued",
       },
       { trace_id: context.traceId },
     ),

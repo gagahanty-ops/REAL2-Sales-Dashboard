@@ -30,13 +30,10 @@ export function createRetentionWorkerDbClient(
   databaseUrl: string,
   options: Options<Record<string, never>> = {},
 ): Database {
-  return createDbClient(databaseUrl, {
-    ...options,
-    connection: {
-      ...options.connection,
-      role: "retention_worker",
-    },
-  });
+  // The retention URL must authenticate as the dedicated login. Do not SET
+  // ROLE from the ordinary worker connection: membership would let it bypass
+  // the raw-evidence deletion boundary.
+  return createDbClient(databaseUrl, options);
 }
 
 export async function closeDbClient(db: Database): Promise<void> {

@@ -1,6 +1,7 @@
 import {
   closeDbClient,
   createServiceWorkerDbClient,
+  failStaleSyncRuns,
   purgeExpiredOAuthStates,
   type Database,
 } from "@real2/db";
@@ -8,7 +9,7 @@ import { parseServerEnv, type ServerEnv } from "@real2/domain";
 import { pathToFileURL } from "node:url";
 
 export type WorkerIdleResult = Readonly<{
-  status: "idle";
+  status: "idle" | "ready";
   networkRequests: 0;
 }>;
 
@@ -36,11 +37,7 @@ const workerCliDependencies: WorkerCliDependencies = {
 export async function runWorkerOnce(
   switches: WorkerNetworkSwitches = disabledNetworkSwitches,
 ): Promise<WorkerIdleResult> {
-  if (switches.SYNC_ENABLED || switches.SHEET_PUBLISH_ENABLED) {
-    throw new Error("Network integrations are not configured");
-  }
-
-  return { status: "idle", networkRequests: 0 };
+  return { status: switches.SYNC_ENABLED ? "ready" : "idle", networkRequests: 0 };
 }
 
 export async function runWorkerCli(
@@ -53,6 +50,20 @@ export async function runWorkerCli(
 
   try {
     await dependencies.purgeExpiredOAuthStates(db);
+    // The one-shot entrypoint is cron-friendly. Scheduled sync calls retain
+    // the double switch inside runSync; watchdog is DB-only and safe while
+    // sync is disabled.
+    if (env.SYNC_ENABLED) {
+      await failStaleSyncRuns(db, new Date(Date.now() - 20 * 60_000), new Date());
+      const now = new Date();
+      if (now.getUTCMinutes() % 5 === 0) {
+        // Resolve only in an enabled production worker. Node's repository-test
+        // runner executes TypeScript source directly, while deployed workers
+        // use the package's compiled guarded entrypoint.
+        const { runSync } = await import("@real2/worker/amo-sync");
+        await runSync("incremental");
+      }
+    }
     const result = await runWorkerOnce(env);
     write(JSON.stringify(result));
   } finally {

@@ -68,6 +68,7 @@ export {
 } from "./raw-amo.js";
 export {
   deleteProvenRawBefore,
+  enqueueSyncWork,
   failStaleSyncRuns,
   getLatestSyncRun,
   getPreviousFullLeadCount,
@@ -79,6 +80,7 @@ export {
   type RawRetentionProofInput,
   type RawRetentionResult,
   type RawRetentionSourceTable,
+  type QueuedSyncWork,
   type SafeSyncRunDetail,
   type SafeSyncRunSummary,
 } from "./sync-operations.js";

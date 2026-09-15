@@ -102,6 +102,21 @@ export type RawRetentionResult = Readonly<{
   normalizedRowsVerified: number;
 }>;
 
+export type QueuedSyncWork = Readonly<{ id: string; traceId: string; kind: SyncKind }>;
+
+export async function enqueueSyncWork(
+  db: Database,
+  input: Readonly<{ traceId: string; kind: SyncKind; requestedBy: string | null }>,
+): Promise<QueuedSyncWork> {
+  const [row] = await db<{ id: string; trace_id: string; kind: SyncKind }[]>`
+    insert into public.sync_work_queue (trace_id, kind, requested_by)
+    values (${input.traceId}, ${input.kind}, ${input.requestedBy})
+    returning id, trace_id, kind
+  `;
+  if (!row) throw new AppError("E_DB", 500);
+  return { id: row.id, traceId: row.trace_id, kind: row.kind };
+}
+
 function isSha256(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value);
 }

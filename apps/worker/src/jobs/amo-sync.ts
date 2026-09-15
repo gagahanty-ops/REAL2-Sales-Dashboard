@@ -164,6 +164,9 @@ export type AmoSyncDependencies = Readonly<{
   reconciliation: Readonly<{
     previousFullLeadCount(connectionId: string): Promise<number | null>;
   }>;
+  alerts?: Readonly<{
+    critical(input: Readonly<{ runId: string; code: string; summary: string }>): Promise<void>;
+  }>;
   traceId?: () => string;
 }>;
 
@@ -189,6 +192,7 @@ type RunContext = {
   counts: MutableCounts;
   tokenProvider: AmoTokenProvider;
   pageHashes: string[];
+  distinctLeadIds: Set<number>;
   nextCursors: SyncCursorSnapshot;
   nextPageNumber: Record<SyncStream, number>;
 };
@@ -402,6 +406,7 @@ async function paginate<
   },
 ): Promise<void> {
   const seenChecksums = new Set<string>();
+  const seenLogicalChecksums = new Set<string>();
   let url: string | undefined = input.url;
 
   while (url) {
@@ -418,6 +423,18 @@ async function paginate<
     }
     seenChecksums.add(payloadSha256);
     const mapped = input.map(payload);
+    // Envelope metadata (timestamps, paging markers, and next links) can
+    // change while amoCRM repeats the same logical page. Detect that loop
+    // before appending a second copy of its objects/events.
+    const logicalChecksum = sha256({
+      stream: input.stream,
+      objects: mapped.objects.map((object) => [object.entityType, object.externalId]),
+      events: mapped.events.map((event) => event.amoEventId),
+    });
+    if (seenLogicalChecksums.has(logicalChecksum)) {
+      throw fail("E_AMO_UPSTREAM", "amoCRM logical pagination loop detected", "failed");
+    }
+    seenLogicalChecksums.add(logicalChecksum);
     await appendValidatedPage(
       dependencies,
       context,
@@ -580,8 +597,8 @@ async function ingestLeads(
     stream: "leads",
     map: (payload) => {
       const leads = payload._embedded.leads;
-      context.counts.leadsRead += leads.length;
       for (const lead of leads) {
+        context.distinctLeadIds.add(lead.id);
         context.nextCursors.leads = nextCursor(
           context.nextCursors.leads,
           toDate(lead.updated_at),
@@ -610,16 +627,8 @@ async function executeLockedSync(
   clock: Clock,
   connection: ActiveSyncConnection,
 ): Promise<SyncRunResult> {
-  const config = await dependencies.configs.getActive(connection.id);
-  if (!config) throw new AppError("E_CONFIG_INCOMPLETE", 422);
   const traceId = dependencies.traceId?.() ?? randomUUID();
-  const run = await dependencies.runs.start({
-    kind,
-    connectionId: connection.id,
-    configId: config.id,
-    traceId,
-    startedAt: clock.now(),
-  });
+  let run: StartedSyncRun | undefined;
   const counts: MutableCounts = {
     pagesRead: 0,
     leadsRead: 0,
@@ -628,23 +637,27 @@ async function executeLockedSync(
     retries: 0,
   };
   const incremental = kind === "incremental";
-  const context: RunContext = {
-    connection,
-    config,
-    run,
-    clock,
-    counts,
-    tokenProvider: dependencies.tokens.createProvider(connection.id, {
-      runId: run.id,
-      traceId: run.traceId,
-      clock,
-    }),
-    pageHashes: [],
-    nextCursors: await dependencies.cursors.get(connection.id),
-    nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
-  };
 
   try {
+    const config = await dependencies.configs.getActive(connection.id);
+    if (!config) throw new AppError("E_CONFIG_INCOMPLETE", 422);
+    run = await dependencies.runs.start({
+      kind,
+      connectionId: connection.id,
+      configId: config.id,
+      traceId,
+      startedAt: clock.now(),
+    });
+    const context: RunContext = {
+      connection, config, run, clock, counts,
+      tokenProvider: dependencies.tokens.createProvider(connection.id, {
+        runId: run.id, traceId: run.traceId, clock,
+      }),
+      pageHashes: [],
+      distinctLeadIds: new Set<number>(),
+      nextCursors: await dependencies.cursors.get(connection.id),
+      nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
+    };
     await ingestMetadata(dependencies, context);
     await ingestUsers(dependencies, context);
     await ingestEvents(dependencies, context, incremental);
@@ -657,7 +670,7 @@ async function executeLockedSync(
       if (
         previousCount !== null &&
         previousCount > 0 &&
-        counts.leadsRead < previousCount * (1 - MAX_COUNT_DROP_RATIO)
+        context.distinctLeadIds.size < previousCount * (1 - MAX_COUNT_DROP_RATIO)
       ) {
         throw fail(
           "E_DATA_QUALITY_BLOCK",
@@ -667,6 +680,7 @@ async function executeLockedSync(
       }
     }
 
+    counts.leadsRead = context.distinctLeadIds.size;
     await dependencies.runs.finish(
       run.id,
       {
@@ -679,9 +693,19 @@ async function executeLockedSync(
     );
     return { status: "success", runId: run.id, traceId: run.traceId };
   } catch (error) {
+    // Nothing durable exists until the run has started. After that point every
+    // setup, token, cursor, and ingest failure must seal the run.
+    if (!run) throw error;
     const forced = (error as SyncFailure).forceStatus;
     const status = forced ?? (counts.pagesRead > 0 ? "partial" : "failed");
     const code = errorCode(error);
+    if (code === "E_DATA_QUALITY_BLOCK") {
+      await dependencies.alerts?.critical({
+        runId: run.id,
+        code,
+        summary: "Full lead count dropped by more than five percent",
+      });
+    }
     await dependencies.runs.finish(
       run.id,
       {
@@ -696,7 +720,7 @@ async function executeLockedSync(
                 : "amoCRM synchronization failed",
         errorCode: code,
         counts: countsSnapshot(counts),
-        checksum: context.pageHashes.length > 0 ? sha256(context.pageHashes) : null,
+        checksum: null,
       },
       clock.now(),
     );
@@ -885,6 +909,15 @@ export function createProductionAmoSyncDependencies(
     reconciliation: {
       previousFullLeadCount: (connectionId) =>
         getPreviousFullLeadCount(db, connectionId),
+    },
+    alerts: {
+      async critical(input) {
+        await db`
+          insert into public.sync_critical_alerts (sync_run_id, code, summary)
+          values (${input.runId}, ${input.code}, ${input.summary})
+          on conflict (sync_run_id, code) do nothing
+        `;
+      },
     },
   };
 }

@@ -11,7 +11,6 @@ import {
   failStaleSyncRuns,
   getPreviousFullLeadCount,
   getSyncCursors,
-  recordRawRetentionProofs,
   withSyncAdvisoryLock,
 } from "./sync-operations";
 import { finishSyncRun, startSyncRun } from "./sync-runs";
@@ -59,7 +58,7 @@ async function seedFixture(): Promise<Fixture> {
 
 async function clearFixtures(): Promise<void> {
   await adminDb.unsafe(
-    "truncate table public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
   );
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
@@ -153,7 +152,7 @@ describe("sync operational boundaries", () => {
     ).rejects.toMatchObject({ code: "23514" });
   });
 
-  it("retention deletes only hash-matched proven rows and preserves proof history", async () => {
+  it("retention fails closed while no concrete normalized history relation exists", async () => {
     const fixture = await seedFixture();
     const run = await startSyncRun(workerOne, {
       traceId: "retention-run",
@@ -198,29 +197,12 @@ describe("sync operational boundaries", () => {
       payloadSha256: quarantineHash,
       receivedAt: oldAt,
     });
-    const rawRows = await adminDb<{ source_table: string; source_id: string; payload_sha256: string }[]>`
-      select 'raw_amo_objects' as source_table, id as source_id, payload_sha256 from public.raw_amo_objects
-      union all
-      select 'raw_amo_events', id, payload_sha256 from public.raw_amo_events
-      union all
-      select 'raw_amo_quarantine', id, payload_sha256 from public.raw_amo_quarantine
-      order by source_table
-    `;
-    await recordRawRetentionProofs(workerOne, rawRows.map((row, index) => ({
-      sourceTable: row.source_table as "raw_amo_objects" | "raw_amo_events" | "raw_amo_quarantine",
-      sourceId: row.source_id,
-      payloadSha256: row.payload_sha256,
-      normalizedEntityType: "lead_history",
-      normalizedEntityId: `synthetic:${index + 1}`,
-      provedAt: now,
-    })));
-
     await expect(deleteProvenRawBefore(retentionDb, new Date("2026-06-17T09:00:00.000Z"))).resolves.toEqual({
-      objectsDeleted: 1,
-      eventsDeleted: 1,
-      quarantineDeleted: 1,
-      hashesPreserved: 3,
-      normalizedRowsVerified: 3,
+      objectsDeleted: 0,
+      eventsDeleted: 0,
+      quarantineDeleted: 0,
+      hashesPreserved: 0,
+      normalizedRowsVerified: 0,
     });
     const [remaining] = await adminDb<{ raw_count: number; proof_count: number }[]>`
       select
@@ -229,7 +211,7 @@ describe("sync operational boundaries", () => {
          (select count(*) from public.raw_amo_quarantine))::integer as raw_count,
         (select count(*)::integer from public.raw_retention_proofs) as proof_count
     `;
-    expect(remaining).toEqual({ raw_count: 0, proof_count: 3 });
+    expect(remaining).toEqual({ raw_count: 3, proof_count: 0 });
     await expect(workerOne`delete from public.raw_amo_objects`).rejects.toMatchObject({ code: "42501" });
   });
 });

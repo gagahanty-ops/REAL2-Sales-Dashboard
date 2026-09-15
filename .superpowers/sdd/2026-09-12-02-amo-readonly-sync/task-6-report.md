@@ -1,5 +1,26 @@
 # Task 6 report — guarded amoCRM synchronization operations
 
+## Fix round 1 — 2026-09-16
+
+- Added `0007_sync_hardening.sql`. Raw retention now enforces the 90-day
+  cutoff and returns zero deletions until a later normalization migration can
+  prove a concrete normalized row and matching retained hash in the same
+  transaction. The prior synthetic proof-success claim and test were removed.
+- Removed ordinary `service_worker` proof access and its membership route to
+  `retention_worker`; the retention client no longer issues `SET ROLE` and
+  must use separately authenticated retention credentials when that future
+  proof path is enabled.
+- Manual sync HTTP requests now persist `sync_work_queue` work with the
+  authenticated requester and request trace, returning `202 queued` without
+  performing a sync in the web request. Durable critical-alert and queue
+  tables were added for worker processing.
+- Run setup now starts only inside the terminalized execution block. The sync
+  loop detects repeated logical page contents even where response envelopes
+  change, and reconciliation uses distinct lead IDs rather than page lengths.
+- The worker entrypoint no longer throws a placeholder exception when sync is
+  enabled; it invokes its guarded scheduled entrypoint at five-minute
+  boundaries and seals stale runs before dispatch.
+
 ## Summary
 
 - Recovered and independently audited the uncommitted Task 6 diff on top of

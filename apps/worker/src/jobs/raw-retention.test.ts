@@ -2,13 +2,13 @@ import { expect, it, vi } from "vitest";
 
 import { runRawRetention } from "./raw-retention";
 
-it("deletes only proven raw payloads older than ninety days", async () => {
+it("keeps raw payloads when concrete normalized evidence is unavailable", async () => {
   const deleteProvenBefore = vi.fn(async () => ({
-    objectsDeleted: 2,
-    eventsDeleted: 3,
-    quarantineDeleted: 1,
-    hashesPreserved: 6,
-    normalizedRowsVerified: 6,
+    objectsDeleted: 0,
+    eventsDeleted: 0,
+    quarantineDeleted: 0,
+    hashesPreserved: 0,
+    normalizedRowsVerified: 0,
   }));
   const now = new Date("2026-09-15T09:00:00.000Z");
 
@@ -18,9 +18,9 @@ it("deletes only proven raw payloads older than ninety days", async () => {
     new Date("2026-06-17T09:00:00.000Z"),
   );
   expect(result).toMatchObject({
-    deleted: 6,
-    hashesPreserved: 6,
-    normalizedRowsVerified: 6,
+    deleted: 0,
+    hashesPreserved: 0,
+    normalizedRowsVerified: 0,
   });
 });
 
