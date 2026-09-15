@@ -1,6 +1,7 @@
 export {
   closeDbClient,
   createDbClient,
+  createRetentionWorkerDbClient,
   createServiceWorkerDbClient,
   type Database,
 } from "./client.js";
@@ -65,3 +66,19 @@ export {
   type RawChannelValue,
   type RawEntityType,
 } from "./raw-amo.js";
+export {
+  deleteProvenRawBefore,
+  failStaleSyncRuns,
+  getLatestSyncRun,
+  getPreviousFullLeadCount,
+  getSyncCursors,
+  getSyncRunDetail,
+  listSyncRuns,
+  recordRawRetentionProofs,
+  withSyncAdvisoryLock,
+  type RawRetentionProofInput,
+  type RawRetentionResult,
+  type RawRetentionSourceTable,
+  type SafeSyncRunDetail,
+  type SafeSyncRunSummary,
+} from "./sync-operations.js";

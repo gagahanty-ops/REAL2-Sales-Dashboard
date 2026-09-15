@@ -59,6 +59,9 @@ importers:
       '@real2/integrations':
         specifier: workspace:*
         version: link:../../packages/integrations
+      '@real2/worker':
+        specifier: workspace:*
+        version: link:../worker
       '@supabase/ssr':
         specifier: ^0.8.0
         version: 0.8.0(@supabase/supabase-js@2.116.0)

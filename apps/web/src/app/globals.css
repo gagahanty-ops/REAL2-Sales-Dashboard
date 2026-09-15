@@ -321,6 +321,25 @@ p {
   background: rgb(151 231 88 / 9%);
 }
 
+.sync-trigger {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.sync-recent {
+  max-width: 260px;
+  margin: 0;
+  color: #ffe2a8;
+  font-size: 0.84rem;
+  text-align: right;
+}
+
+.sync-summary,
+.sync-history {
+  margin-bottom: 24px;
+}
+
 .settings-grid {
   display: grid;
   gap: 24px;
@@ -492,6 +511,14 @@ p {
   .app-header,
   .page-heading {
     flex-direction: column;
+  }
+
+  .sync-trigger {
+    justify-items: start;
+  }
+
+  .sync-recent {
+    text-align: left;
   }
 
   .user-identity {

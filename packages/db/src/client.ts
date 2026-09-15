@@ -26,6 +26,19 @@ export function createServiceWorkerDbClient(
   });
 }
 
+export function createRetentionWorkerDbClient(
+  databaseUrl: string,
+  options: Options<Record<string, never>> = {},
+): Database {
+  return createDbClient(databaseUrl, {
+    ...options,
+    connection: {
+      ...options.connection,
+      role: "retention_worker",
+    },
+  });
+}
+
 export async function closeDbClient(db: Database): Promise<void> {
   await db.end({ timeout: 5 });
 }

@@ -105,6 +105,25 @@ describe("amoFetch", () => {
   });
 
   it.each([
+    [401, "E_AMO_AUTH"],
+    [429, "E_AMO_RATE_LIMIT"],
+    [503, "E_AMO_UPSTREAM"],
+  ])("preserves retryable HTTP status %i without response data", async (status, code) => {
+    const { audit, fetchFn, request } = createRequest();
+    fetchFn.mockResolvedValue(
+      new Response(JSON.stringify({ private: "synthetic-private-value" }), {
+        status,
+      }),
+    );
+
+    const rejection = await amoFetch(request).catch((error: unknown) => error);
+
+    expect(rejection).toMatchObject({ code, responseStatus: status });
+    expect(JSON.stringify(rejection)).not.toContain("synthetic-private-value");
+    expect(audit).toHaveLength(1);
+  });
+
+  it.each([
     ["forbidden method", { method: "PATCH" }, "E_AMO_METHOD_DENIED"],
     [
       "forbidden path",

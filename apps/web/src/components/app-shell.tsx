@@ -30,7 +30,10 @@ export function AppShell({
             </nav>
           ) : null}
           {user.role === "admin" || user.role === "head" ? (
-            <Link href="/quality/config">Качество</Link>
+            <>
+              <Link href="/quality/config">Качество</Link>
+              <Link href="/sync">Синхронизации</Link>
+            </>
           ) : null}
           <div className="user-identity">
             <span>{user.fullName}</span>

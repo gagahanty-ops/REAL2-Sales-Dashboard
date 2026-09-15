@@ -22,8 +22,16 @@ function deniedRedirect(): AppError {
   return new AppError("E_AMO_PATH_DENIED", 403);
 }
 
-function upstreamError(): AppError {
-  return new AppError("E_AMO_UPSTREAM", 502);
+function upstreamError(responseStatus?: number): AppError & { responseStatus?: number } {
+  const code =
+    responseStatus === 401
+      ? "E_AMO_AUTH"
+      : responseStatus === 429
+        ? "E_AMO_RATE_LIMIT"
+        : "E_AMO_UPSTREAM";
+  return Object.assign(new AppError(code, 502), {
+    ...(responseStatus !== undefined ? { responseStatus } : {}),
+  });
 }
 
 export async function amoFetch<T>(request: AmoFetchRequest<T>): Promise<T> {
@@ -66,12 +74,12 @@ export async function amoFetch<T>(request: AmoFetchRequest<T>): Promise<T> {
     responseStatus = response.status;
 
     if (!response.ok) {
-      throw upstreamError();
+      throw upstreamError(response.status);
     }
 
     const parsed = request.schema.safeParse(await response.json());
     if (!parsed.success) {
-      throw upstreamError();
+      throw upstreamError(response.status);
     }
 
     await recordAudit(request, {
