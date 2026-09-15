@@ -443,7 +443,7 @@ create table sync_cursors (
   connection_id uuid not null references amo_connections(id),
   stream text not null check (stream in ('leads','events','users','metadata')),
   cursor_time timestamptz,
-  cursor_external_id bigint,
+  cursor_external_id text,
   last_successful_run_id uuid references sync_runs(id),
   updated_at timestamptz not null default now(),
   primary key (connection_id, stream)
@@ -468,7 +468,7 @@ create table raw_amo_events (
   id uuid primary key default gen_random_uuid(),
   sync_run_id uuid not null references sync_runs(id),
   account_id bigint not null,
-  amo_event_id bigint not null,
+  amo_event_id text not null,
   amo_lead_id bigint,
   event_type text not null,
   event_at timestamptz not null,

@@ -2,9 +2,13 @@
 
 > Слой 2 по Spec-First Methodology.
 >
-> Версия: 1.0.1. Дата: 2026-09-12. Статус: утверждена заказчиком 2026-09-12.
+> Версия: 1.0.2. Дата: 2026-09-15. Статус: базовая спецификация утверждена заказчиком 2026-09-12; техническая коррекция 1.0.2 проверена по замечанию review 2026-09-15 без нового утверждения заказчиком.
 >
 > Техническое уточнение 1.0.1: в M4.2 добавлено хранилище quarantine, уже требовавшееся сценарием M4.6; бизнес-правила не изменены.
+>
+> Техническая коррекция 1.0.2: `amo_event_id` и внешний ID event-cursor являются ограниченными строками, как требует официальный Events API amoCRM (`id: string`, пример `01pz58t6p04ymgsgfbmfyfy1mf`). Формулы и ключ дедупликации `(account_id, amo_event_id)` не изменены.
+>
+> Локальный ingestion-контракт трактует event/cursor ID как непрозрачные строки длиной 1–128 символов, сохраняет значение и регистр без преобразования. Этот защитный предел приложения не заявляется как лимит amoCRM.
 >
 > Нормативные приложения: `METRICS_CATALOG.md` и `SECURITY_READ_ONLY.md`.
 
@@ -480,7 +484,7 @@ create table sync_cursors (
   connection_id uuid not null references amo_connections(id),
   stream text not null check (stream in ('leads','events','users','metadata')),
   cursor_time timestamptz,
-  cursor_external_id bigint,
+  cursor_external_id text,
   last_successful_run_id uuid references sync_runs(id),
   updated_at timestamptz not null default now(),
   primary key (connection_id, stream)
@@ -505,7 +509,7 @@ create table raw_amo_events (
   id uuid primary key default gen_random_uuid(),
   sync_run_id uuid not null references sync_runs(id),
   account_id bigint not null,
-  amo_event_id bigint not null,
+  amo_event_id text not null,
   amo_lead_id bigint,
   event_type text not null,
   event_at timestamptz not null,
@@ -549,7 +553,7 @@ create table amo_api_audit (
 - `sync_runs(status, started_at desc)`;
 - `amo_api_audit(sync_run_id, created_at)`.
 
-Raw payload хранится 90 дней, затем удаляется утверждённой retention job; hashes и нормализованная история сохраняются. Append-only обеспечивается отсутствием UPDATE/DELETE policies у application roles.
+`amo_event_id` — непрозрачная ограниченная строка из Events API; числовое преобразование запрещено. Raw payload хранится 90 дней, затем удаляется утверждённой retention job; hashes и нормализованная история сохраняются. Append-only обеспечивается отсутствием UPDATE/DELETE policies у application roles, проверкой `running` при каждой вставке и единственной атомарной DB-функцией завершения run/cursor advancement. `normalized_path` до durable insert сводится к allowlisted структурному пути с `:id` либо `/denied`; query, body, свободный текст и динамические ID не сохраняются.
 
 ### M4.3 API и расписание
 
@@ -660,7 +664,7 @@ create table leads (
 create table lead_stage_events (
   id uuid primary key default gen_random_uuid(),
   account_id bigint not null,
-  amo_event_id bigint not null,
+  amo_event_id text not null,
   amo_lead_id bigint not null,
   from_status_id bigint,
   to_status_id bigint not null,
@@ -673,7 +677,7 @@ create table lead_stage_events (
 create table lead_responsible_events (
   id uuid primary key default gen_random_uuid(),
   account_id bigint not null,
-  amo_event_id bigint not null,
+  amo_event_id text not null,
   amo_lead_id bigint not null,
   from_user_id bigint,
   to_user_id bigint,

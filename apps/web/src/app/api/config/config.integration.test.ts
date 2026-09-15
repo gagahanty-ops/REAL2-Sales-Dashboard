@@ -884,10 +884,10 @@ describe("pipeline configuration routes", () => {
     if (!binding) throw new Error("active configuration fixture is missing");
     const [run] = await adminDb<{ id: string }[]>`
       insert into public.sync_runs (
-        trace_id, connection_id, config_id, kind, status, finished_at
+        trace_id, connection_id, config_id, kind
       ) values (
         'trace-channel-values', ${binding.connection_id}, ${binding.config_id},
-        'incremental', 'success', '2026-09-15T09:01:00.000Z'
+        'incremental'
       )
       returning id
     `;
@@ -912,6 +912,13 @@ describe("pipeline configuration routes", () => {
           ${adminDb.json({ id: 7003, custom_fields_values: [{ field_id: 77, values: [{ value: "WhatsApp" }] }] })},
           ${"c".repeat(64)}
         )
+    `;
+    await adminDb`
+      select app.finish_sync_run(
+        ${run.id}::uuid, 'success'::public.sync_status,
+        '2026-09-15T09:01:00.000Z'::timestamptz,
+        1, 3, 0, 0, 0, null, null, null, null, '{}'::jsonb
+      )
     `;
 
     const response = await channelValuesRoute(

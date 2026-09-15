@@ -307,10 +307,9 @@ describe("raw synchronization RLS", () => {
     if (!config) throw new Error("pipeline fixture is missing");
     const [run] = await adminDb<{ id: string }[]>`
       insert into public.sync_runs (
-        trace_id, connection_id, config_id, kind, status, finished_at
+        trace_id, connection_id, config_id, kind
       ) values (
-        'trace-rls', ${connection.id}, ${config.id}, 'incremental',
-        'success', '2026-09-15T09:01:00.000Z'
+        'trace-rls', ${connection.id}, ${config.id}, 'incremental'
       )
       returning id
     `;
@@ -330,6 +329,17 @@ describe("raw synchronization RLS", () => {
       )
     `;
     await adminDb`
+      insert into public.raw_amo_events (
+        sync_run_id, account_id, amo_event_id, amo_lead_id,
+        event_type, event_at, payload, payload_sha256
+      ) values (
+        ${run.id}, 555151, '01pz58t6p04ymgsgfbmfyfy1mf', 7001,
+        'lead_status_changed', '2026-09-15T09:00:30.000Z',
+        ${adminDb.json({ id: "01pz58t6p04ymgsgfbmfyfy1mf", synthetic: true })},
+        ${"c".repeat(64)}
+      )
+    `;
+    await adminDb`
       insert into public.amo_api_audit (
         sync_run_id, trace_id, method, normalized_path,
         response_status, duration_ms, attempt, result
@@ -337,6 +347,11 @@ describe("raw synchronization RLS", () => {
         ${run.id}, 'trace-rls', 'GET', '/api/v4/leads',
         200, 3, 1, 'success'
       )
+    `;
+    await adminDb`
+      update public.sync_runs
+      set status = 'success', finished_at = '2026-09-15T09:01:00.000Z'
+      where id = ${run.id}
     `;
   }
 
@@ -351,12 +366,14 @@ describe("raw synchronization RLS", () => {
         pages: number;
         audits: number;
         raw_objects: number;
+        raw_events: number;
       }[]>`
         select
           (select count(*)::integer from public.sync_runs) as runs,
           (select count(*)::integer from public.sync_pages) as pages,
           (select count(*)::integer from public.amo_api_audit) as audits,
-          (select count(*)::integer from public.raw_amo_objects) as raw_objects
+          (select count(*)::integer from public.raw_amo_objects) as raw_objects,
+          (select count(*)::integer from public.raw_amo_events) as raw_events
       `;
       return counts;
     });
@@ -370,16 +387,24 @@ describe("raw synchronization RLS", () => {
       pages: 1,
       audits: 1,
       raw_objects: 1,
+      raw_events: 1,
     });
     await expect(visibleJournalCounts(testUsers.head.authUserId)).resolves.toEqual({
       runs: 1,
       pages: 1,
       audits: 1,
       raw_objects: 0,
+      raw_events: 0,
     });
     await expect(
       visibleJournalCounts(testUsers.managerOne.authUserId),
-    ).resolves.toEqual({ runs: 0, pages: 0, audits: 0, raw_objects: 0 });
+    ).resolves.toEqual({
+      runs: 0,
+      pages: 0,
+      audits: 0,
+      raw_objects: 0,
+      raw_events: 0,
+    });
   });
 
   it("keeps cursors and direct writes unavailable to authenticated users", async () => {
@@ -413,5 +438,32 @@ describe("raw synchronization RLS", () => {
         `;
       }),
     ).rejects.toMatchObject({ code: "42501" });
+  });
+
+  it("denies anonymous raw-event access and user execution of the finalizer", async () => {
+    await seedRawJournal();
+    await expect(adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role anon");
+      await transaction`select amo_event_id from public.raw_amo_events`;
+    })).rejects.toMatchObject({ code: "42501" });
+    await expect(adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role authenticated");
+      await transaction`
+        select set_config('request.jwt.claim.sub', ${testUsers.admin.authUserId}, true)
+      `;
+      await transaction`
+        select app.finish_sync_run(
+          '00000000-0000-4000-8000-000000000001'::uuid,
+          'success'::public.sync_status, now(), 0, 0, 0, 0, 0,
+          null, null, null, null, '{}'::jsonb
+        )
+      `;
+    })).rejects.toMatchObject({ code: "42501" });
+    await expect(adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role authenticated");
+      await transaction`
+        update public.raw_amo_events set event_type = 'tampered'
+      `;
+    })).rejects.toMatchObject({ code: "42501" });
   });
 });

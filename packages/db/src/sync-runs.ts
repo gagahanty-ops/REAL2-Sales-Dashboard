@@ -1,5 +1,4 @@
 import { AppError } from "@real2/domain";
-import type { TransactionSql } from "postgres";
 
 import type { Database } from "./client.js";
 
@@ -21,7 +20,7 @@ export type SyncCounts = Readonly<{
 
 export type SyncCursorPosition = Readonly<{
   cursorTime: Date | null;
-  cursorExternalId: number | null;
+  cursorExternalId: string | null;
 }>;
 
 export type SyncOutcome =
@@ -71,7 +70,6 @@ type SyncRunRow = {
 };
 
 const streams: readonly SyncStream[] = ["metadata", "users", "events", "leads"];
-
 function isNonNegativeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
@@ -126,45 +124,30 @@ export async function startSyncRun(
   return mapRun(row);
 }
 
-async function replaceCursors(
-  transaction: TransactionSql,
-  connectionId: string,
-  runId: string,
+function serializeCursors(
   nextCursors: Partial<Record<SyncStream, SyncCursorPosition>>,
-  updatedAt: Date,
-): Promise<void> {
+): Record<string, { cursor_time: string | null; cursor_external_id: string | null }> {
+  const serialized: Record<
+    string,
+    { cursor_time: string | null; cursor_external_id: string | null }
+  > = {};
   for (const stream of streams) {
     const cursor = nextCursors[stream];
     if (!cursor) continue;
     if (
       cursor.cursorExternalId !== null &&
-      (!Number.isSafeInteger(cursor.cursorExternalId) || cursor.cursorExternalId <= 0)
+      (typeof cursor.cursorExternalId !== "string" ||
+        cursor.cursorExternalId.length < 1 ||
+        cursor.cursorExternalId.length > 128)
     ) {
       throw new AppError("E_VALIDATION", 422);
     }
-    await transaction`
-      insert into public.sync_cursors (
-        connection_id,
-        stream,
-        cursor_time,
-        cursor_external_id,
-        last_successful_run_id,
-        updated_at
-      ) values (
-        ${connectionId},
-        ${stream},
-        ${cursor.cursorTime},
-        ${cursor.cursorExternalId},
-        ${runId},
-        ${updatedAt}
-      )
-      on conflict (connection_id, stream) do update set
-        cursor_time = excluded.cursor_time,
-        cursor_external_id = excluded.cursor_external_id,
-        last_successful_run_id = excluded.last_successful_run_id,
-        updated_at = excluded.updated_at
-    `;
+    serialized[stream] = {
+      cursor_time: cursor.cursorTime?.toISOString() ?? null,
+      cursor_external_id: cursor.cursorExternalId,
+    };
   }
+  return serialized;
 }
 
 export async function finishSyncRun(
@@ -178,46 +161,27 @@ export async function finishSyncRun(
     throw new AppError("E_VALIDATION", 422);
   }
 
-  await db.begin(async (transaction) => {
-    const [run] = await transaction<{
-      connection_id: string;
-      status: SyncStatus;
-    }[]>`
-      select connection_id, status
-      from public.sync_runs
-      where id = ${runId}
-      for update
-    `;
-    if (!run) throw new AppError("E_NOT_FOUND", 404);
-    if (run.status !== "running") throw new AppError("E_CONFLICT", 409);
-
-    const errorCode = outcome.status === "success" ? null : outcome.errorCode ?? null;
-    const errorSummary = outcome.status === "success" ? null : outcome.safeError;
-    await transaction`
-      update public.sync_runs
-      set
-        status = ${outcome.status},
-        finished_at = ${finishedAt},
-        pages_read = ${outcome.counts.pagesRead},
-        leads_read = ${outcome.counts.leadsRead},
-        events_read = ${outcome.counts.eventsRead},
-        users_read = ${outcome.counts.usersRead},
-        retries = ${outcome.counts.retries},
-        source_max_updated_at = ${outcome.sourceMaxUpdatedAt ?? null},
-        error_code = ${errorCode},
-        error_summary = ${errorSummary},
-        checksum = ${outcome.checksum ?? null}
-      where id = ${runId}
-    `;
-
-    if (outcome.status === "success") {
-      await replaceCursors(
-        transaction,
-        run.connection_id,
-        runId,
-        outcome.nextCursors,
-        finishedAt,
-      );
-    }
-  });
+  const errorCode = outcome.status === "success" ? null : outcome.errorCode ?? null;
+  const errorSummary = outcome.status === "success" ? null : outcome.safeError;
+  const nextCursors =
+    outcome.status === "success" ? serializeCursors(outcome.nextCursors) : {};
+  const [row] = await db<{ result: "finished" | "not_found" | "conflict" }[]>`
+    select app.finish_sync_run(
+      ${runId}::uuid,
+      ${outcome.status}::public.sync_status,
+      ${finishedAt},
+      ${outcome.counts.pagesRead},
+      ${outcome.counts.leadsRead},
+      ${outcome.counts.eventsRead},
+      ${outcome.counts.usersRead},
+      ${outcome.counts.retries},
+      ${outcome.sourceMaxUpdatedAt ?? null},
+      ${errorCode},
+      ${errorSummary},
+      ${outcome.checksum ?? null},
+      ${db.json(nextCursors)}
+    ) as result
+  `;
+  if (!row || row.result === "not_found") throw new AppError("E_NOT_FOUND", 404);
+  if (row.result === "conflict") throw new AppError("E_CONFLICT", 409);
 }

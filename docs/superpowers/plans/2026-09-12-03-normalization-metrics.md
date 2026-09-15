@@ -41,7 +41,11 @@
 ```ts
 it("rejects a stage event for a lead in another amo account", async () => {
   await seedNormalizedLead({ accountId: 1, amoLeadId: 55 });
-  await expect(insertStageEvent({ accountId: 2, amoLeadId: 55, amoEventId: 1 }))
+  await expect(insertStageEvent({
+    accountId: 2,
+    amoLeadId: 55,
+    amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
+  }))
     .rejects.toThrow(/foreign key/i);
 });
 
@@ -108,7 +112,7 @@ create table leads (
 create table lead_stage_events (
   id uuid primary key default gen_random_uuid(),
   account_id bigint not null,
-  amo_event_id bigint not null,
+  amo_event_id text not null,
   amo_lead_id bigint not null,
   from_status_id bigint,
   to_status_id bigint not null,
@@ -121,7 +125,7 @@ create table lead_stage_events (
 create table lead_responsible_events (
   id uuid primary key default gen_random_uuid(),
   account_id bigint not null,
-  amo_event_id bigint not null,
+  amo_event_id text not null,
   amo_lead_id bigint not null,
   from_user_id bigint,
   to_user_id bigint,
@@ -302,15 +306,15 @@ git commit -m "feat: normalize REAL2 lead snapshots deterministically"
 ```ts
 it("uses event ID as a stable tie-breaker and keeps first application/won times", () => {
   const events = [
-    statusEvent(20, "2026-09-07T09:00:00Z", applicationStatusId),
-    statusEvent(10, "2026-09-07T09:00:00Z", earlierStatusId),
-    statusEvent(30, "2026-09-10T10:00:00Z", wonStatusId),
-    statusEvent(40, "2026-09-11T10:00:00Z", wonStatusId),
+    statusEvent("evt-20", "2026-09-07T09:00:00Z", applicationStatusId),
+    statusEvent("evt-10", "2026-09-07T09:00:00Z", earlierStatusId),
+    statusEvent("evt-30", "2026-09-10T10:00:00Z", wonStatusId),
+    statusEvent("evt-40", "2026-09-11T10:00:00Z", wonStatusId),
   ];
   const result = buildLeadHistory({ events, applicationStatusId, wonStatusId });
   expect(result.milestones.applicationAt).toBe("2026-09-07T09:00:00.000Z");
   expect(result.milestones.wonAt).toBe("2026-09-10T10:00:00.000Z");
-  expect(result.orderedEventIds).toEqual([10, 20, 30, 40]);
+  expect(result.orderedEventIds).toEqual(["evt-10", "evt-20", "evt-30", "evt-40"]);
 });
 ```
 
@@ -324,7 +328,7 @@ Expected: FAIL because `buildLeadHistory` does not exist.
 
 ```ts
 const ordered = [...events].sort((a, b) =>
-  a.occurredAt.localeCompare(b.occurredAt) || a.amoEventId - b.amoEventId,
+  a.occurredAt.localeCompare(b.occurredAt) || a.amoEventId.localeCompare(b.amoEventId),
 );
 
 const applicationEvent = ordered.find((event) => event.kind === "stage" && event.toStatusId === applicationStatusId);

@@ -143,12 +143,12 @@ describe("append-only raw amoCRM journal", () => {
     };
     const event = {
       accountId: 4242,
-      amoEventId: 9001,
+      amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
       amoLeadId: 7001,
       eventType: "lead_status_changed",
       eventAt: new Date("2026-09-15T08:59:30.000Z"),
       payload: {
-        id: 9001,
+        id: "01pz58t6p04ymgsgfbmfyfy1mf",
         account_id: 4242,
         entity_id: 7001,
         type: "lead_status_changed",
@@ -191,7 +191,7 @@ describe("append-only raw amoCRM journal", () => {
       workerDb`
         update public.raw_amo_events
         set event_type = 'changed'
-        where amo_event_id = 9001
+        where amo_event_id = '01pz58t6p04ymgsgfbmfyfy1mf'
       `,
     ).rejects.toMatchObject({ code: "42501" });
     await expect(
@@ -201,16 +201,16 @@ describe("append-only raw amoCRM journal", () => {
     ).rejects.toMatchObject({ code: "42501" });
   });
 
-  it("rejects a changed payload that reuses an existing event identity or page number", async () => {
+  it("rejects event hash conflicts on a fresh page and page conflicts independently", async () => {
     const fixture = await seedFixture();
     const run = await startFixtureRun(workerDb, fixture, "trace-conflict");
     const event = {
       accountId: 4242,
-      amoEventId: 9001,
+      amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
       amoLeadId: 7001,
       eventType: "lead_status_changed",
       eventAt: receivedAt,
-      payload: { id: 9001, synthetic: "first" },
+      payload: { id: "01pz58t6p04ymgsgfbmfyfy1mf", synthetic: "first" },
       payloadSha256: hashA,
     };
 
@@ -229,18 +229,90 @@ describe("append-only raw amoCRM journal", () => {
       appendRawPage(workerDb, {
         syncRunId: run.id,
         stream: "events",
-        pageNumber: 1,
+        pageNumber: 2,
         itemCount: 1,
         payloadSha256: hashB,
         objects: [],
-        events: [{ ...event, payload: { id: 9001, synthetic: "changed" }, payloadSha256: hashB }],
+        events: [{
+          ...event,
+          payload: { id: "01pz58t6p04ymgsgfbmfyfy1mf", synthetic: "changed" },
+          payloadSha256: hashB,
+        }],
         receivedAt,
       }),
     ).rejects.toMatchObject({ code: "E_CONFLICT" });
 
     await expect(
-      adminDb<{ count: number }[]>`select count(*)::integer as count from public.raw_amo_events`,
-    ).resolves.toEqual([{ count: 1 }]);
+      adminDb<{ events: number; pages: number }[]>`
+        select
+          (select count(*)::integer from public.raw_amo_events) as events,
+          (select count(*)::integer from public.sync_pages) as pages
+      `,
+    ).resolves.toEqual([{ events: 1, pages: 1 }]);
+
+    await expect(
+      appendRawPage(workerDb, {
+        syncRunId: run.id,
+        stream: "events",
+        pageNumber: 1,
+        itemCount: 1,
+        payloadSha256: hashB,
+        objects: [],
+        events: [],
+      }),
+    ).rejects.toMatchObject({ code: "E_CONFLICT" });
+  });
+
+  it("deduplicates string event IDs across runs within an account, not across accounts", async () => {
+    const fixture = await seedFixture();
+    const first = await startFixtureRun(workerDb, fixture, "trace-event-account-1");
+    const event = {
+      accountId: 4242,
+      amoEventId: "event:01/ABC.2",
+      amoLeadId: 7001,
+      eventType: "lead_status_changed",
+      eventAt: receivedAt,
+      payload: { id: "event:01/ABC.2", synthetic: true },
+      payloadSha256: hashA,
+    };
+    await appendRawPage(workerDb, {
+      syncRunId: first.id,
+      stream: "events",
+      pageNumber: 1,
+      itemCount: 1,
+      payloadSha256: hashA,
+      objects: [],
+      events: [event],
+      receivedAt,
+    });
+    await finishSyncRun(workerDb, first.id, {
+      status: "success",
+      counts: { pagesRead: 1, leadsRead: 0, eventsRead: 1, usersRead: 0, retries: 0 },
+      nextCursors: {},
+    }, finishedAt);
+
+    const second = await startFixtureRun(workerDb, fixture, "trace-event-account-2");
+    await appendRawPage(workerDb, {
+      syncRunId: second.id,
+      stream: "events",
+      pageNumber: 1,
+      itemCount: 2,
+      payloadSha256: hashB,
+      objects: [],
+      events: [event, { ...event, accountId: 4343 }],
+      receivedAt: new Date("2026-09-15T09:02:00.000Z"),
+    });
+
+    await expect(
+      adminDb<{ account_id: string; amo_event_id: string }[]>`
+        select account_id, amo_event_id
+        from public.raw_amo_events
+        order by account_id
+      `,
+    ).resolves.toEqual([
+      { account_id: "4242", amo_event_id: "event:01/ABC.2" },
+      { account_id: "4343", amo_event_id: "event:01/ABC.2" },
+    ]);
   });
 
   it("advances cursors only in the same successful finish transaction", async () => {
@@ -254,9 +326,13 @@ describe("append-only raw amoCRM journal", () => {
         status: "success",
         counts: { pagesRead: 3, leadsRead: 4, eventsRead: 5, usersRead: 6, retries: 1 },
         nextCursors: {
+          events: {
+            cursorTime: new Date("2026-09-15T08:50:00.000Z"),
+            cursorExternalId: "event:01/ABC.2",
+          },
           leads: {
             cursorTime: new Date("2026-09-15T08:50:00.000Z"),
-            cursorExternalId: 7001,
+            cursorExternalId: "7001",
           },
         },
       },
@@ -283,9 +359,15 @@ describe("append-only raw amoCRM journal", () => {
       last_successful_run_id: string;
     }[]>`
       select stream, cursor_time, cursor_external_id, last_successful_run_id
-      from public.sync_cursors
+      from public.sync_cursors order by stream
     `;
     expect(cursors).toEqual([
+      {
+        stream: "events",
+        cursor_time: new Date("2026-09-15T08:50:00.000Z"),
+        cursor_external_id: "event:01/ABC.2",
+        last_successful_run_id: first.id,
+      },
       {
         stream: "leads",
         cursor_time: new Date("2026-09-15T08:50:00.000Z"),
@@ -302,15 +384,33 @@ describe("append-only raw amoCRM journal", () => {
     ]);
   });
 
-  it("does not let the worker rewrite a run's pinned identity", async () => {
+  it("does not let the worker rewrite any run fields or advance cursors directly", async () => {
     const fixture = await seedFixture();
     const run = await startFixtureRun(workerDb, fixture, "trace-pinned");
 
     await expect(
       workerDb`
         update public.sync_runs
-        set trace_id = 'trace-rewritten'
+        set pages_read = 99
         where id = ${run.id}
+      `,
+    ).rejects.toMatchObject({ code: "42501" });
+    await expect(
+      workerDb`
+        insert into public.sync_cursors (
+          connection_id, stream, cursor_external_id, last_successful_run_id
+        ) values (${fixture.connectionId}, 'events', '01pz-direct', ${run.id})
+      `,
+    ).rejects.toMatchObject({ code: "42501" });
+    await expect(
+      workerDb`
+        insert into public.sync_runs (
+          trace_id, connection_id, config_id, kind, status, finished_at,
+          pages_read
+        ) values (
+          'trace-forged-terminal', ${fixture.connectionId}, ${fixture.configId},
+          'incremental', 'success', ${finishedAt}, 99
+        )
       `,
     ).rejects.toMatchObject({ code: "42501" });
     await expect(
@@ -318,6 +418,186 @@ describe("append-only raw amoCRM journal", () => {
         select trace_id from public.sync_runs where id = ${run.id}
       `,
     ).resolves.toEqual([{ trace_id: "trace-pinned" }]);
+  });
+
+  it.each(["", 9001, "x".repeat(129)])("rolls back a direct atomic finish for invalid cursor ID %s", async (invalidId) => {
+    const fixture = await seedFixture();
+    const run = await startFixtureRun(workerDb, fixture, "trace-invalid-cursor");
+
+    await expect(
+      workerDb`
+        select app.finish_sync_run(
+          ${run.id}::uuid,
+          'success'::public.sync_status,
+          ${finishedAt},
+          1, 1, 1, 1, 0,
+          null, null, null, null,
+          ${workerDb.json({ events: { cursor_time: null, cursor_external_id: invalidId } })}
+        )
+      `,
+    ).rejects.toMatchObject({ code: "22023" });
+
+    await expect(
+      adminDb<{ status: string; pages_read: number; cursors: number }[]>`
+        select status, pages_read,
+          (select count(*)::integer from public.sync_cursors) as cursors
+        from public.sync_runs
+        where id = ${run.id}
+      `,
+    ).resolves.toEqual([{ status: "running", pages_read: 0, cursors: 0 }]);
+  });
+
+  it.each(["success", "partial", "failed"] as const)("seals all journal writes after a run becomes %s", async (status) => {
+    const fixture = await seedFixture();
+    const run = await startFixtureRun(workerDb, fixture, "trace-terminal-seal");
+    await finishSyncRun(workerDb, run.id, {
+      status,
+      counts: { pagesRead: 0, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
+      nextCursors: {},
+      safeError: "Synthetic terminal outcome",
+    }, finishedAt);
+
+    await expect(workerDb`
+      update public.sync_runs set status = 'failed', pages_read = 99 where id = ${run.id}
+    `).rejects.toMatchObject({ code: "42501" });
+    await expect(workerDb`
+      update public.sync_cursors set cursor_external_id = 'forged'
+      where connection_id = ${fixture.connectionId}
+    `).rejects.toMatchObject({ code: "42501" });
+    await expect(finishSyncRun(workerDb, run.id, {
+      status: "success",
+      counts: { pagesRead: 99, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
+      nextCursors: { events: { cursorTime: receivedAt, cursorExternalId: "forged" } },
+    })).rejects.toMatchObject({ code: "E_CONFLICT" });
+    await expect(adminDb<{ status: string; pages_read: number; cursors: number }[]>`
+      select status, pages_read,
+        (select count(*)::integer from public.sync_cursors) as cursors
+      from public.sync_runs where id = ${run.id}
+    `).resolves.toEqual([{ status, pages_read: 0, cursors: 0 }]);
+
+    await expect(
+      appendRawPage(workerDb, {
+        syncRunId: run.id,
+        stream: "leads",
+        pageNumber: 1,
+        itemCount: 0,
+        payloadSha256: hashA,
+        objects: [],
+        events: [],
+        receivedAt,
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      workerDb`
+        insert into public.raw_amo_objects (
+          sync_run_id, account_id, entity_type, external_id,
+          payload, payload_sha256
+        ) values (
+          ${run.id}, 4242, 'lead', 7001,
+          ${workerDb.json({ id: 7001, synthetic: true })}, ${hashA}
+        )
+      `,
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      workerDb`
+        insert into public.raw_amo_events (
+          sync_run_id, account_id, amo_event_id, amo_lead_id,
+          event_type, event_at, payload, payload_sha256
+        ) values (
+          ${run.id}, 4242, '01pz-terminal', 7001,
+          'lead_status_changed', ${receivedAt},
+          ${workerDb.json({ id: "01pz-terminal", synthetic: true })}, ${hashB}
+        )
+      `,
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      workerDb`
+        insert into public.raw_amo_quarantine (
+          sync_run_id, stream, page_number, reason_code,
+          payload, payload_sha256
+        ) values (
+          ${run.id}, 'leads', 2, 'E_AMO_SCHEMA',
+          ${workerDb.json({ synthetic: true })}, ${hashB}
+        )
+      `,
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      quarantineRawPage(workerDb, {
+        syncRunId: run.id,
+        stream: "leads",
+        pageNumber: 2,
+        reasonCode: "E_AMO_SCHEMA",
+        payload: { synthetic: true },
+        payloadSha256: hashB,
+        receivedAt,
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      appendAmoApiAudit(workerDb, {
+        syncRunId: run.id,
+        traceId: "trace-terminal-audit",
+        method: "GET",
+        normalizedPath: "/api/v4/leads",
+        responseStatus: 200,
+        durationMs: 1,
+        attempt: 1,
+        result: "success",
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it.each(["append", "finish"] as const)("serializes concurrent append/finalize when %s acquires the run lock first", async (firstOperation) => {
+    const fixture = await seedFixture();
+    const run = await startFixtureRun(workerDb, fixture, "trace-concurrent-seal");
+    const concurrentDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
+    const [connection] = await concurrentDb<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    if (!connection) throw new Error("synthetic concurrent connection is missing");
+    const { pid } = connection;
+    let release!: () => void;
+    let ready!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const locked = new Promise<void>((resolve) => { ready = resolve; });
+    const finish = (db: Database) => finishSyncRun(db, run.id, {
+      status: "success",
+      counts: { pagesRead: 0, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
+      nextCursors: {},
+    });
+    const append = (db: Database) => appendAmoApiAudit(db, {
+      syncRunId: run.id,
+      traceId: "trace-concurrent-audit",
+      method: "GET",
+      normalizedPath: "/api/v4/leads",
+      durationMs: 1,
+      attempt: 1,
+      result: "success",
+    });
+    const first = workerDb.begin(async (transaction) => {
+      const tx = transaction as unknown as Database;
+      await (firstOperation === "append" ? append(tx) : finish(tx));
+      ready();
+      await held;
+    });
+    let second: Promise<unknown> | undefined;
+    try {
+      await locked;
+      second = (firstOperation === "append" ? finish(concurrentDb) : append(concurrentDb))
+        .then(() => ({ success: true }), (error: unknown) => error);
+      await expect.poll(async () => {
+        const [row] = await adminDb<{ blocked: boolean }[]>`
+          select cardinality(pg_blocking_pids(${pid})) > 0 as blocked
+        `;
+        return row?.blocked;
+      }, { timeout: 3000 }).toBe(true);
+      release();
+      await first;
+      expect(await second).toMatchObject(
+        firstOperation === "append" ? { success: true } : { code: "23514" },
+      );
+    } finally {
+      release();
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
+      await closeDbClient(concurrentDb);
+    }
   });
 
   it("quarantines malformed payloads idempotently without changing the cursor", async () => {
@@ -345,7 +625,7 @@ describe("append-only raw amoCRM journal", () => {
     ).resolves.toEqual([{ quarantine: 1, cursors: 0 }]);
   });
 
-  it("persists only the safe audit shape and rejects query-bearing paths", async () => {
+  it("persists only the safe audit shape and canonicalizes dynamic or unsafe paths", async () => {
     const fixture = await seedFixture();
     const run = await startFixtureRun(workerDb, fixture, "trace-audit-run");
 
@@ -359,9 +639,19 @@ describe("append-only raw amoCRM journal", () => {
       attempt: 1,
       result: "success",
     });
+    await appendAmoApiAudit(workerDb, {
+      syncRunId: run.id,
+      traceId: "trace-dynamic-entry",
+      method: "GET",
+      normalizedPath: "/api/v4/leads/7001",
+      responseStatus: 200,
+      durationMs: 2,
+      attempt: 1,
+      result: "success",
+    });
 
     const [row] = await adminDb<Record<string, unknown>[]>`
-      select * from public.amo_api_audit
+      select * from public.amo_api_audit order by trace_id
     `;
     expect(Object.keys(row ?? {}).sort()).toEqual([
       "attempt",
@@ -378,17 +668,31 @@ describe("append-only raw amoCRM journal", () => {
     expect(JSON.stringify(row)).not.toContain("token");
     expect(JSON.stringify(row)).not.toContain("page=2");
 
-    await expect(
-      workerDb`
+    await workerDb`
         insert into public.amo_api_audit (
           sync_run_id, trace_id, method, normalized_path,
           response_status, duration_ms, attempt, result
         ) values (
-          ${run.id}, 'trace-unsafe', 'GET', '/api/v4/leads?page=2',
+          ${run.id}, 'trace-unsafe', 'GET', '/api/v4/leads/Maria@example.com?token=secret',
           200, 1, 1, 'success'
         )
+      `;
+
+    await expect(
+      adminDb<{ trace_id: string; normalized_path: string }[]>`
+        select trace_id, normalized_path
+        from public.amo_api_audit
+        order by trace_id
       `,
-    ).rejects.toMatchObject({ code: "23514" });
+    ).resolves.toEqual([
+      { trace_id: "trace-audit-entry", normalized_path: "/api/v4/leads" },
+      { trace_id: "trace-dynamic-entry", normalized_path: "/api/v4/leads/:id" },
+      { trace_id: "trace-unsafe", normalized_path: "/denied" },
+    ]);
+    const auditJson = JSON.stringify(
+      await adminDb`select normalized_path from public.amo_api_audit`,
+    );
+    expect(auditJson).not.toMatch(/Maria|token|secret|7001/);
   });
 
   it("counts exact source-field values from each lead's latest successful raw snapshot", async () => {
@@ -398,7 +702,7 @@ describe("append-only raw amoCRM journal", () => {
       syncRunId: first.id,
       stream: "leads",
       pageNumber: 1,
-      itemCount: 2,
+      itemCount: 3,
       payloadSha256: hashA,
       objects: [
         {
@@ -417,13 +721,21 @@ describe("append-only raw amoCRM journal", () => {
           payload: { id: 7002, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] },
           payloadSha256: "2".repeat(64),
         },
+        {
+          accountId: 4242,
+          entityType: "lead",
+          externalId: 7003,
+          sourceUpdatedAt: new Date("2026-09-15T08:00:00.000Z"),
+          payload: { id: 7003, custom_fields_values: [{ field_id: 77, values: [{ value: " Avito " }] }] },
+          payloadSha256: "4".repeat(64),
+        },
       ],
       events: [],
       receivedAt,
     });
     await finishSyncRun(workerDb, first.id, {
       status: "success",
-      counts: { pagesRead: 1, leadsRead: 2, eventsRead: 0, usersRead: 0, retries: 0 },
+      counts: { pagesRead: 1, leadsRead: 3, eventsRead: 0, usersRead: 0, retries: 0 },
       nextCursors: {},
     }, finishedAt);
 
@@ -456,6 +768,9 @@ describe("append-only raw amoCRM journal", () => {
         connectionId: fixture.connectionId,
         sourceFieldId: 77,
       }),
-    ).resolves.toEqual([{ value: "Avito", count: 2 }]);
+    ).resolves.toEqual([
+      { value: "Avito", count: 2 },
+      { value: " Avito ", count: 1 },
+    ]);
   });
 });

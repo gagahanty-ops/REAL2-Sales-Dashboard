@@ -17,7 +17,7 @@ export type RawAmoObjectInput = Readonly<{
 
 export type RawAmoEventInput = Readonly<{
   accountId: number;
-  amoEventId: number;
+  amoEventId: string;
   amoLeadId?: number | null;
   eventType: string;
   eventAt: Date;
@@ -68,13 +68,18 @@ function isSha256(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value);
 }
 
+function isBoundedExternalId(value: string): boolean {
+  return typeof value === "string" && value.length >= 1 && value.length <= 128;
+}
+
 function validatePageInput(input: AppendRawPageInput): void {
   if (
     !Number.isSafeInteger(input.pageNumber) ||
     input.pageNumber <= 0 ||
     !Number.isSafeInteger(input.itemCount) ||
     input.itemCount < 0 ||
-    !isSha256(input.payloadSha256)
+    !isSha256(input.payloadSha256) ||
+    input.events.some((event) => !isBoundedExternalId(event.amoEventId))
   ) {
     throw new AppError("E_VALIDATION", 422);
   }
@@ -330,7 +335,7 @@ export async function getRawChannelValues(
       select distinct
         lead.account_id,
         lead.external_id,
-        btrim(value_item ->> 'value') as value
+        value_item ->> 'value' as value
       from ranked_leads as lead
       cross join lateral jsonb_array_elements(
         case
@@ -349,7 +354,7 @@ export async function getRawChannelValues(
       where lead.recency = 1
         and field_item ->> 'field_id' = ${String(input.sourceFieldId)}
         and jsonb_typeof(value_item -> 'value') in ('string', 'number', 'boolean')
-        and btrim(value_item ->> 'value') <> ''
+        and value_item ->> 'value' <> ''
     )
     select value, count(*)::integer as count
     from exact_values
