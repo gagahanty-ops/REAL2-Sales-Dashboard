@@ -14,6 +14,30 @@ export {
 } from "./amo/oauth.js";
 export { amoFetch } from "./amo/transport.js";
 export {
+  amoAccountResponseSchema,
+  amoEventSchema,
+  amoEventsResponseSchema,
+  amoLeadSchema,
+  amoLeadsResponseSchema,
+  amoPipelineSchema,
+  amoPipelinesResponseSchema,
+  amoStatusSchema,
+  amoStatusesResponseSchema,
+  amoUserSchema,
+  amoUsersResponseSchema,
+  type AmoAccountResponse,
+  type AmoEvent,
+  type AmoEventsResponse,
+  type AmoLead,
+  type AmoLeadsResponse,
+  type AmoPipeline,
+  type AmoPipelinesResponse,
+  type AmoStatus,
+  type AmoStatusesResponse,
+  type AmoUser,
+  type AmoUsersResponse,
+} from "./amo/schemas.js";
+export {
   createAmoTokenProvider,
   refreshConnection,
   refreshDueConnections,

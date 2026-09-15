@@ -1,6 +1,7 @@
 import {
   getActivePipelineConfig,
   getCurrentSafeAmoConnectionStatus,
+  getRawChannelValues,
 } from "@real2/db";
 
 import { requireRole } from "../../../../lib/auth/authorization";
@@ -15,9 +16,16 @@ export const GET = withRoute(async () => {
   const config = connection
     ? await getActivePipelineConfig(db, connection.id)
     : null;
+  const values =
+    connection && config?.sourceFieldId
+      ? await getRawChannelValues(db, {
+          connectionId: connection.id,
+          sourceFieldId: config.sourceFieldId,
+        })
+      : [];
 
   return {
     configVersion: config?.version ?? null,
-    values: [],
+    values,
   };
 });

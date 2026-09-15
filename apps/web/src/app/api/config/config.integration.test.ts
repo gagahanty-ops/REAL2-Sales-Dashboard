@@ -146,7 +146,7 @@ beforeEach(async () => {
   session.user.id = testUsers.admin.id;
   session.user.role = "admin";
   await adminDb.unsafe(
-    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
   );
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
@@ -156,7 +156,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await adminDb.unsafe(
-    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
   );
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
@@ -857,6 +857,78 @@ describe("pipeline configuration routes", () => {
     );
     expect(values.status).toBe(200);
     expect(discovery.status).toBe(403);
+  });
+
+  it("returns truthful counts from latest successful raw lead snapshots", async () => {
+    const amo = new AmoDiscoveryMock();
+    vi.stubGlobal("fetch", amo.fetch);
+    const validationResponse = await validateRoute(
+      sameOriginPost("/api/config/validate", candidate),
+    );
+    const validation = (await validationResponse.json()) as {
+      data: { metadataChecksum: string };
+    };
+    await activateRoute(
+      sameOriginPost("/api/config/activate", {
+        candidate,
+        channelRules: INITIAL_CHANNEL_RULES,
+        metadataChecksum: validation.data.metadataChecksum,
+        expectedActiveConfigId: null,
+      }),
+    );
+    const [binding] = await adminDb<{ connection_id: string; config_id: string }[]>`
+      select amo_connection_id as connection_id, id as config_id
+      from public.pipeline_configs
+      where is_active
+    `;
+    if (!binding) throw new Error("active configuration fixture is missing");
+    const [run] = await adminDb<{ id: string }[]>`
+      insert into public.sync_runs (
+        trace_id, connection_id, config_id, kind, status, finished_at
+      ) values (
+        'trace-channel-values', ${binding.connection_id}, ${binding.config_id},
+        'incremental', 'success', '2026-09-15T09:01:00.000Z'
+      )
+      returning id
+    `;
+    if (!run) throw new Error("successful sync fixture is missing");
+    await adminDb`
+      insert into public.raw_amo_objects (
+        sync_run_id, account_id, entity_type, external_id,
+        source_updated_at, payload, payload_sha256
+      ) values
+        (
+          ${run.id}, 4242, 'lead', 7001, '2026-09-15T08:00:00.000Z',
+          ${adminDb.json({ id: 7001, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] })},
+          ${"a".repeat(64)}
+        ),
+        (
+          ${run.id}, 4242, 'lead', 7002, '2026-09-15T08:00:00.000Z',
+          ${adminDb.json({ id: 7002, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] })},
+          ${"b".repeat(64)}
+        ),
+        (
+          ${run.id}, 4242, 'lead', 7003, '2026-09-15T08:00:00.000Z',
+          ${adminDb.json({ id: 7003, custom_fields_values: [{ field_id: 77, values: [{ value: "WhatsApp" }] }] })},
+          ${"c".repeat(64)}
+        )
+    `;
+
+    const response = await channelValuesRoute(
+      new Request("https://dashboard.example.test/api/config/channel-values"),
+    );
+    const body = (await response.json()) as {
+      data: { configVersion: number; values: Array<{ value: string; count: number }> };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.data).toEqual({
+      configVersion: 1,
+      values: [
+        { value: "Avito", count: 2 },
+        { value: "WhatsApp", count: 1 },
+      ],
+    });
   });
 
 });

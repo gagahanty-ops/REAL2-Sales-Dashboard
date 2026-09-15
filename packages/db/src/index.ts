@@ -40,3 +40,28 @@ export {
   type ActiveChannelRule,
   type ActivePipelineConfig,
 } from "./amo-config.js";
+export {
+  finishSyncRun,
+  startSyncRun,
+  type StartSyncRunInput,
+  type SyncCounts,
+  type SyncCursorPosition,
+  type SyncKind,
+  type SyncOutcome,
+  type SyncRun,
+  type SyncStatus,
+  type SyncStream,
+} from "./sync-runs.js";
+export {
+  appendAmoApiAudit,
+  appendRawPage,
+  getRawChannelValues,
+  quarantineRawPage,
+  type AmoApiAuditInput,
+  type AppendRawPageInput,
+  type QuarantineRawPageInput,
+  type RawAmoEventInput,
+  type RawAmoObjectInput,
+  type RawChannelValue,
+  type RawEntityType,
+} from "./raw-amo.js";

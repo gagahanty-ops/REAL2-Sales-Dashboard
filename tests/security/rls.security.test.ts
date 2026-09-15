@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { closeDbClient, createServiceWorkerDbClient } from "@real2/db";
 
@@ -15,12 +15,16 @@ import {
 const adminDb = createAdminDb();
 const allUsers = Object.values(testUsers);
 
-beforeEach(async () => {
+async function clearDatabaseFixtures(): Promise<void> {
   await adminDb.unsafe(
-    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
   );
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
+}
+
+beforeEach(async () => {
+  await clearDatabaseFixtures();
   await resetAndSeedUsers(adminDb, allUsers);
   await adminDb`
     insert into public.amo_connections (
@@ -43,6 +47,10 @@ beforeEach(async () => {
       ${testUsers.admin.id}
     )
   `;
+});
+
+afterEach(async () => {
+  await clearDatabaseFixtures();
 });
 
 afterAll(async () => {
@@ -268,5 +276,142 @@ describe("worker database scope", () => {
     } finally {
       await closeDbClient(workerDb);
     }
+  });
+});
+
+describe("raw synchronization RLS", () => {
+  async function seedRawJournal(): Promise<void> {
+    const [connection] = await adminDb<{ id: string }[]>`
+      select id from public.amo_connections limit 1
+    `;
+    if (!connection) throw new Error("amoCRM fixture connection is missing");
+    const [config] = await adminDb<{ id: string }[]>`
+      insert into public.pipeline_configs (
+        amo_connection_id,
+        pipeline_id,
+        pipeline_name,
+        application_status_id,
+        application_status_name,
+        won_status_id,
+        won_status_name,
+        version,
+        is_active,
+        confirmed_by
+      ) values (
+        ${connection.id}, 10243278, 'РЕАЛ ДВА', 11,
+        'Завершение (самовывоз или доставка)', 99,
+        'Успешно реализовано', 1, true, ${testUsers.admin.id}
+      )
+      returning id
+    `;
+    if (!config) throw new Error("pipeline fixture is missing");
+    const [run] = await adminDb<{ id: string }[]>`
+      insert into public.sync_runs (
+        trace_id, connection_id, config_id, kind, status, finished_at
+      ) values (
+        'trace-rls', ${connection.id}, ${config.id}, 'incremental',
+        'success', '2026-09-15T09:01:00.000Z'
+      )
+      returning id
+    `;
+    if (!run) throw new Error("sync run fixture is missing");
+    await adminDb`
+      insert into public.sync_pages (
+        sync_run_id, stream, page_number, item_count, payload_sha256
+      ) values (${run.id}, 'leads', 1, 1, ${"a".repeat(64)})
+    `;
+    await adminDb`
+      insert into public.raw_amo_objects (
+        sync_run_id, account_id, entity_type, external_id,
+        payload, payload_sha256
+      ) values (
+        ${run.id}, 555151, 'lead', 7001,
+        ${adminDb.json({ id: 7001, synthetic: true })}, ${"b".repeat(64)}
+      )
+    `;
+    await adminDb`
+      insert into public.amo_api_audit (
+        sync_run_id, trace_id, method, normalized_path,
+        response_status, duration_ms, attempt, result
+      ) values (
+        ${run.id}, 'trace-rls', 'GET', '/api/v4/leads',
+        200, 3, 1, 'success'
+      )
+    `;
+  }
+
+  async function visibleJournalCounts(authUserId: string) {
+    return adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role authenticated");
+      await transaction`
+        select set_config('request.jwt.claim.sub', ${authUserId}, true)
+      `;
+      const [counts] = await transaction<{
+        runs: number;
+        pages: number;
+        audits: number;
+        raw_objects: number;
+      }[]>`
+        select
+          (select count(*)::integer from public.sync_runs) as runs,
+          (select count(*)::integer from public.sync_pages) as pages,
+          (select count(*)::integer from public.amo_api_audit) as audits,
+          (select count(*)::integer from public.raw_amo_objects) as raw_objects
+      `;
+      return counts;
+    });
+  }
+
+  it("shows safe run evidence to leadership but raw payloads only to admin", async () => {
+    await seedRawJournal();
+
+    await expect(visibleJournalCounts(testUsers.admin.authUserId)).resolves.toEqual({
+      runs: 1,
+      pages: 1,
+      audits: 1,
+      raw_objects: 1,
+    });
+    await expect(visibleJournalCounts(testUsers.head.authUserId)).resolves.toEqual({
+      runs: 1,
+      pages: 1,
+      audits: 1,
+      raw_objects: 0,
+    });
+    await expect(
+      visibleJournalCounts(testUsers.managerOne.authUserId),
+    ).resolves.toEqual({ runs: 0, pages: 0, audits: 0, raw_objects: 0 });
+  });
+
+  it("keeps cursors and direct writes unavailable to authenticated users", async () => {
+    await seedRawJournal();
+
+    await expect(
+      adminDb.begin(async (transaction) => {
+        await transaction.unsafe("set local role authenticated");
+        await transaction`
+          select set_config(
+            'request.jwt.claim.sub',
+            ${testUsers.admin.authUserId},
+            true
+          )
+        `;
+        await transaction`select stream from public.sync_cursors`;
+      }),
+    ).rejects.toMatchObject({ code: "42501" });
+    await expect(
+      adminDb.begin(async (transaction) => {
+        await transaction.unsafe("set local role authenticated");
+        await transaction`
+          select set_config(
+            'request.jwt.claim.sub',
+            ${testUsers.admin.authUserId},
+            true
+          )
+        `;
+        await transaction`
+          delete from public.raw_amo_objects where external_id = 7001
+        `;
+      }),
+    ).rejects.toMatchObject({ code: "42501" });
   });
 });
