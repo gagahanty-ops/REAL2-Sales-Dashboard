@@ -320,6 +320,44 @@ describe("token rotation", () => {
     );
   });
 
+  it("stops token refresh before validation or token rotation when the sync fence is lost", async () => {
+    const connection = await insertConnection();
+    const { fetchFn, transport } = createOAuthTransport();
+    let fenceChecks = 0;
+    const fenceError = new AppError("E_SYNC_FENCE_LOST", 409);
+    const validate = vi.fn(validateRefreshedAccessToken);
+
+    await expect(
+      refreshConnection(
+        connection.id,
+        {
+          db: adminDb,
+          encryptionKey,
+          oauthConfig,
+          transport,
+          validateRefreshedAccessToken: validate,
+          async assertFence() {
+            fenceChecks += 1;
+            if (fenceChecks >= 3) throw fenceError;
+          },
+        },
+        now,
+      ),
+    ).rejects.toEqual(fenceError);
+
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(validate).not.toHaveBeenCalled();
+    const stored = await getAmoConnectionCredentials(adminDb, connection.id);
+    expect(decryptToken(stored.accessTokenCiphertext, encryptionKey)).toBe(
+      "synthetic-access-old",
+    );
+    expect(decryptToken(stored.refreshTokenCiphertext, encryptionKey)).toBe(
+      "synthetic-refresh-old",
+    );
+    expect(stored.status).toBe("active");
+    expect(stored.refreshedAt).toBeNull();
+  });
+
   it("does not mistake a later explicit refresh for a concurrent waiter", async () => {
     const connection = await insertConnection();
     const { fetchFn, transport } = createOAuthTransport();

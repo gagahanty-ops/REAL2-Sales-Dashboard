@@ -300,3 +300,64 @@ test("worker iteration dispatches five-minute sync, nightly Moscow sync, and que
   ]);
   assert.deepEqual(state.lastDispatchAt, new Date("2026-09-14T23:30:00.000Z"));
 });
+
+test("worker nightly scheduler catches up after 02:30 Moscow once per Moscow date", async () => {
+  const calls: string[] = [];
+  const db = { name: "db" };
+  const state = { lastDispatchAt: null as Date | null, lastNightlyMoscowDate: null as string | null };
+  const enabledEnv = parseWorkerRuntimeEnv({ ...baseEnv, SYNC_ENABLED: "true" });
+  const dependencies = {
+    createWorkerDbClient() {
+      return db;
+    },
+    createRetentionDbClient() {
+      return db;
+    },
+    async purgeExpiredOAuthStates() {
+      return 0;
+    },
+    async failStaleSyncRuns() {
+      return [];
+    },
+    async runRawRetention() {
+      return undefined;
+    },
+    async deleteProvenRawBefore() {
+      throw new Error("runRawRetention was stubbed");
+    },
+    async runSync(kind: string) {
+      calls.push(`sync:${kind}`);
+    },
+    async processSyncQueue() {
+      calls.push("queue");
+      return 0;
+    },
+    async closeDbClient() {
+      return undefined;
+    },
+  };
+
+  await runWorkerIteration(
+    enabledEnv,
+    state,
+    {
+      ...dependencies,
+      now: () => new Date("2026-09-14T23:31:00.000Z"),
+    },
+  );
+  await runWorkerIteration(
+    enabledEnv,
+    state,
+    {
+      ...dependencies,
+      now: () => new Date("2026-09-14T23:32:00.000Z"),
+    },
+  );
+
+  assert.deepEqual(calls, [
+    "sync:nightly_reconciliation",
+    "queue",
+    "queue",
+  ]);
+  assert.equal(state.lastNightlyMoscowDate, "2026-09-15");
+});

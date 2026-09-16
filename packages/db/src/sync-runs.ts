@@ -42,6 +42,7 @@ export type SyncOutcome =
 
 export type StartSyncRunInput = Readonly<{
   traceId: string;
+  correlationTraceId?: string | null;
   connectionId: string;
   configId: string;
   kind: SyncKind;
@@ -52,6 +53,7 @@ export type StartSyncRunInput = Readonly<{
 export type SyncRun = Readonly<{
   id: string;
   traceId: string;
+  correlationTraceId: string | null;
   connectionId: string;
   configId: string;
   kind: SyncKind;
@@ -62,6 +64,7 @@ export type SyncRun = Readonly<{
 type SyncRunRow = {
   id: string;
   trace_id: string;
+  correlation_trace_id: string | null;
   connection_id: string;
   config_id: string;
   kind: SyncKind;
@@ -90,6 +93,7 @@ function mapRun(row: SyncRunRow): SyncRun {
   return {
     id: row.id,
     traceId: row.trace_id,
+    correlationTraceId: row.correlation_trace_id,
     connectionId: row.connection_id,
     configId: row.config_id,
     kind: row.kind,
@@ -105,6 +109,7 @@ export async function startSyncRun(
   const [row] = await db<SyncRunRow[]>`
     insert into public.sync_runs (
       trace_id,
+      correlation_trace_id,
       connection_id,
       config_id,
       kind,
@@ -112,13 +117,16 @@ export async function startSyncRun(
       created_by
     ) values (
       ${input.traceId},
+      ${input.correlationTraceId ?? null},
       ${input.connectionId},
       ${input.configId},
       ${input.kind},
       ${input.startedAt ?? new Date()},
       ${input.createdBy ?? null}
     )
-    returning id, trace_id, connection_id, config_id, kind, status, started_at
+    returning
+      id, trace_id, correlation_trace_id, connection_id, config_id, kind,
+      status, started_at
   `;
   if (!row) throw new AppError("E_DB", 500);
   return mapRun(row);

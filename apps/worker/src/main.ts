@@ -28,6 +28,7 @@ export type WorkerRuntimeEnv = ServerEnv &
 
 export type WorkerIterationState = {
   lastDispatchAt: Date | null;
+  lastNightlyMoscowDate?: string | null;
 };
 
 const disabledNetworkSwitches: WorkerNetworkSwitches = {
@@ -54,25 +55,22 @@ function moscowParts(value: Date): { date: string; hour: number; minute: number 
 
 function dueWorkerSyncKinds(
   now: Date,
-  lastDispatchAt: Date | null,
+  state: WorkerIterationState,
 ): readonly Extract<SyncKind, "incremental" | "nightly_reconciliation">[] {
   const due: Extract<SyncKind, "incremental" | "nightly_reconciliation">[] = [];
   if (
     now.getUTCMinutes() % 5 === 0 &&
-    (!lastDispatchAt || fiveMinuteSlot(lastDispatchAt) < fiveMinuteSlot(now))
+    (!state.lastDispatchAt || fiveMinuteSlot(state.lastDispatchAt) < fiveMinuteSlot(now))
   ) {
     due.push("incremental");
   }
 
   const moscowNow = moscowParts(now);
-  const moscowPrevious = lastDispatchAt ? moscowParts(lastDispatchAt) : null;
+  const afterNightlyStart =
+    moscowNow.hour > 2 || (moscowNow.hour === 2 && moscowNow.minute >= 30);
   if (
-    moscowNow.hour === 2 &&
-    moscowNow.minute === 30 &&
-    (!moscowPrevious ||
-      moscowPrevious.date !== moscowNow.date ||
-      moscowPrevious.hour < 2 ||
-      (moscowPrevious.hour === 2 && moscowPrevious.minute < 30))
+    afterNightlyStart &&
+    state.lastNightlyMoscowDate !== moscowNow.date
   ) {
     due.push("nightly_reconciliation");
   }
@@ -219,8 +217,11 @@ export async function runWorkerIteration(
     }, now);
 
     if (env.SYNC_ENABLED) {
-      const dispatched = dueWorkerSyncKinds(now, state.lastDispatchAt);
+      const dispatched = dueWorkerSyncKinds(now, state);
       for (const kind of dispatched) await deps.runSync(kind);
+      if (dispatched.includes("nightly_reconciliation")) {
+        state.lastNightlyMoscowDate = moscowParts(now).date;
+      }
       if (dispatched.length > 0) state.lastDispatchAt = now;
       await deps.processSyncQueue(workerDb);
     }

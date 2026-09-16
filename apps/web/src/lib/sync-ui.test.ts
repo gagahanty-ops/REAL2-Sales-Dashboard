@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatMoscowDateTime, syncHistoryPagination } from "./sync-ui";
+import { formatCreatedBy, formatMoscowDateTime, syncHistoryPagination } from "./sync-ui";
 
 describe("sync UI helpers", () => {
   it("formats synchronization dates in Europe/Moscow", () => {
@@ -18,5 +18,12 @@ describe("sync UI helpers", () => {
       previousHref: null,
       nextHref: null,
     });
+  });
+
+  it("renders safe created-by attribution labels", () => {
+    expect(formatCreatedBy("10000000-0000-4000-8000-000000000010")).toBe(
+      "ID 10000000-0000-4000-8000-000000000010",
+    );
+    expect(formatCreatedBy(null)).toBe("Система");
   });
 });

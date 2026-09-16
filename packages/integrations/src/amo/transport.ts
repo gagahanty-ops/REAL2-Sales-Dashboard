@@ -65,6 +65,7 @@ export async function amoFetch<T>(request: AmoFetchRequest<T>): Promise<T> {
       headers.set("authorization", `Bearer ${accessToken}`);
     }
 
+    await request.beforeNetwork?.();
     const response = await (request.fetchFn ?? globalThis.fetch)(normalized.url, {
       method: normalized.method,
       headers,

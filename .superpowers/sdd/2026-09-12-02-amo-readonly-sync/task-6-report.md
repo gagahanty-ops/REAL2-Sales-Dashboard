@@ -1,9 +1,9 @@
 # Task 6 report — guarded amoCRM synchronization operations
 
-## Fix round 2/5 — 2026-09-16
+## Fix round 3/5 — 2026-09-16
 
 Implemented from clean base commit
-`3059a95f65971f9b34a680805f2260173aff87a4`.
+`37d240ab80c59e4b7756a05acf4b06dc75cc6624`.
 
 This report intentionally replaces the earlier stale Task 6 write-up. It only
 describes behavior present in this round's code and tests.
@@ -15,28 +15,33 @@ describes behavior present in this round's code and tests.
    error fields, and a retryable running state. `claimNextSyncWork` claims one
    row with `for update skip locked`, so concurrent workers cannot own the same
    item. `completeSyncWork` is fenced by the lease token and rejects stale
-   completions. Expired leases are recoverable, and terminal completion/failure
-   persists the real `sync_run_id`, error code, and safe summary.
+   completions. Expired leases are recoverable; exhausted jobs are durably
+   failed instead of stranded. Queue correlation trace is stable while every
+   retry creates a fresh unique sync-run trace. Only a successful sync is
+   marked `done`; partial and failed runs persist a truthful failed queue state,
+   real `sync_run_id`, safe error code, and safe summary.
 
 2. Manual queue acceptance now preflights the same sync advisory lock used by
    the worker. If a run already owns the per-connection lock, `POST
    /api/sync-runs` returns `409 E_SYNC_LOCKED` before inserting queue work.
 
-3. Queue traceability is propagated into actual runs. Manual queue `trace_id`
-   and `requested_by` flow into `runSync`, `startSyncRun`, safe API projections,
-   and the UI's created-by attribution.
+3. Queue traceability is propagated without violating sync-run uniqueness.
+   Manual queue `trace_id` is stored as `correlation_trace_id`, each attempt has
+   its own `sync_runs.trace_id`, and `requested_by` flows into `runSync`,
+   `startSyncRun`, safe API projections, and the UI's created-by attribution.
 
 4. The worker entrypoint is no longer a one-shot placeholder. Production CLI
    mode loops until process shutdown. Each iteration always runs independent
    maintenance first: OAuth stale-state purge, stale sync watchdog, and raw
    retention at the current fail-closed boundary. When sync is enabled by both
    switches, the iteration dispatches due five-minute incremental syncs, the
-   02:30 `Europe/Moscow` nightly reconciliation, and the manual queue
-   consumer.
+   02:30 `Europe/Moscow` nightly reconciliation, including catch-up after a
+   missed 02:30 wake-up once per Moscow date, and the manual queue consumer.
 
 5. Advisory-lock ownership is fenced before any sensitive continuation. The
    lock helper reserves one PostgreSQL session, exposes a `SyncLockFence`, and
-   verifies the backend before token refresh, amoCRM network calls, raw append,
+   verifies the backend before and inside proactive token refresh, immediately
+   before OAuth/account amoCRM network calls and token rotation, raw append,
    audit persistence, alert persistence, and terminal finalization. If the
    backend is lost or replaced, the runner raises `E_SYNC_FENCE_LOST` and does
    not continue work under an unfenced lock. Cleanup releases locks after nested
@@ -79,11 +84,12 @@ describes behavior present in this round's code and tests.
 ## Regression coverage added
 
 - Queue ownership, `skip locked` single-claim behavior, stale lease recovery,
-  lease-token fencing, and terminal queue completion.
+  lease-token fencing, exhausted-job terminalization, fresh per-attempt trace
+  IDs, and truthful success/partial/failed queue completion.
 - Manual API `409 E_SYNC_LOCKED` before queue insertion while the same advisory
   lock is held.
-- Queue consumer execution that creates a real terminal sync run using the
-  queued trace/requester.
+- Queue consumer execution that creates a real terminal sync run using a fresh
+  attempt trace plus the queued correlation trace/requester.
 - Production worker recurrence for five-minute incremental sync, 02:30 Moscow
   nightly sync, queue consumption, watchdog, and fail-closed retention
   invocation.
@@ -91,6 +97,8 @@ describes behavior present in this round's code and tests.
   the fence trips with `E_SYNC_FENCE_LOST`, then another worker can acquire the
   lock.
 - Nested failure cleanup release of advisory locks.
+- Proactive OAuth refresh fencing before network validation and token rotation.
+- Nightly reconciliation catch-up after 02:30 Moscow without duplicate dispatch.
 - Restricted `service_worker` and `retention_worker` login requirements, same
   URL rejection, admin/postgres rejection, and no `SET ROLE` escalation.
 - Alert-sink failure sealing, partial failure lead-count preservation, checksum
@@ -108,12 +116,12 @@ All final commands were run locally with:
 
 | Check | Evidence |
 |---|---|
-| Local schema | `supabase db reset` applied migrations `0001` through `0008` cleanly. |
-| Focused Task 6 unit/UI | `pnpm vitest run --project unit apps/worker/src/jobs/amo-sync.test.ts apps/web/src/lib/sync-ui.test.ts`: 11 tests passed. |
-| Focused Task 6 DB/API | `pnpm vitest run --project integration packages/db/src/sync-operations.integration.test.ts apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts`: 13 tests passed, including the actual backend-termination fence test. |
-| Worker/repo TAP | `node --test apps/worker/src/main.test.mts tests/repo/container-safety.test.mjs`: 11 tests passed. |
-| Repository + unit | `pnpm test`: 15 TAP tests and 105 unit tests passed. |
-| Integration | `pnpm test:integration`: 8 files / 77 tests passed. |
+| Local schema | `supabase db reset` applied migrations `0001` through `0009` cleanly. |
+| Focused Task 6 unit/UI/OAuth | focused unit suites: 31 tests passed. |
+| Focused Task 6 DB/API | focused integration suites: 15 tests passed, including actual backend-termination fencing, queue retry correlation, exhaustion, and terminal status. |
+| Worker/repo TAP | focused worker/container TAP: 12 tests passed. |
+| Repository + unit | `pnpm test`: 16 TAP tests and 110 unit tests passed. |
+| Integration | `pnpm test:integration`: 8 files / 80 tests passed. |
 | Security | `pnpm test:security`: 2 files / 18 tests passed. |
 | Contracts | `pnpm test:contracts`: exited 0 with no matching contract files. |
 | Static analysis | `pnpm lint` and `pnpm typecheck` passed. |

@@ -29,6 +29,7 @@ export type RefreshAmoTokenDependencies = Readonly<{
   oauthConfig: AmoOAuthConfig;
   transport: AmoOAuthTransport;
   validateRefreshedAccessToken: RefreshedAccessTokenValidator;
+  assertFence?: () => void | Promise<void>;
 }>;
 
 type TokenProviderDependencies = RefreshAmoTokenDependencies &
@@ -37,6 +38,12 @@ type TokenProviderDependencies = RefreshAmoTokenDependencies &
 type RefreshResult =
   | Readonly<{ ok: true; accessToken: string }>
   | Readonly<{ ok: false; error: AppError }>;
+
+async function assertFence(
+  dependencies: Pick<RefreshAmoTokenDependencies, "assertFence">,
+): Promise<void> {
+  await dependencies.assertFence?.();
+}
 
 export async function refreshConnection(
   connectionId: string,
@@ -94,15 +101,23 @@ async function refreshConnectionLocked(
           connection.refreshTokenCiphertext,
           dependencies.encryptionKey,
         );
+        await assertFence(dependencies);
         const tokenPair = await refreshOAuthToken(
           currentRefreshToken,
           dependencies.oauthConfig,
-          dependencies.transport,
+          {
+            ...dependencies.transport,
+            ...(dependencies.assertFence
+              ? { beforeNetwork: dependencies.assertFence }
+              : {}),
+          },
         );
+        await assertFence(dependencies);
         await dependencies.validateRefreshedAccessToken(
           tokenPair.accessToken,
           connection,
         );
+        await assertFence(dependencies);
         const tokenExpiresAt = new Date(
           now.getTime() + tokenPair.expiresInSeconds * 1_000,
         );
@@ -119,10 +134,15 @@ async function refreshConnectionLocked(
           tokenExpiresAt,
           refreshedAt: now,
         });
+        await assertFence(dependencies);
         await actions.markCheckedAt(now);
 
         return { ok: true, accessToken: tokenPair.accessToken };
-      } catch {
+      } catch (error) {
+        if (error instanceof AppError && error.code === "E_SYNC_FENCE_LOST") {
+          throw error;
+        }
+        await assertFence(dependencies);
         await actions.markReauthRequired(now);
         return { ok: false, error: new AppError("E_AMO_AUTH", 502) };
       }
@@ -154,6 +174,7 @@ export function createAmoTokenProvider(
   return {
     async getAccessToken() {
       const now = dependencies.now?.() ?? new Date();
+      await assertFence(dependencies);
       const connection = await getAmoConnectionCredentials(
         dependencies.db,
         connectionId,
@@ -170,6 +191,7 @@ export function createAmoTokenProvider(
         return refreshConnection(connectionId, dependencies, now);
       }
 
+      await assertFence(dependencies);
       return decryptToken(
         connection.accessTokenCiphertext,
         dependencies.encryptionKey,

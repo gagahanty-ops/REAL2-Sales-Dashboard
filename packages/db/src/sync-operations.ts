@@ -13,6 +13,7 @@ import type {
 export type SafeSyncRunSummary = Readonly<{
   id: string;
   traceId: string;
+  correlationTraceId: string | null;
   kind: SyncKind;
   status: SyncStatus;
   startedAt: Date;
@@ -50,6 +51,7 @@ export type SafeSyncRunDetail = SafeSyncRunSummary & Readonly<{
 type SafeSyncRunRow = {
   id: string;
   trace_id: string;
+  correlation_trace_id: string | null;
   kind: SyncKind;
   status: SyncStatus;
   started_at: Date;
@@ -68,6 +70,7 @@ function mapSafeRun(row: SafeSyncRunRow): SafeSyncRunSummary {
   return {
     id: row.id,
     traceId: row.trace_id,
+    correlationTraceId: row.correlation_trace_id,
     kind: row.kind,
     status: row.status,
     startedAt: row.started_at,
@@ -131,6 +134,9 @@ export type SyncLockFence = Readonly<{
   assertOwned(): Promise<void>;
 }>;
 
+const queueExhaustedCode: AppErrorCode = "E_SYNC_QUEUE_EXHAUSTED";
+const queueExhaustedSummary = "Queued synchronization exceeded retry attempts";
+
 export async function enqueueSyncWork(
   db: Database,
   input: Readonly<{ traceId: string; kind: SyncKind; requestedBy: string | null }>,
@@ -158,6 +164,10 @@ export async function claimNextSyncWork(
   const leaseToken = randomUUID();
   const leaseExpiresAt = new Date(input.now.getTime() + input.leaseMs);
   return db.begin(async (transaction) => {
+    await sweepExpiredSyncWorkWithClient(transaction, {
+      now: input.now,
+      maxAttempts,
+    });
     const [selected] = await transaction<{ id: string }[]>`
       select id
       from public.sync_work_queue
@@ -203,6 +213,47 @@ export async function claimNextSyncWork(
       attempt: claimed.attempt_count,
     };
   });
+}
+
+type SyncWorkQueueClient = Pick<Database, "unsafe">;
+
+async function sweepExpiredSyncWorkWithClient(
+  db: SyncWorkQueueClient,
+  input: Readonly<{ now: Date; maxAttempts: number }>,
+): Promise<number> {
+  const rows = await db.unsafe<{ id: string }[]>(
+    `
+    update public.sync_work_queue
+    set
+      status = 'failed',
+      completed_at = $1,
+      lease_token = coalesce(lease_token, gen_random_uuid()),
+      last_error_code = $2,
+      last_error_summary = $3
+    where (
+      status = 'running'
+      and lease_expires_at <= $1
+      and attempt_count >= $4
+    ) or (
+      status = 'queued'
+      and attempt_count >= $4
+    )
+    returning id
+    `,
+    [input.now, queueExhaustedCode, queueExhaustedSummary, input.maxAttempts],
+  );
+  return rows.length;
+}
+
+export async function sweepExpiredSyncWork(
+  db: Database,
+  input: Readonly<{ now: Date; maxAttempts?: number }>,
+): Promise<number> {
+  const maxAttempts = input.maxAttempts ?? 3;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  return sweepExpiredSyncWorkWithClient(db, { now: input.now, maxAttempts });
 }
 
 export async function completeSyncWork(
@@ -451,7 +502,7 @@ export async function deleteProvenRawBefore(
 }
 
 const safeRunColumns = `
-  id, trace_id, kind, status, started_at, finished_at,
+  id, trace_id, correlation_trace_id, kind, status, started_at, finished_at,
   pages_read, leads_read, events_read, users_read, retries,
   error_code, error_summary, created_by
 `;

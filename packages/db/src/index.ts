@@ -79,6 +79,7 @@ export {
   isSyncAdvisoryLockBusy,
   listSyncRuns,
   recordRawRetentionProofs,
+  sweepExpiredSyncWork,
   withSyncAdvisoryLock,
   type ClaimedSyncWork,
   type CompleteSyncWorkInput,

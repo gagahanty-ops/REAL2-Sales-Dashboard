@@ -96,7 +96,13 @@ export type SyncCursorSnapshot = Partial<
 
 export type SyncRunResult =
   | Readonly<{ kind: "disabled" }>
-  | Readonly<{ status: "success" | "partial" | "failed"; runId: string; traceId: string }>
+  | Readonly<{
+      status: "success" | "partial" | "failed";
+      runId: string;
+      traceId: string;
+      errorCode?: AppErrorCode | string | null;
+      errorSummary?: string | null;
+    }>
   | Readonly<{ status: "locked"; code: "E_SYNC_LOCKED" }>;
 
 export type SyncTransportRequest<T> = Readonly<{
@@ -114,6 +120,7 @@ export type StartedSyncRun = Readonly<{ id: string; traceId: string }>;
 
 export type RunSyncOptions = Readonly<{
   traceId?: string;
+  correlationTraceId?: string | null;
   requestedBy?: string | null;
 }>;
 
@@ -139,6 +146,7 @@ export type AmoSyncDependencies = Readonly<{
       connectionId: string;
       configId: string;
       traceId: string;
+      correlationTraceId?: string | null;
       startedAt: Date;
       createdBy?: string | null;
     }): Promise<StartedSyncRun>;
@@ -162,12 +170,17 @@ export type AmoSyncDependencies = Readonly<{
   tokens: Readonly<{
     createProvider(
       connectionId: string,
-      context: Readonly<{ runId: string; traceId: string; clock: Clock }>,
+      context: Readonly<{
+        runId: string;
+        traceId: string;
+        clock: Clock;
+        fence: SyncLockFence;
+      }>,
     ): AmoTokenProvider;
     refresh(
       connectionId: string,
       now: Date,
-      context: Readonly<{ runId: string; traceId: string }>,
+      context: Readonly<{ runId: string; traceId: string; fence: SyncLockFence }>,
     ): Promise<string>;
   }>;
   audit?: Readonly<{
@@ -316,7 +329,7 @@ async function requestWithRetry<T>(
         await dependencies.tokens.refresh(
           context.connection.id,
           context.clock.now(),
-          { runId: context.run.id, traceId: context.run.traceId },
+          { runId: context.run.id, traceId: context.run.traceId, fence: context.fence },
         );
         attempt += 1;
         continue;
@@ -667,13 +680,14 @@ async function executeLockedSync(
       connectionId: connection.id,
       configId: config.id,
       traceId,
+      correlationTraceId: options.correlationTraceId ?? null,
       startedAt: clock.now(),
       createdBy: options.requestedBy ?? null,
     });
     context = {
       connection, config, run, clock, counts,
       tokenProvider: dependencies.tokens.createProvider(connection.id, {
-        runId: run.id, traceId: run.traceId, clock,
+        runId: run.id, traceId: run.traceId, clock, fence,
       }),
       pageHashes: [],
       distinctLeadIds: new Set<number>(),
@@ -764,7 +778,13 @@ async function executeLockedSync(
       },
       clock.now(),
     );
-    return { status, runId: run.id, traceId: run.traceId };
+    return {
+      status,
+      runId: run.id,
+      traceId: run.traceId,
+      errorCode: code,
+      errorSummary: safeError,
+    };
   }
 }
 
@@ -823,10 +843,28 @@ export async function processSyncWorkQueue(
 
   try {
     const result = await processor.run(work.kind, systemClock, {
-      traceId: work.traceId,
+      correlationTraceId: work.traceId,
       requestedBy: work.requestedBy,
     });
     if ("runId" in result) {
+      if (result.status !== "success") {
+        await processor.complete({
+          id: work.id,
+          leaseToken: work.leaseToken,
+          status: "failed",
+          completedAt: processor.now(),
+          syncRunId: result.runId,
+          errorCode:
+            result.errorCode ??
+            (result.status === "partial" ? "E_SYNC_PARTIAL" : "E_INTERNAL"),
+          errorSummary:
+            result.errorSummary ??
+            (result.status === "partial"
+              ? "Queued synchronization completed partially"
+              : "Queued synchronization failed"),
+        });
+        return 1;
+      }
       await processor.complete({
         id: work.id,
         leaseToken: work.leaseToken,
@@ -894,7 +932,7 @@ function productionAuditSink(
 function productionTokenDependencies(
   db: Database,
   env: ServerEnv,
-  context: Readonly<{ runId: string; traceId: string }>,
+  context: Readonly<{ runId: string; traceId: string; fence: SyncLockFence }>,
 ) {
   const encryptionKey = decodeTokenEncryptionKey(env.TOKEN_ENCRYPTION_KEY);
   const oauthConfig = {
@@ -905,6 +943,7 @@ function productionTokenDependencies(
   const transport = {
     traceId: context.traceId,
     auditSink: productionAuditSink(db, context.runId, 1),
+    beforeNetwork: () => context.fence.assertOwned(),
   };
   return {
     db,
@@ -919,12 +958,14 @@ function productionTokenDependencies(
         baseUrl: string;
       }>,
     ): Promise<void> {
+      await context.fence.assertOwned();
       const account: AmoAccountResponse = await amoFetch({
         method: "GET",
         url: `${connection.baseUrl}/api/v4/account`,
         schema: amoAccountResponseSchema,
         traceId: context.traceId,
         tokenProvider: { getAccessToken: async () => accessToken },
+        beforeNetwork: () => context.fence.assertOwned(),
         auditSink: productionAuditSink(db, context.runId, 1),
         redirect: "error",
       });
@@ -935,6 +976,7 @@ function productionTokenDependencies(
         throw new AppError("E_AMO_AUTH", 502);
       }
     },
+    assertFence: () => context.fence.assertOwned(),
   };
 }
 
@@ -991,6 +1033,7 @@ export function createProductionAmoSyncDependencies(
           schema: z.unknown(),
           traceId: request.traceId,
           tokenProvider: request.tokenProvider,
+          beforeNetwork: () => request.fence.assertOwned(),
           auditSink: {
             async record(entry) {
               await request.fence.assertOwned();

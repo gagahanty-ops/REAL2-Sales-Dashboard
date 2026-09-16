@@ -85,6 +85,21 @@ describe("amoFetch", () => {
     expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({ redirect: "error" });
   });
 
+  it("runs a final fence callback immediately before the network request", async () => {
+    const beforeNetwork = vi.fn(async () => {
+      throw new Error("synthetic fence lost");
+    });
+    const { fetchFn, request, tokenProvider } = createRequest({
+      beforeNetwork,
+    });
+
+    await expect(amoFetch(request)).rejects.toThrow("E_AMO_UPSTREAM");
+
+    expect(tokenProvider.getAccessToken).toHaveBeenCalledOnce();
+    expect(beforeNetwork).toHaveBeenCalledOnce();
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it("records only safe fields when a response fails schema validation", async () => {
     const { audit, fetchFn, request } = createRequest();
     fetchFn.mockResolvedValue(

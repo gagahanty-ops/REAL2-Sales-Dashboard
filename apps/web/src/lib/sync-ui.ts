@@ -7,6 +7,10 @@ export function formatMoscowDateTime(value: Date | null): string {
   }).format(value);
 }
 
+export function formatCreatedBy(value: string | null): string {
+  return value ? `ID ${value}` : "Система";
+}
+
 export type SyncHistoryPagination = Readonly<{
   currentPage: number;
   totalPages: number;

@@ -8,7 +8,7 @@ import { SyncTrigger } from "../../components/sync-trigger";
 import { requireRole } from "../../lib/auth/authorization";
 import { requireUser } from "../../lib/auth/require-user";
 import { getDatabase } from "../../lib/server/runtime";
-import { formatMoscowDateTime, syncHistoryPagination } from "../../lib/sync-ui";
+import { formatCreatedBy, formatMoscowDateTime, syncHistoryPagination } from "../../lib/sync-ui";
 
 export const dynamic = "force-dynamic";
 
@@ -64,16 +64,16 @@ export default async function SyncRunsPage({
         <h2>История</h2>
         <div className="config-table-wrap">
           <table className="config-table">
-            <thead><tr><th>Начало</th><th>Тип</th><th>Статус</th><th>Страницы</th><th>Лиды</th><th>События</th><th>Retries</th></tr></thead>
+            <thead><tr><th>Начало</th><th>Тип</th><th>Статус</th><th>Кем</th><th>Страницы</th><th>Лиды</th><th>События</th><th>Retries</th></tr></thead>
             <tbody>
               {history.items.map((run) => (
                 <tr key={run.id}>
                   <td><Link href={`/sync/${run.id}`}>{formatMoscowDateTime(run.startedAt)}</Link></td>
-                  <td>{run.kind}</td><td>{run.status}</td><td>{run.counts.pages}</td>
+                  <td>{run.kind}</td><td>{run.status}</td><td>{formatCreatedBy(run.createdBy)}</td><td>{run.counts.pages}</td>
                   <td>{run.counts.leads}</td><td>{run.counts.events}</td><td>{run.counts.retries}</td>
                 </tr>
               ))}
-              {history.items.length === 0 ? <tr><td colSpan={7} className="muted">Нет безопасной истории запусков.</td></tr> : null}
+              {history.items.length === 0 ? <tr><td colSpan={8} className="muted">Нет безопасной истории запусков.</td></tr> : null}
             </tbody>
           </table>
         </div>

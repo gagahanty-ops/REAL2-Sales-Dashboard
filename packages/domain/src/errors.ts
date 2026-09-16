@@ -14,6 +14,7 @@ export type AppErrorCode =
   | "E_SYNC_LOCKED"
   | "E_SYNC_FENCE_LOST"
   | "E_SYNC_PARTIAL"
+  | "E_SYNC_QUEUE_EXHAUSTED"
   | "E_DATA_QUALITY_BLOCK"
   | "E_SHEET_PROTECTED"
   | "E_SHEET_LAYOUT_MISMATCH"
@@ -37,6 +38,7 @@ const defaultMessages: Record<AppErrorCode, string> = {
   E_SYNC_LOCKED: "Синхронизация уже выполняется",
   E_SYNC_FENCE_LOST: "Синхронизация потеряла эксклюзивную блокировку",
   E_SYNC_PARTIAL: "Синхронизация завершилась не полностью",
+  E_SYNC_QUEUE_EXHAUSTED: "Очередь синхронизации исчерпала попытки",
   E_DATA_QUALITY_BLOCK: "Проверка качества данных не пройдена",
   E_SHEET_PROTECTED: "Исходная таблица защищена от записи",
   E_SHEET_LAYOUT_MISMATCH: "Структура таблицы изменилась",

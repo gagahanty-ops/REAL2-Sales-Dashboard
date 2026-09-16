@@ -24,6 +24,7 @@ export type AmoOAuthTransport = Readonly<{
   fetchFn?: AmoFetchFn;
   auditSink: AmoAuditSink;
   traceId: string;
+  beforeNetwork?: () => void | Promise<void>;
 }>;
 
 export type AmoTokenPair = Readonly<{
@@ -48,6 +49,7 @@ async function exchangeToken(
     schema: tokenResponseSchema,
     traceId: transport.traceId,
     tokenProvider: oauthTokenProvider,
+    ...(transport.beforeNetwork ? { beforeNetwork: transport.beforeNetwork } : {}),
     ...(transport.fetchFn ? { fetchFn: transport.fetchFn } : {}),
     auditSink: transport.auditSink,
     headers: { "content-type": "application/json" },

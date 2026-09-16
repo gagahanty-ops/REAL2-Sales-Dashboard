@@ -204,7 +204,7 @@ describe("amoCRM read-only sync", () => {
     expect(quarantined[0]).toMatchObject({ payload: malformed });
   });
 
-  it("propagates manual queue trace and requester attribution into the sync run", async () => {
+  it("uses a unique run trace while preserving manual queue correlation and requester attribution", async () => {
     const started: unknown[] = [];
     const dependencies = {
       envEnabled: true,
@@ -242,20 +242,22 @@ describe("amoCRM read-only sync", () => {
         refresh: vi.fn(),
       },
       reconciliation: { previousFullLeadCount: vi.fn(async () => null) },
+      traceId: vi.fn(() => "attempt-trace-1"),
     } as unknown as AmoSyncDependencies;
 
     await expect(
       createAmoSyncRunner(dependencies)("manual", createClock(), {
-        traceId: "manual-request-trace",
+        correlationTraceId: "manual-request-trace",
         requestedBy: "10000000-0000-4000-8000-000000000010",
       }),
     ).resolves.toMatchObject({
       status: "success",
-      traceId: "manual-request-trace",
+      traceId: "attempt-trace-1",
     });
 
     expect(started[0]).toMatchObject({
-      traceId: "manual-request-trace",
+      traceId: "attempt-trace-1",
+      correlationTraceId: "manual-request-trace",
       createdBy: "10000000-0000-4000-8000-000000000010",
     });
   });
@@ -285,7 +287,7 @@ describe("amoCRM read-only sync", () => {
     })).resolves.toBe(1);
 
     expect(run).toHaveBeenCalledWith("manual", expect.anything(), {
-      traceId: "queued-trace",
+      correlationTraceId: "queued-trace",
       requestedBy: "10000000-0000-4000-8000-000000000010",
     });
     expect(completed[0]).toMatchObject({
@@ -294,6 +296,156 @@ describe("amoCRM read-only sync", () => {
       status: "done",
       syncRunId: "run-1",
     });
+  });
+
+  it("reclaimed queue attempts get distinct run traces while preserving the queue correlation", async () => {
+    const runOptions: unknown[] = [];
+    const complete = vi.fn();
+    const claims = [
+      {
+        id: "queue-1",
+        traceId: "stable-queue-correlation",
+        kind: "manual" as const,
+        requestedBy: "10000000-0000-4000-8000-000000000010",
+        leaseToken: "40000000-0000-4000-8000-000000000001",
+        attempt: 1,
+      },
+      {
+        id: "queue-1",
+        traceId: "stable-queue-correlation",
+        kind: "manual" as const,
+        requestedBy: "10000000-0000-4000-8000-000000000010",
+        leaseToken: "40000000-0000-4000-8000-000000000002",
+        attempt: 2,
+      },
+    ];
+    const run = vi.fn(async (_kind, _clock, options) => {
+      runOptions.push(options);
+      return {
+        status: "success" as const,
+        runId: `run-${runOptions.length}`,
+        traceId: `attempt-trace-${runOptions.length}`,
+      };
+    });
+
+    for (const claim of claims) {
+      await processSyncWorkQueue({
+        now: () => fixedNow,
+        claim: vi.fn(async () => claim),
+        complete,
+        run,
+      });
+    }
+
+    expect(runOptions).toEqual([
+      {
+        correlationTraceId: "stable-queue-correlation",
+        requestedBy: "10000000-0000-4000-8000-000000000010",
+      },
+      {
+        correlationTraceId: "stable-queue-correlation",
+        requestedBy: "10000000-0000-4000-8000-000000000010",
+      },
+    ]);
+    expect(complete).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      status: "done",
+      syncRunId: "run-1",
+    }));
+    expect(complete).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      status: "done",
+      syncRunId: "run-2",
+    }));
+  });
+
+  it("marks partial and failed sync attempts as failed queue terminals with the run link", async () => {
+    const completed: unknown[] = [];
+
+    await processSyncWorkQueue({
+      now: () => fixedNow,
+      claim: vi.fn(async () => ({
+        id: "queue-1",
+        traceId: "queued-trace",
+        kind: "manual" as const,
+        requestedBy: null,
+        leaseToken: "40000000-0000-4000-8000-000000000001",
+        attempt: 1,
+      })),
+      complete: vi.fn(async (input) => {
+        completed.push(input);
+      }),
+      run: vi.fn(async () => ({
+        status: "partial" as const,
+        runId: "run-partial",
+        traceId: "attempt-trace",
+        errorCode: "E_SYNC_PARTIAL",
+        errorSummary: "amoCRM returned an invalid page",
+      })),
+    });
+
+    expect(completed[0]).toMatchObject({
+      id: "queue-1",
+      status: "failed",
+      syncRunId: "run-partial",
+      errorCode: "E_SYNC_PARTIAL",
+      errorSummary: "amoCRM returned an invalid page",
+    });
+  });
+
+  it("threads the advisory fence into token provider and refresh paths", async () => {
+    const refreshContexts: unknown[] = [];
+    const providerContexts: unknown[] = [];
+    let requestCount = 0;
+    const dependencies = {
+      envEnabled: true,
+      controls: { isSyncEnabled: vi.fn(async () => true) },
+      connections: {
+        getActive: vi.fn(async () => ({
+          id: "connection-1",
+          accountId: 9001,
+          baseUrl: "https://555151.amocrm.ru",
+        })),
+      },
+      configs: { getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })) },
+      locks: { withSyncLock: vi.fn(async (_id, action) => action(testFence)) },
+      cursors: { get: vi.fn(async () => ({})) },
+      runs: {
+        start: vi.fn(async () => ({ id: "run-1", traceId: "attempt-trace" })),
+        finish: vi.fn(),
+      },
+      raw: { appendPage: vi.fn(), quarantinePage: vi.fn() },
+      transport: {
+        requestPage: vi.fn(async () => {
+          requestCount += 1;
+          if (requestCount === 1) {
+            throw Object.assign(new Error("expired token"), {
+              code: "E_AMO_AUTH",
+              responseStatus: 401,
+            });
+          }
+          return { id: 9001, subdomain: "555151" };
+        }),
+      },
+      tokens: {
+        createProvider: vi.fn((_connectionId, context) => {
+          providerContexts.push(context);
+          return { getAccessToken: vi.fn(async () => "test-token") };
+        }),
+        refresh: vi.fn(async (_connectionId, _now, context) => {
+          refreshContexts.push(context);
+          throw new AppError("E_SYNC_FENCE_LOST", 409);
+        }),
+      },
+      reconciliation: { previousFullLeadCount: vi.fn(async () => null) },
+    } as unknown as AmoSyncDependencies;
+
+    await expect(
+      createAmoSyncRunner(dependencies)("incremental", createClock()),
+    ).rejects.toMatchObject({ code: "E_SYNC_FENCE_LOST" });
+
+    expect(providerContexts[0]).toMatchObject({ fence: testFence });
+    expect(refreshContexts[0]).toMatchObject({ fence: testFence });
+    expect(dependencies.transport.requestPage).toHaveBeenCalledTimes(1);
+    expect(dependencies.runs.finish).not.toHaveBeenCalled();
   });
 
   it("cancels before append or finalization when the advisory fence is lost", async () => {

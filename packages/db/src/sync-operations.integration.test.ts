@@ -263,6 +263,134 @@ describe("sync operational boundaries", () => {
     })).resolves.toBeNull();
   });
 
+  it("sweeps expired max-attempt queue work to failed before claiming", async () => {
+    await seedFixture();
+    await adminDb`
+      insert into public.sync_work_queue (
+        trace_id, kind, requested_by, status, attempt_count,
+        claimed_at, lease_token, lease_expires_at
+      ) values (
+        'expired-running', 'manual', ${testUsers.admin.id}, 'running', 3,
+        ${new Date("2026-09-15T08:00:00.000Z")},
+        '40000000-0000-4000-8000-000000000001',
+        ${new Date("2026-09-15T08:20:00.000Z")}
+      )
+    `;
+    await adminDb`
+      insert into public.sync_work_queue (
+        trace_id, kind, requested_by, status, attempt_count
+      ) values (
+        'queued-exhausted', 'manual', ${testUsers.admin.id}, 'queued', 3
+      )
+    `;
+
+    await expect(claimNextSyncWork(workerOne, {
+      now,
+      leaseMs: 60_000,
+      maxAttempts: 3,
+    })).resolves.toBeNull();
+    await expect(
+      adminDb<{
+        trace_id: string;
+        status: string;
+        completed_at: Date | null;
+        last_error_code: string | null;
+        last_error_summary: string | null;
+      }[]>`
+        select trace_id, status, completed_at, last_error_code, last_error_summary
+        from public.sync_work_queue
+        order by trace_id
+      `,
+    ).resolves.toEqual([
+      {
+        trace_id: "expired-running",
+        status: "failed",
+        completed_at: now,
+        last_error_code: "E_SYNC_QUEUE_EXHAUSTED",
+        last_error_summary: "Queued synchronization exceeded retry attempts",
+      },
+      {
+        trace_id: "queued-exhausted",
+        status: "failed",
+        completed_at: now,
+        last_error_code: "E_SYNC_QUEUE_EXHAUSTED",
+        last_error_summary: "Queued synchronization exceeded retry attempts",
+      },
+    ]);
+  });
+
+  it("reclaims crashed queue work without reusing the previous run trace", async () => {
+    const fixture = await seedFixture();
+    const queued = await enqueueSyncWork(adminDb, {
+      traceId: "stable-queue-correlation",
+      kind: "manual",
+      requestedBy: testUsers.admin.id,
+    });
+    const first = await claimNextSyncWork(workerOne, {
+      now,
+      leaseMs: 60_000,
+      maxAttempts: 3,
+    });
+    expect(first).toMatchObject({
+      id: queued.id,
+      traceId: "stable-queue-correlation",
+      attempt: 1,
+    });
+    if (!first) throw new Error("first claim missing");
+    const firstRun = await startSyncRun(workerOne, {
+      traceId: "attempt-trace-1",
+      correlationTraceId: first.traceId,
+      connectionId: fixture.connectionId,
+      configId: fixture.configId,
+      kind: "manual",
+      createdBy: first.requestedBy,
+      startedAt: now,
+    });
+
+    const recovered = await claimNextSyncWork(workerTwo, {
+      now: new Date("2026-09-15T09:01:01.000Z"),
+      leaseMs: 60_000,
+      maxAttempts: 3,
+    });
+    expect(recovered).toMatchObject({
+      id: queued.id,
+      traceId: "stable-queue-correlation",
+      requestedBy: testUsers.admin.id,
+      attempt: 2,
+    });
+    if (!recovered) throw new Error("recovered claim missing");
+    const secondRun = await startSyncRun(workerTwo, {
+      traceId: "attempt-trace-2",
+      correlationTraceId: recovered.traceId,
+      connectionId: fixture.connectionId,
+      configId: fixture.configId,
+      kind: "manual",
+      createdBy: recovered.requestedBy,
+      startedAt: new Date("2026-09-15T09:01:01.000Z"),
+    });
+
+    expect(secondRun.traceId).not.toBe(firstRun.traceId);
+    await expect(
+      adminDb<{ trace_id: string; correlation_trace_id: string | null; created_by: string | null }[]>`
+        select trace_id, correlation_trace_id, created_by
+        from public.sync_runs
+        where id in (${firstRun.id}, ${secondRun.id})
+        order by trace_id
+      `,
+    ).resolves.toEqual([
+      {
+        trace_id: "attempt-trace-1",
+        correlation_trace_id: "stable-queue-correlation",
+        created_by: testUsers.admin.id,
+      },
+      {
+        trace_id: "attempt-trace-2",
+        correlation_trace_id: "stable-queue-correlation",
+        created_by: testUsers.admin.id,
+      },
+    ]);
+  });
+
   it("returns cursors and the previous successful full lead count", async () => {
     const fixture = await seedFixture();
     const run = await startSyncRun(workerOne, {
