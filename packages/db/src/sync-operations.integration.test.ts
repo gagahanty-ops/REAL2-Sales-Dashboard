@@ -1,30 +1,37 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   closeDbClient,
   createRetentionWorkerDbClient,
   createServiceWorkerDbClient,
+  type Database,
 } from "./client";
 import { appendRawPage, quarantineRawPage } from "./raw-amo";
 import {
+  claimNextSyncWork,
+  completeSyncWork,
   deleteProvenRawBefore,
+  enqueueSyncWork,
   failStaleSyncRuns,
   getPreviousFullLeadCount,
   getSyncCursors,
+  isSyncAdvisoryLockBusy,
   withSyncAdvisoryLock,
 } from "./sync-operations";
 import { finishSyncRun, startSyncRun } from "./sync-runs";
 import {
   createAdminDb,
-  localDatabaseUrl,
+  ensureRestrictedTestLogins,
+  localRetentionWorkerDatabaseUrl,
+  localServiceWorkerDatabaseUrl,
   resetAndSeedUsers,
   testUsers,
 } from "../../../tests/helpers/local-db";
 
 const adminDb = createAdminDb();
-const workerOne = createServiceWorkerDbClient(localDatabaseUrl, { max: 2 });
-const workerTwo = createServiceWorkerDbClient(localDatabaseUrl, { max: 2 });
-const retentionDb = createRetentionWorkerDbClient(localDatabaseUrl, { max: 1 });
+let workerOne: Database;
+let workerTwo: Database;
+let retentionDb: Database;
 const oldAt = new Date("2026-01-01T00:00:00.000Z");
 const now = new Date("2026-09-15T09:00:00.000Z");
 
@@ -64,6 +71,13 @@ async function clearFixtures(): Promise<void> {
   await adminDb`delete from public.amo_connections`;
 }
 
+beforeAll(async () => {
+  await ensureRestrictedTestLogins(adminDb);
+  workerOne = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 2 });
+  workerTwo = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 2 });
+  retentionDb = createRetentionWorkerDbClient(localRetentionWorkerDatabaseUrl, { max: 1 });
+});
+
 beforeEach(clearFixtures);
 afterEach(clearFixtures);
 afterAll(async () => {
@@ -101,6 +115,152 @@ describe("sync operational boundaries", () => {
     await expect(
       withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after"),
     ).resolves.toBe("after");
+  });
+
+  it("preflights the same advisory lock without taking ownership away from the runner", async () => {
+    const fixture = await seedFixture();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const first = withSyncAdvisoryLock(workerOne, fixture.connectionId, async () => {
+      entered();
+      await held;
+    });
+    await acquired;
+
+    await expect(isSyncAdvisoryLockBusy(workerTwo, fixture.connectionId)).resolves.toBe(true);
+    release();
+    await first;
+    await expect(isSyncAdvisoryLockBusy(workerTwo, fixture.connectionId)).resolves.toBe(false);
+  });
+
+  it("releases the advisory lock after nested failures", async () => {
+    const fixture = await seedFixture();
+
+    await expect(
+      withSyncAdvisoryLock(workerOne, fixture.connectionId, async () => {
+        throw Object.assign(new Error("nested failure"), { code: "E_INTERNAL" });
+      }),
+    ).rejects.toMatchObject({ code: "E_INTERNAL" });
+    await expect(
+      withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after-throw"),
+    ).resolves.toBe("after-throw");
+  });
+
+  it("fences an actually terminated advisory-lock session before work continues", async () => {
+    const fixture = await seedFixture();
+    const victimDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
+    let allowFenceCheck!: () => void;
+    const terminated = new Promise<void>((resolve) => {
+      allowFenceCheck = resolve;
+    });
+    let publishBackendPid!: (pid: number) => void;
+    const backendPid = new Promise<number>((resolve) => {
+      publishBackendPid = resolve;
+    });
+
+    try {
+      const runner = withSyncAdvisoryLock(victimDb, fixture.connectionId, async (fence) => {
+        publishBackendPid(fence.backendPid);
+        await terminated;
+        await expect(fence.assertOwned()).rejects.toMatchObject({ code: "E_SYNC_FENCE_LOST" });
+        return "fenced";
+      });
+
+      const pid = await backendPid;
+      const [row] = await adminDb<{ terminated: boolean }[]>`
+        select pg_terminate_backend(${pid}) as terminated
+      `;
+      expect(row?.terminated).toBe(true);
+      allowFenceCheck();
+
+      await expect(runner).resolves.toBe("fenced");
+      await expect(isSyncAdvisoryLockBusy(workerTwo, fixture.connectionId)).resolves.toBe(false);
+      await expect(
+        withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after-terminate"),
+      ).resolves.toBe("after-terminate");
+    } finally {
+      await closeDbClient(victimDb);
+    }
+  }, 15_000);
+
+  it("claims queued sync work once with skip locked and recovers an expired lease", async () => {
+    await seedFixture();
+    const queued = await enqueueSyncWork(adminDb, {
+      traceId: "manual-trace-1",
+      kind: "manual",
+      requestedBy: testUsers.admin.id,
+    });
+    await enqueueSyncWork(adminDb, {
+      traceId: "manual-trace-2",
+      kind: "manual",
+      requestedBy: testUsers.admin.id,
+    });
+    const claimedAt = new Date("2026-09-15T09:00:00.000Z");
+    const [first, second] = await Promise.all([
+      claimNextSyncWork(workerOne, { now: claimedAt, leaseMs: 60_000 }),
+      claimNextSyncWork(workerTwo, { now: claimedAt, leaseMs: 60_000 }),
+    ]);
+
+    expect([first?.traceId, second?.traceId].sort()).toEqual([
+      "manual-trace-1",
+      "manual-trace-2",
+    ]);
+
+    const stillLeased = await claimNextSyncWork(workerTwo, {
+      now: new Date("2026-09-15T09:00:30.000Z"),
+      leaseMs: 60_000,
+    });
+    expect(stillLeased).toBeNull();
+
+    const recovered = await claimNextSyncWork(workerTwo, {
+      now: new Date("2026-09-15T09:01:01.000Z"),
+      leaseMs: 60_000,
+    });
+    expect(recovered).toMatchObject({
+      id: queued.id,
+      traceId: "manual-trace-1",
+      requestedBy: testUsers.admin.id,
+      attempt: 2,
+    });
+    expect(recovered?.leaseToken).not.toBe(first?.leaseToken);
+
+    await expect(
+      completeSyncWork(workerOne, {
+        id: queued.id,
+        leaseToken: first?.leaseToken ?? "00000000-0000-4000-8000-000000000000",
+        status: "done",
+        completedAt: new Date("2026-09-15T09:01:02.000Z"),
+        syncRunId: "30000000-0000-4000-8000-000000000001",
+      }),
+    ).rejects.toMatchObject({ code: "E_CONFLICT" });
+
+    await completeSyncWork(workerTwo, {
+      id: queued.id,
+      leaseToken: recovered?.leaseToken ?? "00000000-0000-4000-8000-000000000000",
+      status: "done",
+      completedAt: new Date("2026-09-15T09:01:03.000Z"),
+      syncRunId: "30000000-0000-4000-8000-000000000002",
+    });
+    for (const claim of [first, second]) {
+      if (!claim || claim.id === queued.id) continue;
+      await completeSyncWork(workerOne, {
+        id: claim.id,
+        leaseToken: claim.leaseToken,
+        status: "done",
+        completedAt: new Date("2026-09-15T09:01:04.000Z"),
+        syncRunId: "30000000-0000-4000-8000-000000000003",
+      });
+    }
+    await expect(claimNextSyncWork(workerOne, {
+      now: new Date("2026-09-15T09:02:04.000Z"),
+      leaseMs: 60_000,
+    })).resolves.toBeNull();
   });
 
   it("returns cursors and the previous successful full lead count", async () => {

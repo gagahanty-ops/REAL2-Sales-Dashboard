@@ -29,6 +29,14 @@ test("Compose keeps both external network switches literally disabled", async ()
     compose,
     /DATABASE_URL:\s*["']postgresql:\/\/postgres:postgres@host\.docker\.internal:54322\/postgres["']/,
   );
+  assert.match(
+    compose,
+    /WORKER_DATABASE_URL:\s*["']postgresql:\/\/service_worker:service-worker-test@host\.docker\.internal:54322\/postgres["']/,
+  );
+  assert.match(
+    compose,
+    /RETENTION_DATABASE_URL:\s*["']postgresql:\/\/retention_worker:retention-worker-test@host\.docker\.internal:54322\/postgres["']/,
+  );
 });
 
 test("container builds do not accept credentials as build arguments", async () => {

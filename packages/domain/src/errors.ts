@@ -12,6 +12,7 @@ export type AppErrorCode =
   | "E_AMO_METHOD_DENIED"
   | "E_AMO_PATH_DENIED"
   | "E_SYNC_LOCKED"
+  | "E_SYNC_FENCE_LOST"
   | "E_SYNC_PARTIAL"
   | "E_DATA_QUALITY_BLOCK"
   | "E_SHEET_PROTECTED"
@@ -34,6 +35,7 @@ const defaultMessages: Record<AppErrorCode, string> = {
   E_AMO_METHOD_DENIED: "Метод amoCRM запрещён",
   E_AMO_PATH_DENIED: "Адрес amoCRM запрещён",
   E_SYNC_LOCKED: "Синхронизация уже выполняется",
+  E_SYNC_FENCE_LOST: "Синхронизация потеряла эксклюзивную блокировку",
   E_SYNC_PARTIAL: "Синхронизация завершилась не полностью",
   E_DATA_QUALITY_BLOCK: "Проверка качества данных не пройдена",
   E_SHEET_PROTECTED: "Исходная таблица защищена от записи",

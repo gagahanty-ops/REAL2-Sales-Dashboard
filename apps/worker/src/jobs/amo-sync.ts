@@ -19,11 +19,13 @@ import {
 import type {
   AmoApiAuditInput,
   AppendRawPageInput,
+  ClaimedSyncWork,
   RawAmoEventInput,
   RawAmoObjectInput,
   SyncCounts,
   SyncCursorPosition,
   SyncKind,
+  SyncLockFence,
   SyncOutcome,
   SyncStream,
 } from "@real2/db";
@@ -104,10 +106,16 @@ export type SyncTransportRequest<T> = Readonly<{
   attempt: number;
   tokenProvider: AmoTokenProvider;
   schema: z.ZodType<T>;
+  fence: SyncLockFence;
   audit(input: AmoApiAuditInput): Promise<void>;
 }>;
 
 export type StartedSyncRun = Readonly<{ id: string; traceId: string }>;
+
+export type RunSyncOptions = Readonly<{
+  traceId?: string;
+  requestedBy?: string | null;
+}>;
 
 export type AmoSyncDependencies = Readonly<{
   envEnabled: boolean;
@@ -117,7 +125,10 @@ export type AmoSyncDependencies = Readonly<{
     getActive(connectionId: string): Promise<ActiveSyncConfig | null>;
   }>;
   locks: Readonly<{
-    withSyncLock<T>(connectionId: string, action: () => Promise<T>): Promise<T>;
+    withSyncLock<T>(
+      connectionId: string,
+      action: (fence: SyncLockFence) => Promise<T>,
+    ): Promise<T>;
   }>;
   cursors: Readonly<{
     get(connectionId: string): Promise<SyncCursorSnapshot>;
@@ -129,6 +140,7 @@ export type AmoSyncDependencies = Readonly<{
       configId: string;
       traceId: string;
       startedAt: Date;
+      createdBy?: string | null;
     }): Promise<StartedSyncRun>;
     finish(runId: string, outcome: SyncOutcome, finishedAt: Date): Promise<void>;
   }>;
@@ -193,6 +205,7 @@ type RunContext = {
   tokenProvider: AmoTokenProvider;
   pageHashes: string[];
   distinctLeadIds: Set<number>;
+  fence: SyncLockFence;
   nextCursors: SyncCursorSnapshot;
   nextPageNumber: Record<SyncStream, number>;
 };
@@ -282,6 +295,7 @@ async function requestWithRetry<T>(
 
   while (true) {
     try {
+      await context.fence.assertOwned();
       return await dependencies.transport.requestPage({
         url,
         runId: context.run.id,
@@ -289,6 +303,7 @@ async function requestWithRetry<T>(
         attempt,
         tokenProvider: context.tokenProvider,
         schema,
+        fence: context.fence,
         audit: async (input) => dependencies.audit?.append(input),
       });
     } catch (error) {
@@ -297,6 +312,7 @@ async function requestWithRetry<T>(
       if (!refreshed && (status === 401 || code === "E_AMO_AUTH")) {
         refreshed = true;
         context.counts.retries += 1;
+        await context.fence.assertOwned();
         await dependencies.tokens.refresh(
           context.connection.id,
           context.clock.now(),
@@ -334,6 +350,7 @@ async function appendValidatedPage(
   const payloadSha256 = sha256(payload);
   context.pageHashes.push(payloadSha256);
   const pageNumber = context.nextPageNumber[stream]++;
+  await context.fence.assertOwned();
   await dependencies.raw.appendPage({
     syncRunId: context.run.id,
     stream,
@@ -355,6 +372,7 @@ async function quarantineInvalidPage(
 ): Promise<never> {
   const payloadSha256 = sha256(payload);
   const pageNumber = context.nextPageNumber[stream]++;
+  await context.fence.assertOwned();
   await dependencies.raw.quarantinePage({
     syncRunId: context.run.id,
     stream,
@@ -626,9 +644,12 @@ async function executeLockedSync(
   kind: SyncKind,
   clock: Clock,
   connection: ActiveSyncConnection,
+  fence: SyncLockFence,
+  options: RunSyncOptions,
 ): Promise<SyncRunResult> {
-  const traceId = dependencies.traceId?.() ?? randomUUID();
+  const traceId = options.traceId ?? dependencies.traceId?.() ?? randomUUID();
   let run: StartedSyncRun | undefined;
+  let context: RunContext | undefined;
   const counts: MutableCounts = {
     pagesRead: 0,
     leadsRead: 0,
@@ -647,14 +668,16 @@ async function executeLockedSync(
       configId: config.id,
       traceId,
       startedAt: clock.now(),
+      createdBy: options.requestedBy ?? null,
     });
-    const context: RunContext = {
+    context = {
       connection, config, run, clock, counts,
       tokenProvider: dependencies.tokens.createProvider(connection.id, {
         runId: run.id, traceId: run.traceId, clock,
       }),
       pageHashes: [],
       distinctLeadIds: new Set<number>(),
+      fence,
       nextCursors: await dependencies.cursors.get(connection.id),
       nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
     };
@@ -681,6 +704,7 @@ async function executeLockedSync(
     }
 
     counts.leadsRead = context.distinctLeadIds.size;
+    await fence.assertOwned();
     await dependencies.runs.finish(
       run.id,
       {
@@ -696,31 +720,47 @@ async function executeLockedSync(
     // Nothing durable exists until the run has started. After that point every
     // setup, token, cursor, and ingest failure must seal the run.
     if (!run) throw error;
+    if (errorCode(error) === "E_SYNC_FENCE_LOST") throw error;
+    await fence.assertOwned();
     const forced = (error as SyncFailure).forceStatus;
     const status = forced ?? (counts.pagesRead > 0 ? "partial" : "failed");
     const code = errorCode(error);
-    if (code === "E_DATA_QUALITY_BLOCK") {
-      await dependencies.alerts?.critical({
-        runId: run.id,
-        code,
-        summary: "Full lead count dropped by more than five percent",
-      });
+    if (context) {
+      counts.leadsRead = context.distinctLeadIds.size;
     }
+    let safeError =
+      code === "E_DATA_QUALITY_BLOCK"
+        ? "Full lead count dropped by more than five percent"
+        : code === "E_AMO_AUTH"
+          ? "amoCRM authorization failed"
+          : code === "E_SYNC_PARTIAL"
+            ? "amoCRM returned an invalid page"
+            : "amoCRM synchronization failed";
+    if (code === "E_DATA_QUALITY_BLOCK") {
+      try {
+        await fence.assertOwned();
+        await dependencies.alerts?.critical({
+          runId: run.id,
+          code,
+          summary: "Full lead count dropped by more than five percent",
+        });
+      } catch (alertError) {
+        if (errorCode(alertError) === "E_SYNC_FENCE_LOST") throw alertError;
+        safeError = `${safeError}; critical alert delivery failed`;
+      }
+    }
+    await fence.assertOwned();
     await dependencies.runs.finish(
       run.id,
       {
         status,
-        safeError:
-          code === "E_DATA_QUALITY_BLOCK"
-            ? "Full lead count dropped by more than five percent"
-            : code === "E_AMO_AUTH"
-              ? "amoCRM authorization failed"
-              : code === "E_SYNC_PARTIAL"
-                ? "amoCRM returned an invalid page"
-                : "amoCRM synchronization failed",
+        safeError,
         errorCode: code,
         counts: countsSnapshot(counts),
-        checksum: null,
+        checksum:
+          context && context.pageHashes.length > 0
+            ? sha256(context.pageHashes)
+            : null,
       },
       clock.now(),
     );
@@ -732,6 +772,7 @@ export function createAmoSyncRunner(dependencies: AmoSyncDependencies) {
   return async function runSyncWithDependencies(
     kind: SyncKind,
     clock: Clock = systemClock,
+    options: RunSyncOptions = {},
   ): Promise<SyncRunResult> {
     if (!dependencies.envEnabled) return { kind: "disabled" };
     if (!(await dependencies.controls.isSyncEnabled())) {
@@ -744,8 +785,8 @@ export function createAmoSyncRunner(dependencies: AmoSyncDependencies) {
     }
 
     try {
-      return await dependencies.locks.withSyncLock(connection.id, () =>
-        executeLockedSync(dependencies, kind, clock, connection),
+      return await dependencies.locks.withSyncLock(connection.id, (fence) =>
+        executeLockedSync(dependencies, kind, clock, connection, fence, options),
       );
     } catch (error) {
       if (errorCode(error) === "E_SYNC_LOCKED") {
@@ -754,6 +795,70 @@ export function createAmoSyncRunner(dependencies: AmoSyncDependencies) {
       throw error;
     }
   };
+}
+
+export type SyncWorkQueueProcessor = Readonly<{
+  now(): Date;
+  claim(input: Readonly<{ now: Date; leaseMs: number }>): Promise<ClaimedSyncWork | null>;
+  complete(input: {
+    id: string;
+    leaseToken: string;
+    status: "done" | "failed";
+    completedAt: Date;
+    syncRunId?: string | null;
+    errorCode?: AppErrorCode | string | null;
+    errorSummary?: string | null;
+  }): Promise<void>;
+  run(kind: SyncKind, clock: Clock, options: RunSyncOptions): Promise<SyncRunResult>;
+}>;
+
+const QUEUE_LEASE_MS = 20 * 60_000;
+
+export async function processSyncWorkQueue(
+  processor: SyncWorkQueueProcessor,
+): Promise<number> {
+  const now = processor.now();
+  const work = await processor.claim({ now, leaseMs: QUEUE_LEASE_MS });
+  if (!work) return 0;
+
+  try {
+    const result = await processor.run(work.kind, systemClock, {
+      traceId: work.traceId,
+      requestedBy: work.requestedBy,
+    });
+    if ("runId" in result) {
+      await processor.complete({
+        id: work.id,
+        leaseToken: work.leaseToken,
+        status: "done",
+        completedAt: processor.now(),
+        syncRunId: result.runId,
+      });
+    } else {
+      await processor.complete({
+        id: work.id,
+        leaseToken: work.leaseToken,
+        status: "failed",
+        completedAt: processor.now(),
+        errorCode: "kind" in result ? "E_CONFIG_INCOMPLETE" : result.code,
+        errorSummary:
+          "kind" in result
+            ? "Synchronization is disabled"
+            : "Synchronization lock was already held",
+      });
+    }
+    return 1;
+  } catch (error) {
+    await processor.complete({
+      id: work.id,
+      leaseToken: work.leaseToken,
+      status: "failed",
+      completedAt: processor.now(),
+      errorCode: errorCode(error),
+      errorSummary: "Queued synchronization failed before creating a run",
+    });
+    return 1;
+  }
 }
 
 function productionAuditSink(
@@ -886,7 +991,12 @@ export function createProductionAmoSyncDependencies(
           schema: z.unknown(),
           traceId: request.traceId,
           tokenProvider: request.tokenProvider,
-          auditSink: productionAuditSink(db, request.runId, request.attempt),
+          auditSink: {
+            async record(entry) {
+              await request.fence.assertOwned();
+              await productionAuditSink(db, request.runId, request.attempt).record(entry);
+            },
+          },
           redirect: "error",
         }),
     },
@@ -931,16 +1041,21 @@ export function configureAmoSync(dependencies: AmoSyncDependencies): void {
 export async function runSync(
   kind: SyncKind,
   clock: Clock = systemClock,
+  options: RunSyncOptions = {},
 ): Promise<SyncRunResult> {
   if (defaultDependencies) {
-    return createAmoSyncRunner(defaultDependencies)(kind, clock);
+    return createAmoSyncRunner(defaultDependencies)(kind, clock, options);
   }
   const env = parseServerEnv(process.env);
-  const db = createServiceWorkerDbClient(env.DATABASE_URL);
+  const workerDatabaseUrl = process.env.WORKER_DATABASE_URL;
+  if (!workerDatabaseUrl) {
+    throw new AppError("E_CONFIG_INCOMPLETE", 500, "WORKER_DATABASE_URL is required");
+  }
+  const db = createServiceWorkerDbClient(workerDatabaseUrl);
   try {
     return await createAmoSyncRunner(
       createProductionAmoSyncDependencies(db, env),
-    )(kind, clock);
+    )(kind, clock, options);
   } finally {
     await closeDbClient(db);
   }

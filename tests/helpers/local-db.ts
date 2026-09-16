@@ -3,6 +3,12 @@ import postgres, { type Sql, type TransactionSql } from "postgres";
 export const localDatabaseUrl =
   process.env.TEST_DATABASE_URL ??
   "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
+export const localServiceWorkerDatabaseUrl =
+  process.env.TEST_SERVICE_WORKER_DATABASE_URL ??
+  "postgresql://service_worker:service-worker-test@127.0.0.1:54322/postgres";
+export const localRetentionWorkerDatabaseUrl =
+  process.env.TEST_RETENTION_WORKER_DATABASE_URL ??
+  "postgresql://retention_worker:retention-worker-test@127.0.0.1:54322/postgres";
 
 export type TestAppUser = Readonly<{
   id: string;
@@ -64,6 +70,11 @@ export const testUsers = {
 
 export function createAdminDb(): Sql {
   return postgres(localDatabaseUrl, { max: 1 });
+}
+
+export async function ensureRestrictedTestLogins(db: Sql): Promise<void> {
+  await db.unsafe("alter role service_worker login password 'service-worker-test'");
+  await db.unsafe("alter role retention_worker login password 'retention-worker-test'");
 }
 
 export async function resetAndSeedUsers(

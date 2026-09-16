@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   closeDbClient,
@@ -14,13 +14,14 @@ import {
 import { finishSyncRun, startSyncRun } from "./sync-runs";
 import {
   createAdminDb,
-  localDatabaseUrl,
+  ensureRestrictedTestLogins,
+  localServiceWorkerDatabaseUrl,
   resetAndSeedUsers,
   testUsers,
 } from "../../../tests/helpers/local-db";
 
 const adminDb = createAdminDb();
-const workerDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
+let workerDb: Database;
 const receivedAt = new Date("2026-09-15T09:00:00.000Z");
 const finishedAt = new Date("2026-09-15T09:01:00.000Z");
 const hashA = "a".repeat(64);
@@ -108,6 +109,11 @@ async function clearFixture(): Promise<void> {
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
 }
+
+beforeAll(async () => {
+  await ensureRestrictedTestLogins(adminDb);
+  workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
+});
 
 beforeEach(async () => {
   await clearFixture();
@@ -549,7 +555,7 @@ describe("append-only raw amoCRM journal", () => {
   it.each(["append", "finish"] as const)("serializes concurrent append/finalize when %s acquires the run lock first", async (firstOperation) => {
     const fixture = await seedFixture();
     const run = await startFixtureRun(workerDb, fixture, "trace-concurrent-seal");
-    const concurrentDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
+    const concurrentDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
     const [connection] = await concurrentDb<{ pid: number }[]>`select pg_backend_pid() as pid`;
     if (!connection) throw new Error("synthetic concurrent connection is missing");
     const { pid } = connection;

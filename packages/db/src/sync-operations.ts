@@ -1,4 +1,6 @@
-import { AppError } from "@real2/domain";
+import { randomUUID } from "node:crypto";
+
+import { AppError, type AppErrorCode } from "@real2/domain";
 
 import type { Database } from "./client.js";
 import type {
@@ -24,6 +26,7 @@ export type SafeSyncRunSummary = Readonly<{
   }>;
   errorCode: string | null;
   errorSummary: string | null;
+  createdBy: string | null;
 }>;
 
 export type SafeSyncRunDetail = SafeSyncRunSummary & Readonly<{
@@ -58,6 +61,7 @@ type SafeSyncRunRow = {
   retries: number;
   error_code: string | null;
   error_summary: string | null;
+  created_by: string | null;
 };
 
 function mapSafeRun(row: SafeSyncRunRow): SafeSyncRunSummary {
@@ -77,6 +81,7 @@ function mapSafeRun(row: SafeSyncRunRow): SafeSyncRunSummary {
     },
     errorCode: row.error_code,
     errorSummary: row.error_summary,
+    createdBy: row.created_by,
   };
 }
 
@@ -104,6 +109,28 @@ export type RawRetentionResult = Readonly<{
 
 export type QueuedSyncWork = Readonly<{ id: string; traceId: string; kind: SyncKind }>;
 
+export type ClaimedSyncWork = QueuedSyncWork &
+  Readonly<{
+    requestedBy: string | null;
+    leaseToken: string;
+    attempt: number;
+  }>;
+
+export type CompleteSyncWorkInput = Readonly<{
+  id: string;
+  leaseToken: string;
+  status: "done" | "failed";
+  completedAt: Date;
+  syncRunId?: string | null;
+  errorCode?: AppErrorCode | string | null;
+  errorSummary?: string | null;
+}>;
+
+export type SyncLockFence = Readonly<{
+  backendPid: number;
+  assertOwned(): Promise<void>;
+}>;
+
 export async function enqueueSyncWork(
   db: Database,
   input: Readonly<{ traceId: string; kind: SyncKind; requestedBy: string | null }>,
@@ -117,6 +144,90 @@ export async function enqueueSyncWork(
   return { id: row.id, traceId: row.trace_id, kind: row.kind };
 }
 
+export async function claimNextSyncWork(
+  db: Database,
+  input: Readonly<{ now: Date; leaseMs: number; maxAttempts?: number }>,
+): Promise<ClaimedSyncWork | null> {
+  if (!Number.isSafeInteger(input.leaseMs) || input.leaseMs <= 0) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  const maxAttempts = input.maxAttempts ?? 3;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  const leaseToken = randomUUID();
+  const leaseExpiresAt = new Date(input.now.getTime() + input.leaseMs);
+  return db.begin(async (transaction) => {
+    const [selected] = await transaction<{ id: string }[]>`
+      select id
+      from public.sync_work_queue
+      where status in ('queued', 'running')
+        and attempt_count < ${maxAttempts}
+        and (
+          status = 'queued'
+          or (status = 'running' and lease_expires_at <= ${input.now})
+        )
+      order by requested_at, id
+      for update skip locked
+      limit 1
+    `;
+    if (!selected) return null;
+    const [claimed] = await transaction<{
+      id: string;
+      trace_id: string;
+      kind: SyncKind;
+      requested_by: string | null;
+      lease_token: string;
+      attempt_count: number;
+    }[]>`
+      update public.sync_work_queue
+      set
+        status = 'running',
+        claimed_at = ${input.now},
+        completed_at = null,
+        lease_token = ${leaseToken},
+        lease_expires_at = ${leaseExpiresAt},
+        attempt_count = attempt_count + 1,
+        last_error_code = null,
+        last_error_summary = null
+      where id = ${selected.id}
+      returning id, trace_id, kind, requested_by, lease_token, attempt_count
+    `;
+    if (!claimed) throw new AppError("E_DB", 500);
+    return {
+      id: claimed.id,
+      traceId: claimed.trace_id,
+      kind: claimed.kind,
+      requestedBy: claimed.requested_by,
+      leaseToken: claimed.lease_token,
+      attempt: claimed.attempt_count,
+    };
+  });
+}
+
+export async function completeSyncWork(
+  db: Database,
+  input: CompleteSyncWorkInput,
+): Promise<void> {
+  if (input.errorSummary && input.errorSummary.length > 500) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  const [row] = await db<{ id: string }[]>`
+    update public.sync_work_queue
+    set
+      status = ${input.status},
+      completed_at = ${input.completedAt},
+      sync_run_id = ${input.syncRunId ?? null},
+      last_error_code = ${input.errorCode ?? null},
+      last_error_summary = ${input.errorSummary ?? null}
+    where id = ${input.id}
+      and lease_token = ${input.leaseToken}
+      and status = 'running'
+    returning id
+  `;
+  if (!row) throw new AppError("E_CONFLICT", 409);
+}
+
 function isSha256(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value);
 }
@@ -124,8 +235,74 @@ function isSha256(value: string): boolean {
 export async function withSyncAdvisoryLock<T>(
   db: Database,
   connectionId: string,
-  action: () => Promise<T>,
+  action: (fence: SyncLockFence) => Promise<T>,
 ): Promise<T> {
+  const reserved = await db.reserve();
+  let locked = false;
+  let backendPid: number | null = null;
+  let lockSessionLost = false;
+  try {
+    const [backend] = await reserved<{ pid: number }[]>`
+      select pg_backend_pid() as pid
+    `;
+    if (!backend) throw new AppError("E_DB", 500);
+    backendPid = backend.pid;
+    const [row] = await reserved<{ locked: boolean }[]>`
+      select pg_try_advisory_lock(
+        hashtextextended(${`${connectionId}:sync`}, 0)
+      ) as locked
+    `;
+    locked = row?.locked === true;
+    if (!locked) throw new AppError("E_SYNC_LOCKED", 409);
+    const fence: SyncLockFence = {
+      backendPid,
+      async assertOwned() {
+        let timeout: NodeJS.Timeout | undefined;
+        try {
+          const heartbeat = reserved<{ pid: number }[]>`
+            select pg_backend_pid() as pid
+          `;
+          const [current] = await Promise.race([
+            heartbeat,
+            new Promise<never>((_resolve, reject) => {
+              timeout = setTimeout(() => {
+                reject(new AppError("E_SYNC_FENCE_LOST", 409));
+              }, 1_000);
+            }),
+          ]);
+          if (!current || current.pid !== backendPid) {
+            throw new AppError("E_SYNC_FENCE_LOST", 409);
+          }
+        } catch (error) {
+          lockSessionLost = true;
+          if (error instanceof AppError) throw error;
+          throw new AppError("E_SYNC_FENCE_LOST", 409);
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+      },
+    };
+    return await action(fence);
+  } finally {
+    if (locked && !lockSessionLost) {
+      try {
+        await reserved`
+          select pg_advisory_unlock(
+            hashtextextended(${`${connectionId}:sync`}, 0)
+          )
+        `;
+      } catch {
+        // A terminated session has already released its advisory locks.
+      }
+    }
+    reserved.release();
+  }
+}
+
+export async function isSyncAdvisoryLockBusy(
+  db: Database,
+  connectionId: string,
+): Promise<boolean> {
   const reserved = await db.reserve();
   let locked = false;
   try {
@@ -135,8 +312,7 @@ export async function withSyncAdvisoryLock<T>(
       ) as locked
     `;
     locked = row?.locked === true;
-    if (!locked) throw new AppError("E_SYNC_LOCKED", 409);
-    return await action();
+    return !locked;
   } finally {
     if (locked) {
       await reserved`
@@ -277,7 +453,7 @@ export async function deleteProvenRawBefore(
 const safeRunColumns = `
   id, trace_id, kind, status, started_at, finished_at,
   pages_read, leads_read, events_read, users_read, retries,
-  error_code, error_summary
+  error_code, error_summary, created_by
 `;
 
 export async function listSyncRuns(

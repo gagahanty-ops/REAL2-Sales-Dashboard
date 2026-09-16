@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { finishSyncRun, startSyncRun } from "@real2/db";
+import { closeDbClient, createDbClient, finishSyncRun, startSyncRun, withSyncAdvisoryLock } from "@real2/db";
 import {
   createAdminDb,
+  localDatabaseUrl,
   resetAndSeedUsers,
   testUsers,
 } from "../../../../../../tests/helpers/local-db";
@@ -108,6 +109,7 @@ describe("safe synchronization routes", () => {
     expect((await list.json()).data.items[0]).toMatchObject({
       id: run.id,
       status: "success",
+      createdBy: testUsers.admin.id,
       counts: { pages: 2, leads: 3, events: 4, users: 1, retries: 1 },
     });
     const detailBody = await detail.json();
@@ -141,6 +143,43 @@ describe("safe synchronization routes", () => {
     expect(accepted.status).toBe(202);
     expect((await accepted.json()).data.status).toBe("queued");
     expect((await adminDb`select count(*)::integer as count from public.sync_work_queue`)[0]?.count).toBe(1);
+  });
+
+  it("returns E_SYNC_LOCKED before accepting manual work when a run owns the advisory lock", async () => {
+    const run = await seedRun(new Date("2026-09-15T08:00:00.000Z"));
+    const [row] = await adminDb<{ connection_id: string }[]>`
+      select connection_id from public.sync_runs where id = ${run.id}
+    `;
+    if (!row) throw new Error("missing seeded connection");
+    const lockDb = createDbClient(localDatabaseUrl, { max: 1 });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const locked = withSyncAdvisoryLock(lockDb, row.connection_id, async () => {
+      entered();
+      await held;
+    });
+    await acquired;
+    try {
+      const response = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
+        method: "POST",
+        headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
+        body: JSON.stringify({ confirmRecent: true }),
+      }));
+
+      expect(response.status).toBe(409);
+      expect((await response.json()).error.code).toBe("E_SYNC_LOCKED");
+      expect((await adminDb`select count(*)::integer as count from public.sync_work_queue`)[0]?.count).toBe(0);
+    } finally {
+      release();
+      await locked;
+      await closeDbClient(lockDb);
+    }
   });
 
 });

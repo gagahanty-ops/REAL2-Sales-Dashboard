@@ -4,7 +4,8 @@ import { closeDbClient, createServiceWorkerDbClient } from "@real2/db";
 
 import {
   createAdminDb,
-  localDatabaseUrl,
+  ensureRestrictedTestLogins,
+  localServiceWorkerDatabaseUrl,
   resetAndSeedUsers,
   testUsers,
   updateOwnNameAsManager,
@@ -24,6 +25,7 @@ async function clearDatabaseFixtures(): Promise<void> {
 }
 
 beforeEach(async () => {
+  await ensureRestrictedTestLogins(adminDb);
   await clearDatabaseFixtures();
   await resetAndSeedUsers(adminDb, allUsers);
   await adminDb`
@@ -264,7 +266,7 @@ describe("pipeline configuration RLS", () => {
 
 describe("worker database scope", () => {
   it("connects as service_worker and cannot read application-user rows", async () => {
-    const workerDb = createServiceWorkerDbClient(localDatabaseUrl);
+    const workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl);
 
     try {
       await expect(workerDb<{ current_user: string }[]>`

@@ -3,6 +3,8 @@ name: real2-sales-dashboard
 x-runtime-environment: &runtime-environment
   APP_URL: "${APP_URL:-http://localhost:3000}"
   DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:54322/postgres"
+  WORKER_DATABASE_URL: "postgresql://service_worker:service-worker-test@host.docker.internal:54322/postgres"
+  RETENTION_DATABASE_URL: "postgresql://retention_worker:retention-worker-test@host.docker.internal:54322/postgres"
   SUPABASE_URL: "http://host.docker.internal:54321"
   SUPABASE_ANON_KEY: "${REAL2_SUPABASE_ANON_KEY:-local-anon-key}"
   SUPABASE_SERVICE_ROLE_KEY: "${REAL2_SUPABASE_SERVICE_ROLE_KEY:-local-service-role-key}"

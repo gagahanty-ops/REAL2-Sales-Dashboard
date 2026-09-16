@@ -1,4 +1,10 @@
-import { enqueueSyncWork, getLatestSyncRun, listSyncRuns } from "@real2/db";
+import {
+  enqueueSyncWork,
+  getCurrentSafeAmoConnectionStatus,
+  getLatestSyncRun,
+  isSyncAdvisoryLockBusy,
+  listSyncRuns,
+} from "@real2/db";
 import { AppError, success } from "@real2/domain";
 import { z } from "zod";
 
@@ -23,7 +29,8 @@ export const POST = withRoute(async (request, context) => {
   requireSameOrigin(request);
   const user = requireRole(await requireUser(), ["admin"]);
   const input = manualSyncSchema.parse(await readJson(request));
-  const latest = await getLatestSyncRun(getDatabase());
+  const db = getDatabase();
+  const latest = await getLatestSyncRun(db);
   if (
     latest &&
     Date.now() - latest.startedAt.getTime() < 60_000 &&
@@ -36,7 +43,15 @@ export const POST = withRoute(async (request, context) => {
     );
   }
 
-  const queued = await enqueueSyncWork(getDatabase(), {
+  const connection = await getCurrentSafeAmoConnectionStatus(db);
+  if (
+    connection?.status === "active" &&
+    (await isSyncAdvisoryLockBusy(db, connection.id))
+  ) {
+    throw new AppError("E_SYNC_LOCKED", 409);
+  }
+
+  const queued = await enqueueSyncWork(db, {
     traceId: context.traceId,
     kind: "manual",
     requestedBy: user.id,

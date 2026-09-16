@@ -340,6 +340,19 @@ p {
   margin-bottom: 24px;
 }
 
+.sync-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  margin-top: 14px;
+  font-size: 0.9rem;
+}
+
+.sync-pagination a {
+  color: #dbe9ff;
+}
+
 .settings-grid {
   display: grid;
   gap: 24px;
