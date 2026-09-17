@@ -47,6 +47,33 @@
 - The current sync worker does not request `with=source`, so `integration_source_exact` rules have no input until an approved worker change adds it.
 - Open owner question: METRICS_CATALOG §7 / SPEC M3.5 wording could state explicitly that a filled but unmapped source field yields `unknown` (ruling R1, confirmed by review) and that conflicts are evaluated within one source kind.
 
+## Блокер доступа к GitHub (2026-09-17)
+
+Push с машины `ishop` отклонён: `Permission to sarrinoj-glitch/REAL2-Sales-Dashboard.git denied to gagahanty-ops` (HTTP 403). И HTTPS-токен, и SSH-ключ на этой машине принадлежат аккаунту `gagahanty-ops`, у которого права `pull: true, push: false`.
+
+Коммиты Task 2 существуют только локально:
+
+```text
+23e4853 feat: normalize REAL2 lead snapshots deterministically
+0072eff fix: harden deterministic lead normalization
+4c46499 fix: mask phones with any common separator in lead names
+4a7faa8 docs: checkpoint deterministic normalization task
+плюс docs-коммит «record the blocked push and the recovery bundle» (последний на ветке)
+```
+
+Что нужно от владельца (любой вариант):
+
+1. дать аккаунту `gagahanty-ops` право записи (Collaborator: Write);
+2. либо забрать изменения бандлом `~/Desktop/REAL2-task2.bundle` с аккаунта владельца:
+
+```bash
+git fetch ~/Desktop/REAL2-task2.bundle feat/foundation-access:task2
+git merge --ff-only task2      # в клоне на feat/foundation-access
+git push origin feat/foundation-access
+```
+
+После push обязательно сверить local, tracking и `git ls-remote`.
+
 ## Dependency scan
 
 | Producer | Consumer | Contract to preserve |

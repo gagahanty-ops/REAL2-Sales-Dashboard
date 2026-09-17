@@ -36,6 +36,11 @@ date: 2026-09-17
 - Если он зелёный — Plan 3 Task 3.
 - Handoff notes для Task 3/4 — в `raw-context/sdd/2026-09-12-03-normalization-metrics/progress.md`.
 
+## Блокеры
+
+1. Нет Docker/Supabase — DB-часть gate не выполнена.
+2. Нет прав push: аккаунт `gagahanty-ops` имеет только чтение. Коммиты лежат локально и в бандле `~/Desktop/REAL2-task2.bundle`.
+
 ## Безопасность
 
 - Внешних вызовов amoCRM и Google не было.
