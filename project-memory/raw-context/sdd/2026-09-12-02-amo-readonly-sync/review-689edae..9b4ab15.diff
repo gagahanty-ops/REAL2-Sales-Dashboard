@@ -1,0 +1,2092 @@
+# Review package: 689edae39b7c1910f6d0a78959dd8ea34114fb92..9b4ab150c89069dd90a7843d80218b3ede98bb3a
+
+## Commits
+9b4ab15 feat: persist append-only amoCRM sync journal
+
+## Files changed
+ .../task-5-report.md                               |  83 ++++
+ .../web/src/app/api/config/channel-values/route.ts |  10 +-
+ .../src/app/api/config/config.integration.test.ts  |  76 +++-
+ packages/db/src/index.ts                           |  25 ++
+ packages/db/src/raw-amo.integration.test.ts        | 461 +++++++++++++++++++++
+ packages/db/src/raw-amo.ts                         | 360 ++++++++++++++++
+ packages/db/src/sync-runs.ts                       | 223 ++++++++++
+ packages/integrations/src/amo/schemas.test.ts      | 104 +++++
+ packages/integrations/src/amo/schemas.ts           |  99 +++++
+ packages/integrations/src/index.ts                 |  24 ++
+ supabase/migrations/0005_raw_sync.sql              | 233 +++++++++++
+ tests/security/rls.security.test.ts                | 151 ++++++-
+ 12 files changed, 1843 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md
+new file mode 100644
+index 0000000..40de5a6
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md
+@@ -0,0 +1,83 @@
++# Task 5 report — append-only amoCRM raw synchronization journal
++
++## Summary
++
++- Added ordered migration `0005_raw_sync.sql` (migrations `0001`–`0004` were already occupied) for sync runs, durable cursors, minimal page metadata, raw amoCRM objects/events, malformed-page quarantine, and safe API audit rows.
++- Added service-worker repositories for starting and atomically finishing runs, advancing cursors only on `success`, idempotently appending pages/objects/events, quarantining malformed pages, persisting the safe audit shape, and aggregating exact source-field values from the latest successful raw lead snapshots.
++- Added Zod contracts for account, pipeline/status, user, lead, and event responses. Entity schemas retain unknown upstream fields for the raw journal while requiring stable identity and ordering fields.
++- Completed the deferred `GET /api/config/channel-values` contract with truthful raw-derived counts; partial/failed runs are excluded and later successful lead snapshots supersede older values.
++- Preserved the read-only boundary: no production HTTP/OAuth/Google code changed, both external switches remain disabled, and all evidence used synthetic local fixtures.
++
++## Files
++
++- `.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md`
++- `supabase/migrations/0005_raw_sync.sql`
++- `packages/db/src/sync-runs.ts`
++- `packages/db/src/raw-amo.ts`
++- `packages/db/src/raw-amo.integration.test.ts`
++- `packages/db/src/index.ts`
++- `packages/integrations/src/amo/schemas.ts`
++- `packages/integrations/src/amo/schemas.test.ts`
++- `packages/integrations/src/index.ts`
++- `apps/web/src/app/api/config/channel-values/route.ts`
++- `apps/web/src/app/api/config/config.integration.test.ts`
++- `tests/security/rls.security.test.ts`
++
++## Data and transaction guarantees
++
++- `sync_runs` pins a unique trace ID, one connection, one immutable configuration version, kind, terminal outcome, safe counters/error fields, checksum, and timestamps.
++- `sync_pages` stores only run, stream, positive page number, non-negative item count, SHA-256, and receive time. It stores no URL, query value, request body, or duplicate raw payload.
++- Raw objects are unique per `(sync_run_id, entity_type, external_id)`; events are unique per `(account_id, amo_event_id)` across repeated runs; quarantine rows are unique per run/stream/page/hash.
++- Replaying identical pages/entities is a no-op. Reusing a page or event identity with a different hash raises `E_CONFLICT`, and the page transaction rolls back rather than mixing versions.
++- `finishSyncRun` row-locks the running run and writes its terminal outcome and successful cursor updates in one transaction. Partial and failed outcomes retain diagnostics but never advance cursors.
++- `getRawChannelValues` considers only successful runs, selects the latest successful raw snapshot per lead, counts each exact value once per lead, ignores malformed/non-scalar/empty values, and returns deterministic count/value ordering.
++
++## Access and retention boundary
++
++- RLS is enabled on every new table; anonymous access remains absent.
++- Admin/head can read safe run/page/audit evidence. Only admin can read raw objects, events, and quarantine through authenticated RLS. Managers see no rows. Authenticated users cannot read durable cursors or write journal tables.
++- `service_worker` can insert/read journal data, update only terminal run fields/counters and cursor values, and cannot rewrite a run's pinned trace/connection/config identity.
++- Neither `service_worker` nor a user-facing role has raw `UPDATE` or `DELETE`. This is the retention boundary: Task 6's separately reviewed 90-day retention operation must preserve hashes and normalized history before receiving any deletion path; ordinary sync credentials cannot delete raw evidence.
++
++## TDD evidence
++
++### RED
++
++1. New response-schema tests failed because `packages/integrations/src/amo/schemas.ts` did not exist.
++2. New raw-journal integration tests failed because `raw-amo.ts` and `sync-runs.ts` did not exist.
++3. The pinned-run-identity test failed because the interrupted migration granted whole-table `UPDATE` to `service_worker` (`promise resolved "[]" instead of rejecting`).
++4. The channel-values route test failed with `{ configVersion: 1, values: [] }` despite three successful raw lead fixtures.
++5. The first full unit run exposed missing teardown in the new RLS suite: retained synthetic config rows caused 15 OAuth cleanup FK failures. Symmetric teardown fixed the isolation defect.
++
++### GREEN
++
++- Repository/worker Node tests: 12/12 passed.
++- Unit: 80/80 passed across 14 files, including 4 new synchronization response-schema tests.
++- Integration: 52/52 passed across 6 files, including 7 new raw-journal repository tests and the raw-backed channel-values route test.
++- Security: 17/17 passed across RLS and safe-log suites, including admin/head/manager raw journal visibility and direct-write denial.
++- Contracts: command exited 0 with `--passWithNoTests`; no contract files exist yet.
++- Local Supabase reset applied migrations `0001` through `0005` successfully on the configured PostgreSQL 17 stack.
++- Lint, TypeScript checks, production build, tracked-secret scan, and `git diff --check` all exited 0.
++
++## Final verification commands
++
++All package commands ran with Node `v22.23.2` and pnpm `10.34.5`:
++
++```text
++supabase db reset
++pnpm lint
++pnpm typecheck
++pnpm test
++pnpm test:contracts
++pnpm test:integration
++pnpm test:security
++pnpm build
++pnpm check:secrets
++git diff --check
++```
++
++## Self-review and follow-up boundary
++
++- No live amoCRM host was called, no token or credential was read, no OAuth setting changed, no Google API was used, and the protected original spreadsheet was untouched.
++- The migration deliberately does not grant raw deletion to the normal worker. The retention job, watchdog, pagination/retry orchestration, schedules, sync APIs, and sync screens remain Task 6 ownership.
++- Response schemas are raw-ingestion contracts, not normalized business models. They preserve additional upstream keys so later normalization can be replayed without changing the journal.
+diff --git a/apps/web/src/app/api/config/channel-values/route.ts b/apps/web/src/app/api/config/channel-values/route.ts
+index f248e24..dcb17cb 100644
+--- a/apps/web/src/app/api/config/channel-values/route.ts
++++ b/apps/web/src/app/api/config/channel-values/route.ts
+@@ -1,23 +1,31 @@
+ import {
+   getActivePipelineConfig,
+   getCurrentSafeAmoConnectionStatus,
++  getRawChannelValues,
+ } from "@real2/db";
+ 
+ import { requireRole } from "../../../../lib/auth/authorization";
+ import { requireUser } from "../../../../lib/auth/require-user";
+ import { withRoute } from "../../../../lib/http/route";
+ import { getDatabase } from "../../../../lib/server/runtime";
+ 
+ export const GET = withRoute(async () => {
+   requireRole(await requireUser(), ["admin", "head"]);
+   const db = getDatabase();
+   const connection = await getCurrentSafeAmoConnectionStatus(db);
+   const config = connection
+     ? await getActivePipelineConfig(db, connection.id)
+     : null;
++  const values =
++    connection && config?.sourceFieldId
++      ? await getRawChannelValues(db, {
++          connectionId: connection.id,
++          sourceFieldId: config.sourceFieldId,
++        })
++      : [];
+ 
+   return {
+     configVersion: config?.version ?? null,
+-    values: [],
++    values,
+   };
+ });
+diff --git a/apps/web/src/app/api/config/config.integration.test.ts b/apps/web/src/app/api/config/config.integration.test.ts
+index 37c1075..05ebec7 100644
+--- a/apps/web/src/app/api/config/config.integration.test.ts
++++ b/apps/web/src/app/api/config/config.integration.test.ts
+@@ -139,31 +139,31 @@ async function seedActiveConnection(): Promise<void> {
+     installedBy: testUsers.admin.id,
+     lastCheckedAt: new Date("2026-09-14T00:00:00.000Z"),
+   });
+ }
+ 
+ beforeEach(async () => {
+   runtime.db = adminDb;
+   session.user.id = testUsers.admin.id;
+   session.user.role = "admin";
+   await adminDb.unsafe(
+-    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+   await resetAndSeedUsers(adminDb, [testUsers.admin, testUsers.head, testUsers.managerOne]);
+   await seedActiveConnection();
+ });
+ 
+ afterEach(async () => {
+   await adminDb.unsafe(
+-    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+   vi.unstubAllGlobals();
+ });
+ 
+ afterAll(async () => {
+   vi.unstubAllGlobals();
+   await adminDb.end();
+ });
+@@ -852,11 +852,83 @@ describe("pipeline configuration routes", () => {
+     );
+ 
+     expect(current.status).toBe(200);
+     expect(JSON.stringify(await current.json())).not.toMatch(
+       /ciphertext|token|connection_id|confirmed_by/i,
+     );
+     expect(values.status).toBe(200);
+     expect(discovery.status).toBe(403);
+   });
+ 
++  it("returns truthful counts from latest successful raw lead snapshots", async () => {
++    const amo = new AmoDiscoveryMock();
++    vi.stubGlobal("fetch", amo.fetch);
++    const validationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const validation = (await validationResponse.json()) as {
++      data: { metadataChecksum: string };
++    };
++    await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        candidate,
++        channelRules: INITIAL_CHANNEL_RULES,
++        metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
++      }),
++    );
++    const [binding] = await adminDb<{ connection_id: string; config_id: string }[]>`
++      select amo_connection_id as connection_id, id as config_id
++      from public.pipeline_configs
++      where is_active
++    `;
++    if (!binding) throw new Error("active configuration fixture is missing");
++    const [run] = await adminDb<{ id: string }[]>`
++      insert into public.sync_runs (
++        trace_id, connection_id, config_id, kind, status, finished_at
++      ) values (
++        'trace-channel-values', ${binding.connection_id}, ${binding.config_id},
++        'incremental', 'success', '2026-09-15T09:01:00.000Z'
++      )
++      returning id
++    `;
++    if (!run) throw new Error("successful sync fixture is missing");
++    await adminDb`
++      insert into public.raw_amo_objects (
++        sync_run_id, account_id, entity_type, external_id,
++        source_updated_at, payload, payload_sha256
++      ) values
++        (
++          ${run.id}, 4242, 'lead', 7001, '2026-09-15T08:00:00.000Z',
++          ${adminDb.json({ id: 7001, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] })},
++          ${"a".repeat(64)}
++        ),
++        (
++          ${run.id}, 4242, 'lead', 7002, '2026-09-15T08:00:00.000Z',
++          ${adminDb.json({ id: 7002, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] })},
++          ${"b".repeat(64)}
++        ),
++        (
++          ${run.id}, 4242, 'lead', 7003, '2026-09-15T08:00:00.000Z',
++          ${adminDb.json({ id: 7003, custom_fields_values: [{ field_id: 77, values: [{ value: "WhatsApp" }] }] })},
++          ${"c".repeat(64)}
++        )
++    `;
++
++    const response = await channelValuesRoute(
++      new Request("https://dashboard.example.test/api/config/channel-values"),
++    );
++    const body = (await response.json()) as {
++      data: { configVersion: number; values: Array<{ value: string; count: number }> };
++    };
++
++    expect(response.status).toBe(200);
++    expect(body.data).toEqual({
++      configVersion: 1,
++      values: [
++        { value: "Avito", count: 2 },
++        { value: "WhatsApp", count: 1 },
++      ],
++    });
++  });
++
+ });
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 63ac62e..b85ae8f 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -33,10 +33,35 @@ export {
+   type OAuthState,
+   type SafeAmoConnectionStatus,
+ } from "./amo-connections.js";
+ export {
+   activatePipelineConfig,
+   getActivePipelineConfig,
+   type ActivatePipelineConfigInput,
+   type ActiveChannelRule,
+   type ActivePipelineConfig,
+ } from "./amo-config.js";
++export {
++  finishSyncRun,
++  startSyncRun,
++  type StartSyncRunInput,
++  type SyncCounts,
++  type SyncCursorPosition,
++  type SyncKind,
++  type SyncOutcome,
++  type SyncRun,
++  type SyncStatus,
++  type SyncStream,
++} from "./sync-runs.js";
++export {
++  appendAmoApiAudit,
++  appendRawPage,
++  getRawChannelValues,
++  quarantineRawPage,
++  type AmoApiAuditInput,
++  type AppendRawPageInput,
++  type QuarantineRawPageInput,
++  type RawAmoEventInput,
++  type RawAmoObjectInput,
++  type RawChannelValue,
++  type RawEntityType,
++} from "./raw-amo.js";
+diff --git a/packages/db/src/raw-amo.integration.test.ts b/packages/db/src/raw-amo.integration.test.ts
+new file mode 100644
+index 0000000..54fbaa9
+--- /dev/null
++++ b/packages/db/src/raw-amo.integration.test.ts
+@@ -0,0 +1,461 @@
++import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import {
++  closeDbClient,
++  createServiceWorkerDbClient,
++  type Database,
++} from "./client";
++import {
++  appendAmoApiAudit,
++  appendRawPage,
++  getRawChannelValues,
++  quarantineRawPage,
++} from "./raw-amo";
++import { finishSyncRun, startSyncRun } from "./sync-runs";
++import {
++  createAdminDb,
++  localDatabaseUrl,
++  resetAndSeedUsers,
++  testUsers,
++} from "../../../tests/helpers/local-db";
++
++const adminDb = createAdminDb();
++const workerDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
++const receivedAt = new Date("2026-09-15T09:00:00.000Z");
++const finishedAt = new Date("2026-09-15T09:01:00.000Z");
++const hashA = "a".repeat(64);
++const hashB = "b".repeat(64);
++
++type Fixture = Readonly<{ connectionId: string; configId: string }>;
++
++async function seedFixture(): Promise<Fixture> {
++  await resetAndSeedUsers(adminDb, [testUsers.admin, testUsers.head]);
++  const [connection] = await adminDb<{ id: string }[]>`
++    insert into public.amo_connections (
++      account_id,
++      subdomain,
++      base_url,
++      access_token_ciphertext,
++      refresh_token_ciphertext,
++      token_expires_at,
++      status,
++      installed_by
++    ) values (
++      4242,
++      '555151',
++      'https://555151.amocrm.ru',
++      ${Buffer.alloc(64)},
++      ${Buffer.alloc(64)},
++      '2030-01-01T00:00:00.000Z',
++      'active',
++      ${testUsers.admin.id}
++    )
++    returning id
++  `;
++  if (!connection) throw new Error("synthetic connection fixture is missing");
++
++  const [config] = await adminDb<{ id: string }[]>`
++    insert into public.pipeline_configs (
++      amo_connection_id,
++      pipeline_id,
++      pipeline_name,
++      application_status_id,
++      application_status_name,
++      won_status_id,
++      won_status_name,
++      source_field_id,
++      version,
++      is_active,
++      confirmed_by
++    ) values (
++      ${connection.id},
++      10243278,
++      'РЕАЛ ДВА',
++      11,
++      'Завершение (самовывоз или доставка)',
++      99,
++      'Успешно реализовано',
++      77,
++      1,
++      true,
++      ${testUsers.admin.id}
++    )
++    returning id
++  `;
++  if (!config) throw new Error("synthetic config fixture is missing");
++  return { connectionId: connection.id, configId: config.id };
++}
++
++async function startFixtureRun(
++  db: Database,
++  fixture: Fixture,
++  traceId: string,
++) {
++  return startSyncRun(db, {
++    traceId,
++    connectionId: fixture.connectionId,
++    configId: fixture.configId,
++    kind: "incremental",
++    createdBy: testUsers.admin.id,
++    startedAt: receivedAt,
++  });
++}
++
++async function clearFixture(): Promise<void> {
++  await adminDb.unsafe(
++    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++  );
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
++}
++
++beforeEach(async () => {
++  await clearFixture();
++});
++
++afterEach(async () => {
++  await clearFixture();
++});
++
++afterAll(async () => {
++  await closeDbClient(workerDb);
++  await closeDbClient(adminDb);
++});
++
++describe("append-only raw amoCRM journal", () => {
++  it("stores repeated objects and events once and makes raw rows immutable to the worker", async () => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-idempotent");
++    const lead = {
++      accountId: 4242,
++      entityType: "lead" as const,
++      externalId: 7001,
++      sourceUpdatedAt: new Date("2026-09-15T08:59:00.000Z"),
++      payload: {
++        id: 7001,
++        account_id: 4242,
++        updated_at: 1_757_926_740,
++        custom_fields_values: [
++          { field_id: 77, values: [{ value: "Synthetic source" }] },
++        ],
++      },
++      payloadSha256: hashA,
++    };
++    const event = {
++      accountId: 4242,
++      amoEventId: 9001,
++      amoLeadId: 7001,
++      eventType: "lead_status_changed",
++      eventAt: new Date("2026-09-15T08:59:30.000Z"),
++      payload: {
++        id: 9001,
++        account_id: 4242,
++        entity_id: 7001,
++        type: "lead_status_changed",
++        created_at: 1_757_926_770,
++      },
++      payloadSha256: hashB,
++    };
++
++    await appendRawPage(workerDb, {
++      syncRunId: run.id,
++      stream: "leads",
++      pageNumber: 1,
++      itemCount: 2,
++      payloadSha256: "c".repeat(64),
++      objects: [lead, lead],
++      events: [event, event],
++      receivedAt,
++    });
++    await appendRawPage(workerDb, {
++      syncRunId: run.id,
++      stream: "leads",
++      pageNumber: 1,
++      itemCount: 2,
++      payloadSha256: "c".repeat(64),
++      objects: [lead],
++      events: [event],
++      receivedAt,
++    });
++
++    await expect(
++      adminDb<{ objects: number; events: number; pages: number }[]>`
++        select
++          (select count(*)::integer from public.raw_amo_objects) as objects,
++          (select count(*)::integer from public.raw_amo_events) as events,
++          (select count(*)::integer from public.sync_pages) as pages
++      `,
++    ).resolves.toEqual([{ objects: 1, events: 1, pages: 1 }]);
++
++    await expect(
++      workerDb`
++        update public.raw_amo_events
++        set event_type = 'changed'
++        where amo_event_id = 9001
++      `,
++    ).rejects.toMatchObject({ code: "42501" });
++    await expect(
++      workerDb`
++        delete from public.raw_amo_objects where external_id = 7001
++      `,
++    ).rejects.toMatchObject({ code: "42501" });
++  });
++
++  it("rejects a changed payload that reuses an existing event identity or page number", async () => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-conflict");
++    const event = {
++      accountId: 4242,
++      amoEventId: 9001,
++      amoLeadId: 7001,
++      eventType: "lead_status_changed",
++      eventAt: receivedAt,
++      payload: { id: 9001, synthetic: "first" },
++      payloadSha256: hashA,
++    };
++
++    await appendRawPage(workerDb, {
++      syncRunId: run.id,
++      stream: "events",
++      pageNumber: 1,
++      itemCount: 1,
++      payloadSha256: hashA,
++      objects: [],
++      events: [event],
++      receivedAt,
++    });
++
++    await expect(
++      appendRawPage(workerDb, {
++        syncRunId: run.id,
++        stream: "events",
++        pageNumber: 1,
++        itemCount: 1,
++        payloadSha256: hashB,
++        objects: [],
++        events: [{ ...event, payload: { id: 9001, synthetic: "changed" }, payloadSha256: hashB }],
++        receivedAt,
++      }),
++    ).rejects.toMatchObject({ code: "E_CONFLICT" });
++
++    await expect(
++      adminDb<{ count: number }[]>`select count(*)::integer as count from public.raw_amo_events`,
++    ).resolves.toEqual([{ count: 1 }]);
++  });
++
++  it("advances cursors only in the same successful finish transaction", async () => {
++    const fixture = await seedFixture();
++    const first = await startFixtureRun(workerDb, fixture, "trace-success");
++
++    await finishSyncRun(
++      workerDb,
++      first.id,
++      {
++        status: "success",
++        counts: { pagesRead: 3, leadsRead: 4, eventsRead: 5, usersRead: 6, retries: 1 },
++        nextCursors: {
++          leads: {
++            cursorTime: new Date("2026-09-15T08:50:00.000Z"),
++            cursorExternalId: 7001,
++          },
++        },
++      },
++      finishedAt,
++    );
++
++    const partial = await startFixtureRun(workerDb, fixture, "trace-partial");
++    await finishSyncRun(
++      workerDb,
++      partial.id,
++      {
++        status: "partial",
++        counts: { pagesRead: 2, leadsRead: 3, eventsRead: 0, usersRead: 0, retries: 5 },
++        errorCode: "E_AMO_UPSTREAM",
++        safeError: "Upstream response was incomplete",
++      },
++      new Date("2026-09-15T09:02:00.000Z"),
++    );
++
++    const cursors = await adminDb<{
++      stream: string;
++      cursor_time: Date;
++      cursor_external_id: string;
++      last_successful_run_id: string;
++    }[]>`
++      select stream, cursor_time, cursor_external_id, last_successful_run_id
++      from public.sync_cursors
++    `;
++    expect(cursors).toEqual([
++      {
++        stream: "leads",
++        cursor_time: new Date("2026-09-15T08:50:00.000Z"),
++        cursor_external_id: "7001",
++        last_successful_run_id: first.id,
++      },
++    ]);
++    await expect(
++      adminDb<{ status: string; error_summary: string }[]>`
++        select status, error_summary from public.sync_runs where id = ${partial.id}
++      `,
++    ).resolves.toEqual([
++      { status: "partial", error_summary: "Upstream response was incomplete" },
++    ]);
++  });
++
++  it("does not let the worker rewrite a run's pinned identity", async () => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-pinned");
++
++    await expect(
++      workerDb`
++        update public.sync_runs
++        set trace_id = 'trace-rewritten'
++        where id = ${run.id}
++      `,
++    ).rejects.toMatchObject({ code: "42501" });
++    await expect(
++      adminDb<{ trace_id: string }[]>`
++        select trace_id from public.sync_runs where id = ${run.id}
++      `,
++    ).resolves.toEqual([{ trace_id: "trace-pinned" }]);
++  });
++
++  it("quarantines malformed payloads idempotently without changing the cursor", async () => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-quarantine");
++    const input = {
++      syncRunId: run.id,
++      stream: "leads" as const,
++      pageNumber: 3,
++      reasonCode: "E_AMO_SCHEMA",
++      payload: { unexpected: "synthetic malformed value" },
++      payloadSha256: hashA,
++      receivedAt,
++    };
++
++    await quarantineRawPage(workerDb, input);
++    await quarantineRawPage(workerDb, input);
++
++    await expect(
++      adminDb<{ quarantine: number; cursors: number }[]>`
++        select
++          (select count(*)::integer from public.raw_amo_quarantine) as quarantine,
++          (select count(*)::integer from public.sync_cursors) as cursors
++      `,
++    ).resolves.toEqual([{ quarantine: 1, cursors: 0 }]);
++  });
++
++  it("persists only the safe audit shape and rejects query-bearing paths", async () => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-audit-run");
++
++    await appendAmoApiAudit(workerDb, {
++      syncRunId: run.id,
++      traceId: "trace-audit-entry",
++      method: "GET",
++      normalizedPath: "/api/v4/leads",
++      responseStatus: 200,
++      durationMs: 17,
++      attempt: 1,
++      result: "success",
++    });
++
++    const [row] = await adminDb<Record<string, unknown>[]>`
++      select * from public.amo_api_audit
++    `;
++    expect(Object.keys(row ?? {}).sort()).toEqual([
++      "attempt",
++      "created_at",
++      "duration_ms",
++      "id",
++      "method",
++      "normalized_path",
++      "response_status",
++      "result",
++      "sync_run_id",
++      "trace_id",
++    ]);
++    expect(JSON.stringify(row)).not.toContain("token");
++    expect(JSON.stringify(row)).not.toContain("page=2");
++
++    await expect(
++      workerDb`
++        insert into public.amo_api_audit (
++          sync_run_id, trace_id, method, normalized_path,
++          response_status, duration_ms, attempt, result
++        ) values (
++          ${run.id}, 'trace-unsafe', 'GET', '/api/v4/leads?page=2',
++          200, 1, 1, 'success'
++        )
++      `,
++    ).rejects.toMatchObject({ code: "23514" });
++  });
++
++  it("counts exact source-field values from each lead's latest successful raw snapshot", async () => {
++    const fixture = await seedFixture();
++    const first = await startFixtureRun(workerDb, fixture, "trace-values-1");
++    await appendRawPage(workerDb, {
++      syncRunId: first.id,
++      stream: "leads",
++      pageNumber: 1,
++      itemCount: 2,
++      payloadSha256: hashA,
++      objects: [
++        {
++          accountId: 4242,
++          entityType: "lead",
++          externalId: 7001,
++          sourceUpdatedAt: new Date("2026-09-15T08:00:00.000Z"),
++          payload: { id: 7001, custom_fields_values: [{ field_id: 77, values: [{ value: "WhatsApp" }] }] },
++          payloadSha256: "1".repeat(64),
++        },
++        {
++          accountId: 4242,
++          entityType: "lead",
++          externalId: 7002,
++          sourceUpdatedAt: new Date("2026-09-15T08:00:00.000Z"),
++          payload: { id: 7002, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] },
++          payloadSha256: "2".repeat(64),
++        },
++      ],
++      events: [],
++      receivedAt,
++    });
++    await finishSyncRun(workerDb, first.id, {
++      status: "success",
++      counts: { pagesRead: 1, leadsRead: 2, eventsRead: 0, usersRead: 0, retries: 0 },
++      nextCursors: {},
++    }, finishedAt);
++
++    const second = await startFixtureRun(workerDb, fixture, "trace-values-2");
++    await appendRawPage(workerDb, {
++      syncRunId: second.id,
++      stream: "leads",
++      pageNumber: 1,
++      itemCount: 1,
++      payloadSha256: hashB,
++      objects: [{
++        accountId: 4242,
++        entityType: "lead",
++        externalId: 7001,
++        sourceUpdatedAt: new Date("2026-09-15T08:30:00.000Z"),
++        payload: { id: 7001, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] },
++        payloadSha256: "3".repeat(64),
++      }],
++      events: [],
++      receivedAt: new Date("2026-09-15T09:03:00.000Z"),
++    });
++    await finishSyncRun(workerDb, second.id, {
++      status: "success",
++      counts: { pagesRead: 1, leadsRead: 1, eventsRead: 0, usersRead: 0, retries: 0 },
++      nextCursors: {},
++    }, new Date("2026-09-15T09:04:00.000Z"));
++
++    await expect(
++      getRawChannelValues(adminDb, {
++        connectionId: fixture.connectionId,
++        sourceFieldId: 77,
++      }),
++    ).resolves.toEqual([{ value: "Avito", count: 2 }]);
++  });
++});
+diff --git a/packages/db/src/raw-amo.ts b/packages/db/src/raw-amo.ts
+new file mode 100644
+index 0000000..808c7cf
+--- /dev/null
++++ b/packages/db/src/raw-amo.ts
+@@ -0,0 +1,360 @@
++import { AppError } from "@real2/domain";
++import type { JSONValue, TransactionSql } from "postgres";
++
++import type { Database } from "./client.js";
++import type { SyncStream } from "./sync-runs.js";
++
++export type RawEntityType = "account" | "pipeline" | "status" | "user" | "lead";
++
++export type RawAmoObjectInput = Readonly<{
++  accountId: number;
++  entityType: RawEntityType;
++  externalId: number;
++  sourceUpdatedAt?: Date | null;
++  payload: JSONValue;
++  payloadSha256: string;
++}>;
++
++export type RawAmoEventInput = Readonly<{
++  accountId: number;
++  amoEventId: number;
++  amoLeadId?: number | null;
++  eventType: string;
++  eventAt: Date;
++  payload: JSONValue;
++  payloadSha256: string;
++}>;
++
++export type AppendRawPageInput = Readonly<{
++  syncRunId: string;
++  stream: SyncStream;
++  pageNumber: number;
++  itemCount: number;
++  payloadSha256: string;
++  objects: readonly RawAmoObjectInput[];
++  events: readonly RawAmoEventInput[];
++  receivedAt?: Date;
++}>;
++
++export type QuarantineRawPageInput = Readonly<{
++  syncRunId: string;
++  stream: SyncStream;
++  pageNumber: number;
++  reasonCode: string;
++  payload: JSONValue;
++  payloadSha256: string;
++  receivedAt?: Date;
++}>;
++
++export type AmoApiAuditInput = Readonly<{
++  syncRunId?: string | null;
++  traceId: string;
++  method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
++  normalizedPath: string;
++  responseStatus?: number | null;
++  durationMs: number;
++  attempt: number;
++  result: "allowed" | "denied" | "success" | "error";
++  createdAt?: Date;
++}>;
++
++export type RawChannelValue = Readonly<{ value: string; count: number }>;
++
++function conflict(): never {
++  throw new AppError("E_CONFLICT", 409);
++}
++
++function isSha256(value: string): boolean {
++  return /^[a-f0-9]{64}$/.test(value);
++}
++
++function validatePageInput(input: AppendRawPageInput): void {
++  if (
++    !Number.isSafeInteger(input.pageNumber) ||
++    input.pageNumber <= 0 ||
++    !Number.isSafeInteger(input.itemCount) ||
++    input.itemCount < 0 ||
++    !isSha256(input.payloadSha256)
++  ) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++}
++
++async function appendPageMetadata(
++  transaction: TransactionSql,
++  input: Readonly<{
++    syncRunId: string;
++    stream: SyncStream;
++    pageNumber: number;
++    itemCount: number;
++    payloadSha256: string;
++    receivedAt: Date;
++  }>,
++): Promise<void> {
++  const inserted = await transaction<{ id: string }[]>`
++    insert into public.sync_pages (
++      sync_run_id,
++      stream,
++      page_number,
++      item_count,
++      payload_sha256,
++      received_at
++    ) values (
++      ${input.syncRunId},
++      ${input.stream},
++      ${input.pageNumber},
++      ${input.itemCount},
++      ${input.payloadSha256},
++      ${input.receivedAt}
++    )
++    on conflict (sync_run_id, stream, page_number) do nothing
++    returning id
++  `;
++  if (inserted.length > 0) return;
++
++  const [existing] = await transaction<{
++    item_count: number;
++    payload_sha256: string;
++  }[]>`
++    select item_count, payload_sha256
++    from public.sync_pages
++    where sync_run_id = ${input.syncRunId}
++      and stream = ${input.stream}
++      and page_number = ${input.pageNumber}
++  `;
++  if (
++    !existing ||
++    existing.item_count !== input.itemCount ||
++    existing.payload_sha256 !== input.payloadSha256
++  ) {
++    conflict();
++  }
++}
++
++async function appendObject(
++  transaction: TransactionSql,
++  syncRunId: string,
++  object: RawAmoObjectInput,
++  receivedAt: Date,
++): Promise<void> {
++  const inserted = await transaction<{ id: string }[]>`
++    insert into public.raw_amo_objects (
++      sync_run_id,
++      account_id,
++      entity_type,
++      external_id,
++      source_updated_at,
++      payload,
++      payload_sha256,
++      received_at
++    ) values (
++      ${syncRunId},
++      ${object.accountId},
++      ${object.entityType},
++      ${object.externalId},
++      ${object.sourceUpdatedAt ?? null},
++      ${transaction.json(object.payload)},
++      ${object.payloadSha256},
++      ${receivedAt}
++    )
++    on conflict (sync_run_id, entity_type, external_id) do nothing
++    returning id
++  `;
++  if (inserted.length > 0) return;
++
++  const [existing] = await transaction<{ payload_sha256: string }[]>`
++    select payload_sha256
++    from public.raw_amo_objects
++    where sync_run_id = ${syncRunId}
++      and entity_type = ${object.entityType}
++      and external_id = ${object.externalId}
++  `;
++  if (!existing || existing.payload_sha256 !== object.payloadSha256) conflict();
++}
++
++async function appendEvent(
++  transaction: TransactionSql,
++  syncRunId: string,
++  event: RawAmoEventInput,
++  receivedAt: Date,
++): Promise<void> {
++  const inserted = await transaction<{ id: string }[]>`
++    insert into public.raw_amo_events (
++      sync_run_id,
++      account_id,
++      amo_event_id,
++      amo_lead_id,
++      event_type,
++      event_at,
++      payload,
++      payload_sha256,
++      received_at
++    ) values (
++      ${syncRunId},
++      ${event.accountId},
++      ${event.amoEventId},
++      ${event.amoLeadId ?? null},
++      ${event.eventType},
++      ${event.eventAt},
++      ${transaction.json(event.payload)},
++      ${event.payloadSha256},
++      ${receivedAt}
++    )
++    on conflict (account_id, amo_event_id) do nothing
++    returning id
++  `;
++  if (inserted.length > 0) return;
++
++  const [existing] = await transaction<{ payload_sha256: string }[]>`
++    select payload_sha256
++    from public.raw_amo_events
++    where account_id = ${event.accountId}
++      and amo_event_id = ${event.amoEventId}
++  `;
++  if (!existing || existing.payload_sha256 !== event.payloadSha256) conflict();
++}
++
++export async function appendRawPage(
++  db: Database,
++  input: AppendRawPageInput,
++): Promise<void> {
++  validatePageInput(input);
++  const receivedAt = input.receivedAt ?? new Date();
++  await db.begin(async (transaction) => {
++    await appendPageMetadata(transaction, { ...input, receivedAt });
++    for (const object of input.objects) {
++      await appendObject(transaction, input.syncRunId, object, receivedAt);
++    }
++    for (const event of input.events) {
++      await appendEvent(transaction, input.syncRunId, event, receivedAt);
++    }
++  });
++}
++
++export async function quarantineRawPage(
++  db: Database,
++  input: QuarantineRawPageInput,
++): Promise<void> {
++  const receivedAt = input.receivedAt ?? new Date();
++  if (
++    !Number.isSafeInteger(input.pageNumber) ||
++    input.pageNumber <= 0 ||
++    !isSha256(input.payloadSha256)
++  ) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++
++  await db.begin(async (transaction) => {
++    await appendPageMetadata(transaction, {
++      syncRunId: input.syncRunId,
++      stream: input.stream,
++      pageNumber: input.pageNumber,
++      itemCount: 0,
++      payloadSha256: input.payloadSha256,
++      receivedAt,
++    });
++    await transaction`
++      insert into public.raw_amo_quarantine (
++        sync_run_id,
++        stream,
++        page_number,
++        reason_code,
++        payload,
++        payload_sha256,
++        received_at
++      ) values (
++        ${input.syncRunId},
++        ${input.stream},
++        ${input.pageNumber},
++        ${input.reasonCode},
++        ${transaction.json(input.payload)},
++        ${input.payloadSha256},
++        ${receivedAt}
++      )
++      on conflict (sync_run_id, stream, page_number, payload_sha256) do nothing
++    `;
++  });
++}
++
++export async function appendAmoApiAudit(
++  db: Database,
++  input: AmoApiAuditInput,
++): Promise<void> {
++  await db`
++    insert into public.amo_api_audit (
++      sync_run_id,
++      trace_id,
++      method,
++      normalized_path,
++      response_status,
++      duration_ms,
++      attempt,
++      result,
++      created_at
++    ) values (
++      ${input.syncRunId ?? null},
++      ${input.traceId},
++      ${input.method},
++      ${input.normalizedPath},
++      ${input.responseStatus ?? null},
++      ${input.durationMs},
++      ${input.attempt},
++      ${input.result},
++      ${input.createdAt ?? new Date()}
++    )
++  `;
++}
++
++export async function getRawChannelValues(
++  db: Database,
++  input: Readonly<{ connectionId: string; sourceFieldId: number }>,
++): Promise<readonly RawChannelValue[]> {
++  const rows = await db<{ value: string; count: number }[]>`
++    with ranked_leads as (
++      select
++        raw.account_id,
++        raw.external_id,
++        raw.payload,
++        row_number() over (
++          partition by raw.account_id, raw.external_id
++          order by raw.source_updated_at desc nulls last,
++            raw.received_at desc,
++            raw.id desc
++        ) as recency
++      from public.raw_amo_objects as raw
++      join public.sync_runs as run on run.id = raw.sync_run_id
++      where run.connection_id = ${input.connectionId}
++        and run.status = 'success'
++        and raw.entity_type = 'lead'
++    ), exact_values as (
++      select distinct
++        lead.account_id,
++        lead.external_id,
++        btrim(value_item ->> 'value') as value
++      from ranked_leads as lead
++      cross join lateral jsonb_array_elements(
++        case
++          when jsonb_typeof(lead.payload -> 'custom_fields_values') = 'array'
++            then lead.payload -> 'custom_fields_values'
++          else '[]'::jsonb
++        end
++      ) as field_item
++      cross join lateral jsonb_array_elements(
++        case
++          when jsonb_typeof(field_item -> 'values') = 'array'
++            then field_item -> 'values'
++          else '[]'::jsonb
++        end
++      ) as value_item
++      where lead.recency = 1
++        and field_item ->> 'field_id' = ${String(input.sourceFieldId)}
++        and jsonb_typeof(value_item -> 'value') in ('string', 'number', 'boolean')
++        and btrim(value_item ->> 'value') <> ''
++    )
++    select value, count(*)::integer as count
++    from exact_values
++    group by value
++    order by count desc, value asc
++  `;
++  return rows;
++}
+diff --git a/packages/db/src/sync-runs.ts b/packages/db/src/sync-runs.ts
+new file mode 100644
+index 0000000..060b095
+--- /dev/null
++++ b/packages/db/src/sync-runs.ts
+@@ -0,0 +1,223 @@
++import { AppError } from "@real2/domain";
++import type { TransactionSql } from "postgres";
++
++import type { Database } from "./client.js";
++
++export type SyncKind =
++  | "initial_backfill"
++  | "incremental"
++  | "nightly_reconciliation"
++  | "manual";
++export type SyncStatus = "running" | "success" | "partial" | "failed";
++export type SyncStream = "leads" | "events" | "users" | "metadata";
++
++export type SyncCounts = Readonly<{
++  pagesRead: number;
++  leadsRead: number;
++  eventsRead: number;
++  usersRead: number;
++  retries: number;
++}>;
++
++export type SyncCursorPosition = Readonly<{
++  cursorTime: Date | null;
++  cursorExternalId: number | null;
++}>;
++
++export type SyncOutcome =
++  | Readonly<{
++      status: "success";
++      nextCursors: Partial<Record<SyncStream, SyncCursorPosition>>;
++      counts: SyncCounts;
++      sourceMaxUpdatedAt?: Date | null;
++      checksum?: string | null;
++    }>
++  | Readonly<{
++      status: "partial" | "failed";
++      safeError: string;
++      errorCode?: string | null;
++      counts: SyncCounts;
++      sourceMaxUpdatedAt?: Date | null;
++      checksum?: string | null;
++    }>;
++
++export type StartSyncRunInput = Readonly<{
++  traceId: string;
++  connectionId: string;
++  configId: string;
++  kind: SyncKind;
++  createdBy?: string | null;
++  startedAt?: Date;
++}>;
++
++export type SyncRun = Readonly<{
++  id: string;
++  traceId: string;
++  connectionId: string;
++  configId: string;
++  kind: SyncKind;
++  status: SyncStatus;
++  startedAt: Date;
++}>;
++
++type SyncRunRow = {
++  id: string;
++  trace_id: string;
++  connection_id: string;
++  config_id: string;
++  kind: SyncKind;
++  status: SyncStatus;
++  started_at: Date;
++};
++
++const streams: readonly SyncStream[] = ["metadata", "users", "events", "leads"];
++
++function isNonNegativeInteger(value: number): boolean {
++  return Number.isSafeInteger(value) && value >= 0;
++}
++
++function validateCounts(counts: SyncCounts): void {
++  if (
++    !isNonNegativeInteger(counts.pagesRead) ||
++    !isNonNegativeInteger(counts.leadsRead) ||
++    !isNonNegativeInteger(counts.eventsRead) ||
++    !isNonNegativeInteger(counts.usersRead) ||
++    !isNonNegativeInteger(counts.retries)
++  ) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++}
++
++function mapRun(row: SyncRunRow): SyncRun {
++  return {
++    id: row.id,
++    traceId: row.trace_id,
++    connectionId: row.connection_id,
++    configId: row.config_id,
++    kind: row.kind,
++    status: row.status,
++    startedAt: row.started_at,
++  };
++}
++
++export async function startSyncRun(
++  db: Database,
++  input: StartSyncRunInput,
++): Promise<SyncRun> {
++  const [row] = await db<SyncRunRow[]>`
++    insert into public.sync_runs (
++      trace_id,
++      connection_id,
++      config_id,
++      kind,
++      started_at,
++      created_by
++    ) values (
++      ${input.traceId},
++      ${input.connectionId},
++      ${input.configId},
++      ${input.kind},
++      ${input.startedAt ?? new Date()},
++      ${input.createdBy ?? null}
++    )
++    returning id, trace_id, connection_id, config_id, kind, status, started_at
++  `;
++  if (!row) throw new AppError("E_DB", 500);
++  return mapRun(row);
++}
++
++async function replaceCursors(
++  transaction: TransactionSql,
++  connectionId: string,
++  runId: string,
++  nextCursors: Partial<Record<SyncStream, SyncCursorPosition>>,
++  updatedAt: Date,
++): Promise<void> {
++  for (const stream of streams) {
++    const cursor = nextCursors[stream];
++    if (!cursor) continue;
++    if (
++      cursor.cursorExternalId !== null &&
++      (!Number.isSafeInteger(cursor.cursorExternalId) || cursor.cursorExternalId <= 0)
++    ) {
++      throw new AppError("E_VALIDATION", 422);
++    }
++    await transaction`
++      insert into public.sync_cursors (
++        connection_id,
++        stream,
++        cursor_time,
++        cursor_external_id,
++        last_successful_run_id,
++        updated_at
++      ) values (
++        ${connectionId},
++        ${stream},
++        ${cursor.cursorTime},
++        ${cursor.cursorExternalId},
++        ${runId},
++        ${updatedAt}
++      )
++      on conflict (connection_id, stream) do update set
++        cursor_time = excluded.cursor_time,
++        cursor_external_id = excluded.cursor_external_id,
++        last_successful_run_id = excluded.last_successful_run_id,
++        updated_at = excluded.updated_at
++    `;
++  }
++}
++
++export async function finishSyncRun(
++  db: Database,
++  runId: string,
++  outcome: SyncOutcome,
++  finishedAt = new Date(),
++): Promise<void> {
++  validateCounts(outcome.counts);
++  if (outcome.status !== "success" && outcome.safeError.length > 500) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++
++  await db.begin(async (transaction) => {
++    const [run] = await transaction<{
++      connection_id: string;
++      status: SyncStatus;
++    }[]>`
++      select connection_id, status
++      from public.sync_runs
++      where id = ${runId}
++      for update
++    `;
++    if (!run) throw new AppError("E_NOT_FOUND", 404);
++    if (run.status !== "running") throw new AppError("E_CONFLICT", 409);
++
++    const errorCode = outcome.status === "success" ? null : outcome.errorCode ?? null;
++    const errorSummary = outcome.status === "success" ? null : outcome.safeError;
++    await transaction`
++      update public.sync_runs
++      set
++        status = ${outcome.status},
++        finished_at = ${finishedAt},
++        pages_read = ${outcome.counts.pagesRead},
++        leads_read = ${outcome.counts.leadsRead},
++        events_read = ${outcome.counts.eventsRead},
++        users_read = ${outcome.counts.usersRead},
++        retries = ${outcome.counts.retries},
++        source_max_updated_at = ${outcome.sourceMaxUpdatedAt ?? null},
++        error_code = ${errorCode},
++        error_summary = ${errorSummary},
++        checksum = ${outcome.checksum ?? null}
++      where id = ${runId}
++    `;
++
++    if (outcome.status === "success") {
++      await replaceCursors(
++        transaction,
++        run.connection_id,
++        runId,
++        outcome.nextCursors,
++        finishedAt,
++      );
++    }
++  });
++}
+diff --git a/packages/integrations/src/amo/schemas.test.ts b/packages/integrations/src/amo/schemas.test.ts
+new file mode 100644
+index 0000000..3ba5e81
+--- /dev/null
++++ b/packages/integrations/src/amo/schemas.test.ts
+@@ -0,0 +1,104 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  amoEventsResponseSchema,
++  amoLeadsResponseSchema,
++  amoUsersResponseSchema,
++} from "./schemas";
++
++describe("amoCRM synchronization response schemas", () => {
++  it("accepts a complete lead page and preserves raw fields for the journal", () => {
++    const payload = {
++      _page: 2,
++      _links: {
++        self: { href: "https://555151.amocrm.ru/api/v4/leads?page=2" },
++        next: { href: "https://555151.amocrm.ru/api/v4/leads?page=3" },
++      },
++      _embedded: {
++        leads: [
++          {
++            id: 7001,
++            name: "Synthetic lead",
++            status_id: 11,
++            pipeline_id: 10243278,
++            responsible_user_id: 501,
++            created_at: 1_757_635_200,
++            updated_at: 1_757_638_800,
++            account_id: 4242,
++            custom_fields_values: [
++              { field_id: 77, values: [{ value: "Synthetic source" }] },
++            ],
++            synthetic_extra: "must remain available to raw storage",
++          },
++        ],
++      },
++    };
++
++    const parsed = amoLeadsResponseSchema.parse(payload);
++
++    expect(parsed._embedded.leads[0]).toMatchObject({
++      id: 7001,
++      updated_at: 1_757_638_800,
++      synthetic_extra: "must remain available to raw storage",
++    });
++    expect(parsed._links?.next?.href).toContain("page=3");
++  });
++
++  it("rejects a 200 lead page without the fields needed for durable ordering", () => {
++    const result = amoLeadsResponseSchema.safeParse({
++      _embedded: {
++        leads: [
++          {
++            id: 7001,
++            account_id: 4242,
++            created_at: 1_757_635_200,
++          },
++        ],
++      },
++    });
++
++    expect(result.success).toBe(false);
++  });
++
++  it("requires event identity, timestamp, type, and account ownership", () => {
++    expect(
++      amoEventsResponseSchema.safeParse({
++        _embedded: {
++          events: [
++            {
++              id: 9001,
++              type: "lead_status_changed",
++              entity_id: 7001,
++              entity_type: "lead",
++              created_at: 1_757_638_900,
++              account_id: 4242,
++            },
++          ],
++        },
++      }).success,
++    ).toBe(true);
++
++    expect(
++      amoEventsResponseSchema.safeParse({
++        _embedded: {
++          events: [
++            {
++              type: "lead_status_changed",
++              entity_id: 7001,
++              created_at: 1_757_638_900,
++              account_id: 4242,
++            },
++          ],
++        },
++      }).success,
++    ).toBe(false);
++  });
++
++  it("rejects a user page without an immutable external id", () => {
++    expect(
++      amoUsersResponseSchema.safeParse({
++        _embedded: { users: [{ name: "Synthetic User" }] },
++      }).success,
++    ).toBe(false);
++  });
++});
+diff --git a/packages/integrations/src/amo/schemas.ts b/packages/integrations/src/amo/schemas.ts
+new file mode 100644
+index 0000000..d811596
+--- /dev/null
++++ b/packages/integrations/src/amo/schemas.ts
+@@ -0,0 +1,99 @@
++import { z } from "zod";
++
++const positiveId = z.number().int().positive();
++const unixTimestamp = z.number().int().nonnegative();
++
++const amoLinkSchema = z.looseObject({
++  href: z.string().min(1),
++});
++
++const amoPageLinksSchema = z.looseObject({
++  self: amoLinkSchema.optional(),
++  next: amoLinkSchema.optional(),
++});
++
++const amoCustomFieldValueSchema = z.looseObject({
++  field_id: positiveId,
++  values: z.array(
++    z.looseObject({
++      value: z.union([z.string(), z.number(), z.boolean()]),
++    }),
++  ),
++});
++
++export const amoAccountResponseSchema = z.looseObject({
++  id: positiveId,
++  subdomain: z.string().min(1),
++});
++
++export const amoPipelineSchema = z.looseObject({
++  id: positiveId,
++  name: z.string().min(1),
++  account_id: positiveId.optional(),
++});
++
++export const amoStatusSchema = z.looseObject({
++  id: positiveId,
++  name: z.string().min(1),
++  pipeline_id: positiveId,
++  account_id: positiveId.optional(),
++});
++
++export const amoUserSchema = z.looseObject({
++  id: positiveId,
++  name: z.string().min(1),
++});
++
++export const amoLeadSchema = z.looseObject({
++  id: positiveId,
++  account_id: positiveId,
++  created_at: unixTimestamp,
++  updated_at: unixTimestamp,
++  status_id: positiveId.optional(),
++  pipeline_id: positiveId.optional(),
++  responsible_user_id: positiveId.optional(),
++  custom_fields_values: z.array(amoCustomFieldValueSchema).nullable().optional(),
++});
++
++export const amoEventSchema = z.looseObject({
++  id: positiveId,
++  type: z.string().min(1),
++  entity_id: positiveId,
++  entity_type: z.string().min(1),
++  created_at: unixTimestamp,
++  account_id: positiveId,
++});
++
++function pageSchema<TKey extends string, TItem extends z.ZodType>(
++  key: TKey,
++  item: TItem,
++) {
++  return z.looseObject({
++    _page: z.number().int().positive().optional(),
++    _links: amoPageLinksSchema.optional(),
++    _embedded: z.object({ [key]: z.array(item) }) as z.ZodObject<
++      Record<TKey, z.ZodArray<TItem>>
++    >,
++  });
++}
++
++export const amoPipelinesResponseSchema = pageSchema(
++  "pipelines",
++  amoPipelineSchema,
++);
++export const amoStatusesResponseSchema = pageSchema("statuses", amoStatusSchema);
++export const amoUsersResponseSchema = pageSchema("users", amoUserSchema);
++export const amoLeadsResponseSchema = pageSchema("leads", amoLeadSchema);
++export const amoEventsResponseSchema = pageSchema("events", amoEventSchema);
++
++export type AmoAccountResponse = z.infer<typeof amoAccountResponseSchema>;
++export type AmoPipeline = z.infer<typeof amoPipelineSchema>;
++export type AmoStatus = z.infer<typeof amoStatusSchema>;
++export type AmoUser = z.infer<typeof amoUserSchema>;
++export type AmoLead = z.infer<typeof amoLeadSchema>;
++export type AmoEvent = z.infer<typeof amoEventSchema>;
++export type AmoPipelinesResponse = z.infer<typeof amoPipelinesResponseSchema>;
++export type AmoStatusesResponse = z.infer<typeof amoStatusesResponseSchema>;
++export type AmoUsersResponse = z.infer<typeof amoUsersResponseSchema>;
++export type AmoLeadsResponse = z.infer<typeof amoLeadsResponseSchema>;
++export type AmoEventsResponse = z.infer<typeof amoEventsResponseSchema>;
+diff --git a/packages/integrations/src/index.ts b/packages/integrations/src/index.ts
+index 36f3314..ff45aa6 100644
+--- a/packages/integrations/src/index.ts
++++ b/packages/integrations/src/index.ts
+@@ -6,20 +6,44 @@ export {
+   type TokenEncryptionKey,
+ } from "./amo/crypto.js";
+ export {
+   exchangeAuthorizationCode,
+   refreshOAuthToken,
+   type AmoOAuthConfig,
+   type AmoOAuthTransport,
+   type AmoTokenPair,
+ } from "./amo/oauth.js";
+ export { amoFetch } from "./amo/transport.js";
++export {
++  amoAccountResponseSchema,
++  amoEventSchema,
++  amoEventsResponseSchema,
++  amoLeadSchema,
++  amoLeadsResponseSchema,
++  amoPipelineSchema,
++  amoPipelinesResponseSchema,
++  amoStatusSchema,
++  amoStatusesResponseSchema,
++  amoUserSchema,
++  amoUsersResponseSchema,
++  type AmoAccountResponse,
++  type AmoEvent,
++  type AmoEventsResponse,
++  type AmoLead,
++  type AmoLeadsResponse,
++  type AmoPipeline,
++  type AmoPipelinesResponse,
++  type AmoStatus,
++  type AmoStatusesResponse,
++  type AmoUser,
++  type AmoUsersResponse,
++} from "./amo/schemas.js";
+ export {
+   createAmoTokenProvider,
+   refreshConnection,
+   refreshDueConnections,
+   type RefreshedAccessTokenValidator,
+   type RefreshAmoTokenDependencies,
+ } from "./amo/refresh.js";
+ export type {
+   AmoAuditEntry,
+   AmoAuditSink,
+diff --git a/supabase/migrations/0005_raw_sync.sql b/supabase/migrations/0005_raw_sync.sql
+new file mode 100644
+index 0000000..6361a6f
+--- /dev/null
++++ b/supabase/migrations/0005_raw_sync.sql
+@@ -0,0 +1,233 @@
++create type public.sync_kind as enum (
++  'initial_backfill',
++  'incremental',
++  'nightly_reconciliation',
++  'manual'
++);
++
++create type public.sync_status as enum (
++  'running',
++  'success',
++  'partial',
++  'failed'
++);
++
++create type public.raw_entity_type as enum (
++  'account',
++  'pipeline',
++  'status',
++  'user',
++  'lead'
++);
++
++create table public.sync_runs (
++  id uuid primary key default gen_random_uuid(),
++  trace_id text not null unique check (char_length(trace_id) between 1 and 128),
++  connection_id uuid not null references public.amo_connections(id),
++  config_id uuid not null references public.pipeline_configs(id),
++  kind public.sync_kind not null,
++  status public.sync_status not null default 'running',
++  started_at timestamptz not null default now(),
++  finished_at timestamptz,
++  pages_read integer not null default 0 check (pages_read >= 0),
++  leads_read integer not null default 0 check (leads_read >= 0),
++  events_read integer not null default 0 check (events_read >= 0),
++  users_read integer not null default 0 check (users_read >= 0),
++  retries integer not null default 0 check (retries >= 0),
++  source_max_updated_at timestamptz,
++  error_code text check (error_code is null or char_length(error_code) between 1 and 80),
++  error_summary text check (error_summary is null or char_length(error_summary) between 1 and 500),
++  checksum text check (checksum is null or checksum ~ '^[a-f0-9]{64}$'),
++  created_by uuid references public.app_users(id),
++  check (
++    (status = 'running' and finished_at is null)
++    or (status <> 'running' and finished_at is not null)
++  )
++);
++
++create table public.sync_cursors (
++  connection_id uuid not null references public.amo_connections(id),
++  stream text not null check (stream in ('leads', 'events', 'users', 'metadata')),
++  cursor_time timestamptz,
++  cursor_external_id bigint check (cursor_external_id is null or cursor_external_id > 0),
++  last_successful_run_id uuid references public.sync_runs(id),
++  updated_at timestamptz not null default now(),
++  primary key (connection_id, stream)
++);
++
++create table public.sync_pages (
++  id uuid primary key default gen_random_uuid(),
++  sync_run_id uuid not null references public.sync_runs(id),
++  stream text not null check (stream in ('leads', 'events', 'users', 'metadata')),
++  page_number integer not null check (page_number > 0),
++  item_count integer not null check (item_count >= 0),
++  payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
++  received_at timestamptz not null default now(),
++  unique (sync_run_id, stream, page_number)
++);
++
++create table public.raw_amo_objects (
++  id uuid primary key default gen_random_uuid(),
++  sync_run_id uuid not null references public.sync_runs(id),
++  account_id bigint not null check (account_id > 0),
++  entity_type public.raw_entity_type not null,
++  external_id bigint not null check (external_id > 0),
++  source_updated_at timestamptz,
++  payload jsonb not null check (jsonb_typeof(payload) = 'object'),
++  payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
++  received_at timestamptz not null default now(),
++  unique (sync_run_id, entity_type, external_id)
++);
++
++create table public.raw_amo_events (
++  id uuid primary key default gen_random_uuid(),
++  sync_run_id uuid not null references public.sync_runs(id),
++  account_id bigint not null check (account_id > 0),
++  amo_event_id bigint not null check (amo_event_id > 0),
++  amo_lead_id bigint check (amo_lead_id is null or amo_lead_id > 0),
++  event_type text not null check (char_length(event_type) between 1 and 200),
++  event_at timestamptz not null,
++  payload jsonb not null check (jsonb_typeof(payload) = 'object'),
++  payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
++  received_at timestamptz not null default now(),
++  unique (account_id, amo_event_id)
++);
++
++create table public.raw_amo_quarantine (
++  id uuid primary key default gen_random_uuid(),
++  sync_run_id uuid not null references public.sync_runs(id),
++  stream text not null check (stream in ('leads', 'events', 'users', 'metadata')),
++  page_number integer not null check (page_number > 0),
++  reason_code text not null check (char_length(reason_code) between 1 and 80),
++  payload jsonb not null,
++  payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
++  received_at timestamptz not null default now(),
++  unique (sync_run_id, stream, page_number, payload_sha256)
++);
++
++create table public.amo_api_audit (
++  id uuid primary key default gen_random_uuid(),
++  sync_run_id uuid references public.sync_runs(id),
++  trace_id text not null check (char_length(trace_id) between 1 and 128),
++  method text not null check (method in ('GET', 'POST', 'PATCH', 'PUT', 'DELETE')),
++  normalized_path text not null check (
++    normalized_path like '/%'
++    and position('?' in normalized_path) = 0
++    and position('#' in normalized_path) = 0
++    and char_length(normalized_path) <= 500
++  ),
++  response_status integer check (response_status is null or response_status between 100 and 599),
++  duration_ms integer not null check (duration_ms >= 0),
++  attempt smallint not null check (attempt > 0),
++  result text not null check (result in ('allowed', 'denied', 'success', 'error')),
++  created_at timestamptz not null default now()
++);
++
++create index raw_objects_lookup_idx
++on public.raw_amo_objects (entity_type, external_id, received_at desc);
++
++create index raw_events_lead_idx
++on public.raw_amo_events (amo_lead_id, event_at, amo_event_id);
++
++create index raw_quarantine_page_idx
++on public.raw_amo_quarantine (sync_run_id, stream, page_number);
++
++create index sync_pages_run_idx
++on public.sync_pages (sync_run_id, stream, page_number);
++
++create index sync_runs_status_idx
++on public.sync_runs (status, started_at desc);
++
++create index amo_api_audit_run_idx
++on public.amo_api_audit (sync_run_id, created_at);
++
++alter table public.sync_runs enable row level security;
++alter table public.sync_cursors enable row level security;
++alter table public.sync_pages enable row level security;
++alter table public.raw_amo_objects enable row level security;
++alter table public.raw_amo_events enable row level security;
++alter table public.raw_amo_quarantine enable row level security;
++alter table public.amo_api_audit enable row level security;
++
++revoke all on table public.sync_runs from anon, authenticated;
++revoke all on table public.sync_cursors from anon, authenticated;
++revoke all on table public.sync_pages from anon, authenticated;
++revoke all on table public.raw_amo_objects from anon, authenticated;
++revoke all on table public.raw_amo_events from anon, authenticated;
++revoke all on table public.raw_amo_quarantine from anon, authenticated;
++revoke all on table public.amo_api_audit from anon, authenticated;
++
++grant select on table public.sync_runs, public.sync_pages, public.amo_api_audit
++to authenticated;
++
++grant select on table public.raw_amo_objects, public.raw_amo_events,
++  public.raw_amo_quarantine
++to authenticated;
++
++create policy sync_runs_leadership_select
++on public.sync_runs
++for select
++to authenticated
++using ((select app.current_role()) in ('admin', 'head'));
++
++create policy sync_pages_leadership_select
++on public.sync_pages
++for select
++to authenticated
++using ((select app.current_role()) in ('admin', 'head'));
++
++create policy amo_api_audit_leadership_select
++on public.amo_api_audit
++for select
++to authenticated
++using ((select app.current_role()) in ('admin', 'head'));
++
++create policy raw_amo_objects_admin_select
++on public.raw_amo_objects
++for select
++to authenticated
++using ((select app.current_role()) = 'admin');
++
++create policy raw_amo_events_admin_select
++on public.raw_amo_events
++for select
++to authenticated
++using ((select app.current_role()) = 'admin');
++
++create policy raw_amo_quarantine_admin_select
++on public.raw_amo_quarantine
++for select
++to authenticated
++using ((select app.current_role()) = 'admin');
++
++grant select, insert on table public.sync_runs to service_worker;
++grant update (
++  status,
++  finished_at,
++  pages_read,
++  leads_read,
++  events_read,
++  users_read,
++  retries,
++  source_max_updated_at,
++  error_code,
++  error_summary,
++  checksum
++) on public.sync_runs to service_worker;
++
++grant select, insert on table public.sync_cursors to service_worker;
++grant update (
++  cursor_time,
++  cursor_external_id,
++  last_successful_run_id,
++  updated_at
++) on public.sync_cursors to service_worker;
++grant select, insert on table public.sync_pages to service_worker;
++grant select, insert on table public.raw_amo_objects to service_worker;
++grant select, insert on table public.raw_amo_events to service_worker;
++grant select, insert on table public.raw_amo_quarantine to service_worker;
++grant select, insert on table public.amo_api_audit to service_worker;
++
++-- Deliberately no raw UPDATE/DELETE grant exists for service_worker or a user
++-- role. The separately reviewed retention job owns the only future deletion
++-- path and must first preserve hashes and normalized history.
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index 52b4a2b..7c0b4b6 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -1,33 +1,37 @@
+-import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+ 
+ import { closeDbClient, createServiceWorkerDbClient } from "@real2/db";
+ 
+ import {
+   createAdminDb,
+   localDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+   updateOwnNameAsManager,
+   visibleAppUserIds,
+   visibleControlKeys,
+ } from "../helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+ const allUsers = Object.values(testUsers);
+ 
+-beforeEach(async () => {
++async function clearDatabaseFixtures(): Promise<void> {
+   await adminDb.unsafe(
+-    "truncate table public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
++}
++
++beforeEach(async () => {
++  await clearDatabaseFixtures();
+   await resetAndSeedUsers(adminDb, allUsers);
+   await adminDb`
+     insert into public.amo_connections (
+       account_id,
+       subdomain,
+       base_url,
+       access_token_ciphertext,
+       refresh_token_ciphertext,
+       token_expires_at,
+       status,
+@@ -38,20 +42,24 @@ beforeEach(async () => {
+       'https://555151.amocrm.ru',
+       ${Buffer.alloc(64)},
+       ${Buffer.alloc(64)},
+       '2026-09-12T13:00:00.000Z',
+       'active',
+       ${testUsers.admin.id}
+     )
+   `;
+ });
+ 
++afterEach(async () => {
++  await clearDatabaseFixtures();
++});
++
+ afterAll(async () => {
+   await adminDb.end();
+ });
+ 
+ describe("identity RLS deny-by-default rules", () => {
+   it.each([testUsers.admin, testUsers.head])(
+     "$role can read every application user",
+     async (user) => {
+       await expect(
+         visibleAppUserIds(adminDb, "authenticated", user.authUserId),
+@@ -263,10 +271,147 @@ describe("worker database scope", () => {
+         select current_user
+       `).resolves.toEqual([{ current_user: "service_worker" }]);
+       await expect(workerDb`select id from public.app_users`).rejects.toMatchObject({
+         code: "42501",
+       });
+     } finally {
+       await closeDbClient(workerDb);
+     }
+   });
+ });
++
++describe("raw synchronization RLS", () => {
++  async function seedRawJournal(): Promise<void> {
++    const [connection] = await adminDb<{ id: string }[]>`
++      select id from public.amo_connections limit 1
++    `;
++    if (!connection) throw new Error("amoCRM fixture connection is missing");
++    const [config] = await adminDb<{ id: string }[]>`
++      insert into public.pipeline_configs (
++        amo_connection_id,
++        pipeline_id,
++        pipeline_name,
++        application_status_id,
++        application_status_name,
++        won_status_id,
++        won_status_name,
++        version,
++        is_active,
++        confirmed_by
++      ) values (
++        ${connection.id}, 10243278, 'РЕАЛ ДВА', 11,
++        'Завершение (самовывоз или доставка)', 99,
++        'Успешно реализовано', 1, true, ${testUsers.admin.id}
++      )
++      returning id
++    `;
++    if (!config) throw new Error("pipeline fixture is missing");
++    const [run] = await adminDb<{ id: string }[]>`
++      insert into public.sync_runs (
++        trace_id, connection_id, config_id, kind, status, finished_at
++      ) values (
++        'trace-rls', ${connection.id}, ${config.id}, 'incremental',
++        'success', '2026-09-15T09:01:00.000Z'
++      )
++      returning id
++    `;
++    if (!run) throw new Error("sync run fixture is missing");
++    await adminDb`
++      insert into public.sync_pages (
++        sync_run_id, stream, page_number, item_count, payload_sha256
++      ) values (${run.id}, 'leads', 1, 1, ${"a".repeat(64)})
++    `;
++    await adminDb`
++      insert into public.raw_amo_objects (
++        sync_run_id, account_id, entity_type, external_id,
++        payload, payload_sha256
++      ) values (
++        ${run.id}, 555151, 'lead', 7001,
++        ${adminDb.json({ id: 7001, synthetic: true })}, ${"b".repeat(64)}
++      )
++    `;
++    await adminDb`
++      insert into public.amo_api_audit (
++        sync_run_id, trace_id, method, normalized_path,
++        response_status, duration_ms, attempt, result
++      ) values (
++        ${run.id}, 'trace-rls', 'GET', '/api/v4/leads',
++        200, 3, 1, 'success'
++      )
++    `;
++  }
++
++  async function visibleJournalCounts(authUserId: string) {
++    return adminDb.begin(async (transaction) => {
++      await transaction.unsafe("set local role authenticated");
++      await transaction`
++        select set_config('request.jwt.claim.sub', ${authUserId}, true)
++      `;
++      const [counts] = await transaction<{
++        runs: number;
++        pages: number;
++        audits: number;
++        raw_objects: number;
++      }[]>`
++        select
++          (select count(*)::integer from public.sync_runs) as runs,
++          (select count(*)::integer from public.sync_pages) as pages,
++          (select count(*)::integer from public.amo_api_audit) as audits,
++          (select count(*)::integer from public.raw_amo_objects) as raw_objects
++      `;
++      return counts;
++    });
++  }
++
++  it("shows safe run evidence to leadership but raw payloads only to admin", async () => {
++    await seedRawJournal();
++
++    await expect(visibleJournalCounts(testUsers.admin.authUserId)).resolves.toEqual({
++      runs: 1,
++      pages: 1,
++      audits: 1,
++      raw_objects: 1,
++    });
++    await expect(visibleJournalCounts(testUsers.head.authUserId)).resolves.toEqual({
++      runs: 1,
++      pages: 1,
++      audits: 1,
++      raw_objects: 0,
++    });
++    await expect(
++      visibleJournalCounts(testUsers.managerOne.authUserId),
++    ).resolves.toEqual({ runs: 0, pages: 0, audits: 0, raw_objects: 0 });
++  });
++
++  it("keeps cursors and direct writes unavailable to authenticated users", async () => {
++    await seedRawJournal();
++
++    await expect(
++      adminDb.begin(async (transaction) => {
++        await transaction.unsafe("set local role authenticated");
++        await transaction`
++          select set_config(
++            'request.jwt.claim.sub',
++            ${testUsers.admin.authUserId},
++            true
++          )
++        `;
++        await transaction`select stream from public.sync_cursors`;
++      }),
++    ).rejects.toMatchObject({ code: "42501" });
++    await expect(
++      adminDb.begin(async (transaction) => {
++        await transaction.unsafe("set local role authenticated");
++        await transaction`
++          select set_config(
++            'request.jwt.claim.sub',
++            ${testUsers.admin.authUserId},
++            true
++          )
++        `;
++        await transaction`
++          delete from public.raw_amo_objects where external_id = 7001
++        `;
++      }),
++    ).rejects.toMatchObject({ code: "42501" });
++  });
++});

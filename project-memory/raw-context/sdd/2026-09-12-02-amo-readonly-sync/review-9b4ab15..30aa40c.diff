@@ -1,0 +1,2313 @@
+# Review package: 9b4ab150c89069dd90a7843d80218b3ede98bb3a..30aa40cde8525fa69513af3311f820374c841ce7
+
+## Commits
+30aa40c fix: harden amoCRM raw sync journal
+
+## Files changed
+ .../task-5-report.md                               |  26 +-
+ METRICS_CATALOG.md                                 |   1 +
+ SPEC.md                                            |  16 +-
+ .../src/app/api/config/config.integration.test.ts  |  11 +-
+ docs/spec-first/APPROVALS.md                       |   1 +
+ .../plans/2026-09-12-02-amo-readonly-sync.md       |   4 +-
+ .../plans/2026-09-12-03-normalization-metrics.md   |  22 +-
+ packages/db/src/raw-amo.integration.test.ts        | 361 +++++++++++++++++++--
+ packages/db/src/raw-amo.ts                         |  13 +-
+ packages/db/src/sync-runs.ts                       | 112 +++----
+ packages/integrations/src/amo/schemas.test.ts      | 123 ++++++-
+ packages/integrations/src/amo/schemas.ts           |  61 +++-
+ supabase/migrations/0005_raw_sync.sql              | 270 +++++++++++++--
+ tests/security/rls.security.test.ts                |  62 +++-
+ 14 files changed, 921 insertions(+), 162 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md
+index 40de5a6..aef0275 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md
+@@ -1,70 +1,81 @@
+ # Task 5 report — append-only amoCRM raw synchronization journal
+ 
+ ## Summary
+ 
+ - Added ordered migration `0005_raw_sync.sql` (migrations `0001`–`0004` were already occupied) for sync runs, durable cursors, minimal page metadata, raw amoCRM objects/events, malformed-page quarantine, and safe API audit rows.
+ - Added service-worker repositories for starting and atomically finishing runs, advancing cursors only on `success`, idempotently appending pages/objects/events, quarantining malformed pages, persisting the safe audit shape, and aggregating exact source-field values from the latest successful raw lead snapshots.
+ - Added Zod contracts for account, pipeline/status, user, lead, and event responses. Entity schemas retain unknown upstream fields for the raw journal while requiring stable identity and ordering fields.
+ - Completed the deferred `GET /api/config/channel-values` contract with truthful raw-derived counts; partial/failed runs are excluded and later successful lead snapshots supersede older values.
++- Closed fix-round review findings across the contract and implementation: event IDs/cursors are opaque bounded strings, complex official custom-field values remain ingestible, terminal runs are sealed at the database boundary, cursor advancement has one atomic finalizer, durable audit paths are canonicalized, and exact channel values remain whitespace-distinct.
++- Recorded specification version 1.0.2 as a review-verified technical correction based on the official amoCRM Events API. It is explicitly **not** recorded as a new project-owner approval.
+ - Preserved the read-only boundary: no production HTTP/OAuth/Google code changed, both external switches remain disabled, and all evidence used synthetic local fixtures.
+ 
+ ## Files
+ 
+ - `.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-5-report.md`
+ - `supabase/migrations/0005_raw_sync.sql`
++- `SPEC.md`
++- `METRICS_CATALOG.md`
++- `docs/spec-first/APPROVALS.md`
++- `docs/superpowers/plans/2026-09-12-02-amo-readonly-sync.md`
++- `docs/superpowers/plans/2026-09-12-03-normalization-metrics.md`
+ - `packages/db/src/sync-runs.ts`
+ - `packages/db/src/raw-amo.ts`
+ - `packages/db/src/raw-amo.integration.test.ts`
+ - `packages/db/src/index.ts`
+ - `packages/integrations/src/amo/schemas.ts`
+ - `packages/integrations/src/amo/schemas.test.ts`
+ - `packages/integrations/src/index.ts`
+ - `apps/web/src/app/api/config/channel-values/route.ts`
+ - `apps/web/src/app/api/config/config.integration.test.ts`
+ - `tests/security/rls.security.test.ts`
+ 
+ ## Data and transaction guarantees
+ 
+ - `sync_runs` pins a unique trace ID, one connection, one immutable configuration version, kind, terminal outcome, safe counters/error fields, checksum, and timestamps.
+ - `sync_pages` stores only run, stream, positive page number, non-negative item count, SHA-256, and receive time. It stores no URL, query value, request body, or duplicate raw payload.
+-- Raw objects are unique per `(sync_run_id, entity_type, external_id)`; events are unique per `(account_id, amo_event_id)` across repeated runs; quarantine rows are unique per run/stream/page/hash.
++- Raw objects are unique per `(sync_run_id, entity_type, external_id)`; events are unique per `(account_id, amo_event_id)` across repeated runs; quarantine rows are unique per run/stream/page/hash. Event IDs and cursor external IDs are preserved as opaque case-sensitive strings bounded to 1–128 characters, with no numeric conversion or inferred slug grammar.
+ - Replaying identical pages/entities is a no-op. Reusing a page or event identity with a different hash raises `E_CONFLICT`, and the page transaction rolls back rather than mixing versions.
+-- `finishSyncRun` row-locks the running run and writes its terminal outcome and successful cursor updates in one transaction. Partial and failed outcomes retain diagnostics but never advance cursors.
+-- `getRawChannelValues` considers only successful runs, selects the latest successful raw snapshot per lead, counts each exact value once per lead, ignores malformed/non-scalar/empty values, and returns deterministic count/value ordering.
++- Every page/object/event/quarantine/audit insert linked to a run acquires a database key-share lock and requires that run to remain `running`. `app.finish_sync_run` takes the conflicting row lock, writes the terminal outcome, and advances successful cursors atomically, so an append cannot straddle the terminal seal in either lock order.
++- `service_worker` has no direct run-update or cursor-write privilege; the security-definer finalizer is the sole scoped cursor-advancement path. Partial and failed outcomes retain diagnostics but cannot carry cursor updates.
++- A database trigger maps audit paths to a closed allowlist of structural paths, replaces numeric lead/pipeline IDs with `:id`, and stores every unexpected, query-bearing, or free-text path as `/denied`.
++- `getRawChannelValues` considers only successful runs, selects the latest successful raw snapshot per lead, counts each exact scalar value once per lead, ignores malformed/non-scalar/empty-string values, preserves leading/trailing whitespace, and returns deterministic count/value ordering.
+ 
+ ## Access and retention boundary
+ 
+ - RLS is enabled on every new table; anonymous access remains absent.
+ - Admin/head can read safe run/page/audit evidence. Only admin can read raw objects, events, and quarantine through authenticated RLS. Managers see no rows. Authenticated users cannot read durable cursors or write journal tables.
+-- `service_worker` can insert/read journal data, update only terminal run fields/counters and cursor values, and cannot rewrite a run's pinned trace/connection/config identity.
++- `service_worker` can create only a default-`running` run, insert/read journal data, and call the atomic finalizer. It cannot directly update any run field, create a forged terminal run, or insert/update a cursor.
+ - Neither `service_worker` nor a user-facing role has raw `UPDATE` or `DELETE`. This is the retention boundary: Task 6's separately reviewed 90-day retention operation must preserve hashes and normalized history before receiving any deletion path; ordinary sync credentials cannot delete raw evidence.
+ 
+ ## TDD evidence
+ 
+ ### RED
+ 
+ 1. New response-schema tests failed because `packages/integrations/src/amo/schemas.ts` did not exist.
+ 2. New raw-journal integration tests failed because `raw-amo.ts` and `sync-runs.ts` did not exist.
+ 3. The pinned-run-identity test failed because the interrupted migration granted whole-table `UPDATE` to `service_worker` (`promise resolved "[]" instead of rejecting`).
+ 4. The channel-values route test failed with `{ configVersion: 1, values: [] }` despite three successful raw lead fixtures.
+ 5. The first full unit run exposed missing teardown in the new RLS suite: retained synthetic config rows caused 15 OAuth cleanup FK failures. Symmetric teardown fixed the isolation defect.
++6. Fix-round opaque-ID tests failed against the inherited alphanumeric slug restriction for a bounded string such as `event:01/ABC.2`; removing the inferred grammar while preserving the 1–128 character bound made the schema, repository, cursor, and database contracts truly opaque.
+ 
+ ### GREEN
+ 
+ - Repository/worker Node tests: 12/12 passed.
+-- Unit: 80/80 passed across 14 files, including 4 new synchronization response-schema tests.
+-- Integration: 52/52 passed across 6 files, including 7 new raw-journal repository tests and the raw-backed channel-values route test.
+-- Security: 17/17 passed across RLS and safe-log suites, including admin/head/manager raw journal visibility and direct-write denial.
++- Unit: 86/86 passed across 14 files, including 10 synchronization response-schema cases.
++- Integration: 61/61 passed across 6 files, including 16 raw-journal repository cases and the raw-backed channel-values route test.
++- Security: 18/18 passed across RLS and safe-log suites, including admin/head/manager/anonymous raw-event visibility boundaries and finalizer/direct-write denial.
+ - Contracts: command exited 0 with `--passWithNoTests`; no contract files exist yet.
+ - Local Supabase reset applied migrations `0001` through `0005` successfully on the configured PostgreSQL 17 stack.
+ - Lint, TypeScript checks, production build, tracked-secret scan, and `git diff --check` all exited 0.
++- Focused red/green verification: response schemas 10/10 and raw journal 16/16 passed after the final opaque-ID correction and a fresh database reset.
+ 
+ ## Final verification commands
+ 
+ All package commands ran with Node `v22.23.2` and pnpm `10.34.5`:
+ 
+ ```text
+ supabase db reset
+ pnpm lint
+ pnpm typecheck
+ pnpm test
+@@ -72,12 +83,13 @@ pnpm test:contracts
+ pnpm test:integration
+ pnpm test:security
+ pnpm build
+ pnpm check:secrets
+ git diff --check
+ ```
+ 
+ ## Self-review and follow-up boundary
+ 
+ - No live amoCRM host was called, no token or credential was read, no OAuth setting changed, no Google API was used, and the protected original spreadsheet was untouched.
++- The only external lookup was the public official amoCRM developer documentation used to verify that Events API `id` is a string; no account endpoint, OAuth flow, or business-data API was contacted.
+ - The migration deliberately does not grant raw deletion to the normal worker. The retention job, watchdog, pagination/retry orchestration, schedules, sync APIs, and sync screens remain Task 6 ownership.
+ - Response schemas are raw-ingestion contracts, not normalized business models. They preserve additional upstream keys so later normalization can be replayed without changing the journal.
+diff --git a/METRICS_CATALOG.md b/METRICS_CATALOG.md
+index bee2f49..ace8207 100644
+--- a/METRICS_CATALOG.md
++++ b/METRICS_CATALOG.md
+@@ -37,20 +37,21 @@ ID воронки и этапов не принимаются по скринш
+ 
+ Следствие: исторический день может корректно измениться после более позднего движения сделки по воронке. Время фактического события сохраняется и доступно в drill-down, но не определяет строку ежедневного отчёта.
+ 
+ ## 3. Единица учёта и дедупликация
+ 
+ - Одна сделка amoCRM определяется парой `(amo_account_id, amo_lead_id)`.
+ - Одна заявка на сделку учитывается не более одного раза.
+ - Одна оплата на сделку учитывается не более одного раза.
+ - Повторный вход в тот же этап не создаёт вторую заявку или оплату.
+ - Повторное получение одного события определяется уникальным `(amo_account_id, amo_event_id)` и не меняет итог.
++- `amo_event_id` хранится как непрозрачная ограниченная строка Events API amoCRM (например, `01pz58t6p04ymgsgfbmfyfy1mf`) без числового преобразования; это не меняет составной ключ дедупликации.
+ - Повторная полная синхронизация того же состояния обязана вернуть те же агрегаты.
+ 
+ ## 4. Базовые показатели
+ 
+ ### 4.1 Лиды
+ 
+ `leads_created = COUNT(DISTINCT amo_lead_id)` для сделок, у которых `created_date` попадает в выбранный диапазон.
+ 
+ Сделка учитывается независимо от текущего этапа, если она принадлежит целевой воронке и не помечена подтверждённым исключающим правилом.
+ 
+diff --git a/SPEC.md b/SPEC.md
+index 3c3d022..a6270aa 100644
+--- a/SPEC.md
++++ b/SPEC.md
+@@ -1,18 +1,22 @@
+ # SPEC.md — техническая спецификация дашборда РЕАЛ ДВА
+ 
+ > Слой 2 по Spec-First Methodology.
+ >
+-> Версия: 1.0.1. Дата: 2026-09-12. Статус: утверждена заказчиком 2026-09-12.
++> Версия: 1.0.2. Дата: 2026-09-15. Статус: базовая спецификация утверждена заказчиком 2026-09-12; техническая коррекция 1.0.2 проверена по замечанию review 2026-09-15 без нового утверждения заказчиком.
+ >
+ > Техническое уточнение 1.0.1: в M4.2 добавлено хранилище quarantine, уже требовавшееся сценарием M4.6; бизнес-правила не изменены.
+ >
++> Техническая коррекция 1.0.2: `amo_event_id` и внешний ID event-cursor являются ограниченными строками, как требует официальный Events API amoCRM (`id: string`, пример `01pz58t6p04ymgsgfbmfyfy1mf`). Формулы и ключ дедупликации `(account_id, amo_event_id)` не изменены.
++>
++> Локальный ingestion-контракт трактует event/cursor ID как непрозрачные строки длиной 1–128 символов, сохраняет значение и регистр без преобразования. Этот защитный предел приложения не заявляется как лимит amoCRM.
++>
+ > Нормативные приложения: `METRICS_CATALOG.md` и `SECURITY_READ_ONLY.md`.
+ 
+ ---
+ 
+ ## 0. Глобальные контракты
+ 
+ ### 0.1 Цель MVP
+ 
+ MVP автоматически читает одну воронку amoCRM, строит ежедневные показатели по дате создания лида, показывает их в закрытом веб-дашборде и после теневой приёмки публикует только в отдельную копию текущей Google-таблицы.
+ 
+@@ -473,21 +477,21 @@ create table sync_runs (
+   checksum text,
+   created_by uuid references app_users(id),
+   check ((status = 'running' and finished_at is null) or
+          (status <> 'running' and finished_at is not null))
+ );
+ 
+ create table sync_cursors (
+   connection_id uuid not null references amo_connections(id),
+   stream text not null check (stream in ('leads','events','users','metadata')),
+   cursor_time timestamptz,
+-  cursor_external_id bigint,
++  cursor_external_id text,
+   last_successful_run_id uuid references sync_runs(id),
+   updated_at timestamptz not null default now(),
+   primary key (connection_id, stream)
+ );
+ 
+ create type raw_entity_type as enum ('account', 'pipeline', 'status', 'user', 'lead');
+ 
+ create table raw_amo_objects (
+   id uuid primary key default gen_random_uuid(),
+   sync_run_id uuid not null references sync_runs(id),
+@@ -498,21 +502,21 @@ create table raw_amo_objects (
+   payload jsonb not null,
+   payload_sha256 text not null,
+   received_at timestamptz not null default now(),
+   unique (sync_run_id, entity_type, external_id)
+ );
+ 
+ create table raw_amo_events (
+   id uuid primary key default gen_random_uuid(),
+   sync_run_id uuid not null references sync_runs(id),
+   account_id bigint not null,
+-  amo_event_id bigint not null,
++  amo_event_id text not null,
+   amo_lead_id bigint,
+   event_type text not null,
+   event_at timestamptz not null,
+   payload jsonb not null,
+   payload_sha256 text not null,
+   received_at timestamptz not null default now(),
+   unique (account_id, amo_event_id)
+ );
+ 
+ create table raw_amo_quarantine (
+@@ -542,21 +546,21 @@ create table amo_api_audit (
+ ```
+ 
+ Индексы:
+ 
+ - `raw_amo_objects(entity_type, external_id, received_at desc)`;
+ - `raw_amo_events(amo_lead_id, event_at, amo_event_id)`;
+ - `raw_amo_quarantine(sync_run_id, stream, page_number)`;
+ - `sync_runs(status, started_at desc)`;
+ - `amo_api_audit(sync_run_id, created_at)`.
+ 
+-Raw payload хранится 90 дней, затем удаляется утверждённой retention job; hashes и нормализованная история сохраняются. Append-only обеспечивается отсутствием UPDATE/DELETE policies у application roles.
++`amo_event_id` — непрозрачная ограниченная строка из Events API; числовое преобразование запрещено. Raw payload хранится 90 дней, затем удаляется утверждённой retention job; hashes и нормализованная история сохраняются. Append-only обеспечивается отсутствием UPDATE/DELETE policies у application roles, проверкой `running` при каждой вставке и единственной атомарной DB-функцией завершения run/cursor advancement. `normalized_path` до durable insert сводится к allowlisted структурному пути с `:id` либо `/denied`; query, body, свободный текст и динамические ID не сохраняются.
+ 
+ ### M4.3 API и расписание
+ 
+ Внутренние worker-команды:
+ 
+ - `runSync('initial_backfill')` — все сделки целевой воронки и доступная история событий;
+ - `runSync('incremental')` — каждые 5 минут, события и сделки с overlap 10 минут;
+ - `runSync('nightly_reconciliation')` — ежедневно в 02:30 `Europe/Moscow`, полный проход сделок;
+ - `runSync('manual')` — по запросу admin, логика идентична scheduled run.
+ 
+@@ -653,34 +657,34 @@ create table leads (
+   normalization_config_id uuid not null references pipeline_configs(id),
+   amo_url text not null,
+   is_deleted boolean not null default false,
+   normalized_at timestamptz not null default now(),
+   unique (account_id, amo_lead_id)
+ );
+ 
+ create table lead_stage_events (
+   id uuid primary key default gen_random_uuid(),
+   account_id bigint not null,
+-  amo_event_id bigint not null,
++  amo_event_id text not null,
+   amo_lead_id bigint not null,
+   from_status_id bigint,
+   to_status_id bigint not null,
+   responsible_user_id bigint,
+   occurred_at timestamptz not null,
+   unique (account_id, amo_event_id),
+   foreign key (account_id, amo_lead_id) references leads(account_id, amo_lead_id)
+ );
+ 
+ create table lead_responsible_events (
+   id uuid primary key default gen_random_uuid(),
+   account_id bigint not null,
+-  amo_event_id bigint not null,
++  amo_event_id text not null,
+   amo_lead_id bigint not null,
+   from_user_id bigint,
+   to_user_id bigint,
+   occurred_at timestamptz not null,
+   unique (account_id, amo_event_id),
+   foreign key (account_id, amo_lead_id) references leads(account_id, amo_lead_id)
+ );
+ 
+ create table lead_milestones (
+   account_id bigint not null,
+diff --git a/apps/web/src/app/api/config/config.integration.test.ts b/apps/web/src/app/api/config/config.integration.test.ts
+index 05ebec7..b89c8ea 100644
+--- a/apps/web/src/app/api/config/config.integration.test.ts
++++ b/apps/web/src/app/api/config/config.integration.test.ts
+@@ -877,24 +877,24 @@ describe("pipeline configuration routes", () => {
+       }),
+     );
+     const [binding] = await adminDb<{ connection_id: string; config_id: string }[]>`
+       select amo_connection_id as connection_id, id as config_id
+       from public.pipeline_configs
+       where is_active
+     `;
+     if (!binding) throw new Error("active configuration fixture is missing");
+     const [run] = await adminDb<{ id: string }[]>`
+       insert into public.sync_runs (
+-        trace_id, connection_id, config_id, kind, status, finished_at
++        trace_id, connection_id, config_id, kind
+       ) values (
+         'trace-channel-values', ${binding.connection_id}, ${binding.config_id},
+-        'incremental', 'success', '2026-09-15T09:01:00.000Z'
++        'incremental'
+       )
+       returning id
+     `;
+     if (!run) throw new Error("successful sync fixture is missing");
+     await adminDb`
+       insert into public.raw_amo_objects (
+         sync_run_id, account_id, entity_type, external_id,
+         source_updated_at, payload, payload_sha256
+       ) values
+         (
+@@ -906,20 +906,27 @@ describe("pipeline configuration routes", () => {
+           ${run.id}, 4242, 'lead', 7002, '2026-09-15T08:00:00.000Z',
+           ${adminDb.json({ id: 7002, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] })},
+           ${"b".repeat(64)}
+         ),
+         (
+           ${run.id}, 4242, 'lead', 7003, '2026-09-15T08:00:00.000Z',
+           ${adminDb.json({ id: 7003, custom_fields_values: [{ field_id: 77, values: [{ value: "WhatsApp" }] }] })},
+           ${"c".repeat(64)}
+         )
+     `;
++    await adminDb`
++      select app.finish_sync_run(
++        ${run.id}::uuid, 'success'::public.sync_status,
++        '2026-09-15T09:01:00.000Z'::timestamptz,
++        1, 3, 0, 0, 0, null, null, null, null, '{}'::jsonb
++      )
++    `;
+ 
+     const response = await channelValuesRoute(
+       new Request("https://dashboard.example.test/api/config/channel-values"),
+     );
+     const body = (await response.json()) as {
+       data: { configVersion: number; values: Array<{ value: string; count: number }> };
+     };
+ 
+     expect(response.status).toBe(200);
+     expect(body.data).toEqual({
+diff --git a/docs/spec-first/APPROVALS.md b/docs/spec-first/APPROVALS.md
+index 8a11cf0..a580ed7 100644
+--- a/docs/spec-first/APPROVALS.md
++++ b/docs/spec-first/APPROVALS.md
+@@ -1,8 +1,9 @@
+ # Specification approvals
+ 
+ | Date | Artifact | Version | Decision | Evidence |
+ |---|---|---:|---|---|
+ | 2026-09-12 | `PROJECT_IDEA.md`, `SPEC.md`, `METRICS_CATALOG.md`, `SECURITY_READ_ONLY.md` | 1.0 | approved by the project owner | explicit message «утверждаю» in the project task |
+ | 2026-09-12 | `SPEC.md` quarantine storage clarification | 1.0.1 | non-behavioral technical clarification | M4.6 already required quarantine; added its missing table contract |
++| 2026-09-15 | `SPEC.md` M4/M5 and `METRICS_CATALOG.md` event identity correction | 1.0.2 | review-verified technical correction; no new project-owner approval | [official amoCRM Events API](https://www.amocrm.ru/developers/content/crm_platform/events-and-notes) declares `id` as string and publishes `01pz58t6p04ymgsgfbmfyfy1mf`; composite cross-account deduplication and business rules are unchanged |
+ 
+ Approval of specifications does not authorize production credentials, OAuth installation, server deployment, Google sharing, switch enablement, or publication. Each operational action remains subject to its plan gate and explicit owner action.
+diff --git a/docs/superpowers/plans/2026-09-12-02-amo-readonly-sync.md b/docs/superpowers/plans/2026-09-12-02-amo-readonly-sync.md
+index ddf54b4..4b9b741 100644
+--- a/docs/superpowers/plans/2026-09-12-02-amo-readonly-sync.md
++++ b/docs/superpowers/plans/2026-09-12-02-amo-readonly-sync.md
+@@ -436,21 +436,21 @@ create table sync_runs (
+   checksum text,
+   created_by uuid references app_users(id),
+   check ((status = 'running' and finished_at is null) or
+          (status <> 'running' and finished_at is not null))
+ );
+ 
+ create table sync_cursors (
+   connection_id uuid not null references amo_connections(id),
+   stream text not null check (stream in ('leads','events','users','metadata')),
+   cursor_time timestamptz,
+-  cursor_external_id bigint,
++  cursor_external_id text,
+   last_successful_run_id uuid references sync_runs(id),
+   updated_at timestamptz not null default now(),
+   primary key (connection_id, stream)
+ );
+ 
+ create type raw_entity_type as enum ('account', 'pipeline', 'status', 'user', 'lead');
+ 
+ create table raw_amo_objects (
+   id uuid primary key default gen_random_uuid(),
+   sync_run_id uuid not null references sync_runs(id),
+@@ -461,21 +461,21 @@ create table raw_amo_objects (
+   payload jsonb not null,
+   payload_sha256 text not null,
+   received_at timestamptz not null default now(),
+   unique (sync_run_id, entity_type, external_id)
+ );
+ 
+ create table raw_amo_events (
+   id uuid primary key default gen_random_uuid(),
+   sync_run_id uuid not null references sync_runs(id),
+   account_id bigint not null,
+-  amo_event_id bigint not null,
++  amo_event_id text not null,
+   amo_lead_id bigint,
+   event_type text not null,
+   event_at timestamptz not null,
+   payload jsonb not null,
+   payload_sha256 text not null,
+   received_at timestamptz not null default now(),
+   unique (account_id, amo_event_id)
+ );
+ 
+ create table raw_amo_quarantine (
+diff --git a/docs/superpowers/plans/2026-09-12-03-normalization-metrics.md b/docs/superpowers/plans/2026-09-12-03-normalization-metrics.md
+index fb6173a..c2da146 100644
+--- a/docs/superpowers/plans/2026-09-12-03-normalization-metrics.md
++++ b/docs/superpowers/plans/2026-09-12-03-normalization-metrics.md
+@@ -34,21 +34,25 @@
+ 
+ **Interfaces:**
+ - Consumes: successful `sync_run_id`, active `config_id`, and parsed raw objects/events.
+ - Produces: repositories for `amo_users`, `pipeline_statuses`, `leads`, `lead_stage_events`, `lead_responsible_events`, `lead_milestones`, and `data_quality_issues`.
+ 
+ - [ ] **Step 1: Write failing database invariant tests**
+ 
+ ```ts
+ it("rejects a stage event for a lead in another amo account", async () => {
+   await seedNormalizedLead({ accountId: 1, amoLeadId: 55 });
+-  await expect(insertStageEvent({ accountId: 2, amoLeadId: 55, amoEventId: 1 }))
++  await expect(insertStageEvent({
++    accountId: 2,
++    amoLeadId: 55,
++    amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
++  }))
+     .rejects.toThrow(/foreign key/i);
+ });
+ 
+ it("allows only one open quality issue per lead and code", async () => {
+   await quality.open(issueFixture);
+   await quality.open(issueFixture);
+   expect(await quality.countOpen(issueFixture.leadKey, issueFixture.code)).toBe(1);
+ });
+ ```
+ 
+@@ -101,34 +105,34 @@ create table leads (
+   normalization_config_id uuid not null references pipeline_configs(id),
+   amo_url text not null,
+   is_deleted boolean not null default false,
+   normalized_at timestamptz not null default now(),
+   unique (account_id, amo_lead_id)
+ );
+ 
+ create table lead_stage_events (
+   id uuid primary key default gen_random_uuid(),
+   account_id bigint not null,
+-  amo_event_id bigint not null,
++  amo_event_id text not null,
+   amo_lead_id bigint not null,
+   from_status_id bigint,
+   to_status_id bigint not null,
+   responsible_user_id bigint,
+   occurred_at timestamptz not null,
+   unique (account_id, amo_event_id),
+   foreign key (account_id, amo_lead_id) references leads(account_id, amo_lead_id)
+ );
+ 
+ create table lead_responsible_events (
+   id uuid primary key default gen_random_uuid(),
+   account_id bigint not null,
+-  amo_event_id bigint not null,
++  amo_event_id text not null,
+   amo_lead_id bigint not null,
+   from_user_id bigint,
+   to_user_id bigint,
+   occurred_at timestamptz not null,
+   unique (account_id, amo_event_id),
+   foreign key (account_id, amo_lead_id) references leads(account_id, amo_lead_id)
+ );
+ 
+ create table lead_milestones (
+   account_id bigint not null,
+@@ -295,43 +299,43 @@ git commit -m "feat: normalize REAL2 lead snapshots deterministically"
+ 
+ **Interfaces:**
+ - Consumes: one successful sync run, previous normalized lead, ordered raw events, application/won status IDs.
+ - Produces: `buildLeadHistory(input): LeadHistoryResult` and `normalizeSyncRun(syncRunId): NormalizeRunResult`.
+ 
+ - [ ] **Step 1: Write failing milestone-order tests**
+ 
+ ```ts
+ it("uses event ID as a stable tie-breaker and keeps first application/won times", () => {
+   const events = [
+-    statusEvent(20, "2026-09-07T09:00:00Z", applicationStatusId),
+-    statusEvent(10, "2026-09-07T09:00:00Z", earlierStatusId),
+-    statusEvent(30, "2026-09-10T10:00:00Z", wonStatusId),
+-    statusEvent(40, "2026-09-11T10:00:00Z", wonStatusId),
++    statusEvent("evt-20", "2026-09-07T09:00:00Z", applicationStatusId),
++    statusEvent("evt-10", "2026-09-07T09:00:00Z", earlierStatusId),
++    statusEvent("evt-30", "2026-09-10T10:00:00Z", wonStatusId),
++    statusEvent("evt-40", "2026-09-11T10:00:00Z", wonStatusId),
+   ];
+   const result = buildLeadHistory({ events, applicationStatusId, wonStatusId });
+   expect(result.milestones.applicationAt).toBe("2026-09-07T09:00:00.000Z");
+   expect(result.milestones.wonAt).toBe("2026-09-10T10:00:00.000Z");
+-  expect(result.orderedEventIds).toEqual([10, 20, 30, 40]);
++  expect(result.orderedEventIds).toEqual(["evt-10", "evt-20", "evt-30", "evt-40"]);
+ });
+ ```
+ 
+ - [ ] **Step 2: Run the focused test and verify missing history builder**
+ 
+ Run: `pnpm vitest run packages/domain/src/leads/build-history.test.ts`
+ 
+ Expected: FAIL because `buildLeadHistory` does not exist.
+ 
+ - [ ] **Step 3: Implement pure history derivation and transactional persistence**
+ 
+ ```ts
+ const ordered = [...events].sort((a, b) =>
+-  a.occurredAt.localeCompare(b.occurredAt) || a.amoEventId - b.amoEventId,
++  a.occurredAt.localeCompare(b.occurredAt) || a.amoEventId.localeCompare(b.amoEventId),
+ );
+ 
+ const applicationEvent = ordered.find((event) => event.kind === "stage" && event.toStatusId === applicationStatusId);
+ const wonEvent = ordered.find((event) => event.kind === "stage" && event.toStatusId === wonStatusId);
+ ```
+ 
+ Persist stable `lead_stage_events` and `lead_responsible_events`; calculate closed stage durations from adjacent events and current stage age against the snapshot timestamp without adding a mutable interval table. Capture responsible IDs at creation, first application, first won, and current snapshot. `normalizeSyncRun` upserts current normalized rows and replaces derived milestone rows for affected leads in one transaction; it never edits raw data.
+ 
+ - [ ] **Step 4: Verify repeated events, missing pairs, reassignment, and rollback**
+ 
+diff --git a/packages/db/src/raw-amo.integration.test.ts b/packages/db/src/raw-amo.integration.test.ts
+index 54fbaa9..b4a3a84 100644
+--- a/packages/db/src/raw-amo.integration.test.ts
++++ b/packages/db/src/raw-amo.integration.test.ts
+@@ -136,26 +136,26 @@ describe("append-only raw amoCRM journal", () => {
+         account_id: 4242,
+         updated_at: 1_757_926_740,
+         custom_fields_values: [
+           { field_id: 77, values: [{ value: "Synthetic source" }] },
+         ],
+       },
+       payloadSha256: hashA,
+     };
+     const event = {
+       accountId: 4242,
+-      amoEventId: 9001,
++      amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
+       amoLeadId: 7001,
+       eventType: "lead_status_changed",
+       eventAt: new Date("2026-09-15T08:59:30.000Z"),
+       payload: {
+-        id: 9001,
++        id: "01pz58t6p04ymgsgfbmfyfy1mf",
+         account_id: 4242,
+         entity_id: 7001,
+         type: "lead_status_changed",
+         created_at: 1_757_926_770,
+       },
+       payloadSha256: hashB,
+     };
+ 
+     await appendRawPage(workerDb, {
+       syncRunId: run.id,
+@@ -184,86 +184,162 @@ describe("append-only raw amoCRM journal", () => {
+           (select count(*)::integer from public.raw_amo_objects) as objects,
+           (select count(*)::integer from public.raw_amo_events) as events,
+           (select count(*)::integer from public.sync_pages) as pages
+       `,
+     ).resolves.toEqual([{ objects: 1, events: 1, pages: 1 }]);
+ 
+     await expect(
+       workerDb`
+         update public.raw_amo_events
+         set event_type = 'changed'
+-        where amo_event_id = 9001
++        where amo_event_id = '01pz58t6p04ymgsgfbmfyfy1mf'
+       `,
+     ).rejects.toMatchObject({ code: "42501" });
+     await expect(
+       workerDb`
+         delete from public.raw_amo_objects where external_id = 7001
+       `,
+     ).rejects.toMatchObject({ code: "42501" });
+   });
+ 
+-  it("rejects a changed payload that reuses an existing event identity or page number", async () => {
++  it("rejects event hash conflicts on a fresh page and page conflicts independently", async () => {
+     const fixture = await seedFixture();
+     const run = await startFixtureRun(workerDb, fixture, "trace-conflict");
+     const event = {
+       accountId: 4242,
+-      amoEventId: 9001,
++      amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
+       amoLeadId: 7001,
+       eventType: "lead_status_changed",
+       eventAt: receivedAt,
+-      payload: { id: 9001, synthetic: "first" },
++      payload: { id: "01pz58t6p04ymgsgfbmfyfy1mf", synthetic: "first" },
+       payloadSha256: hashA,
+     };
+ 
+     await appendRawPage(workerDb, {
+       syncRunId: run.id,
+       stream: "events",
+       pageNumber: 1,
+       itemCount: 1,
+       payloadSha256: hashA,
+       objects: [],
+       events: [event],
+       receivedAt,
+     });
+ 
+     await expect(
+       appendRawPage(workerDb, {
+         syncRunId: run.id,
+         stream: "events",
+-        pageNumber: 1,
++        pageNumber: 2,
+         itemCount: 1,
+         payloadSha256: hashB,
+         objects: [],
+-        events: [{ ...event, payload: { id: 9001, synthetic: "changed" }, payloadSha256: hashB }],
++        events: [{
++          ...event,
++          payload: { id: "01pz58t6p04ymgsgfbmfyfy1mf", synthetic: "changed" },
++          payloadSha256: hashB,
++        }],
+         receivedAt,
+       }),
+     ).rejects.toMatchObject({ code: "E_CONFLICT" });
+ 
+     await expect(
+-      adminDb<{ count: number }[]>`select count(*)::integer as count from public.raw_amo_events`,
+-    ).resolves.toEqual([{ count: 1 }]);
++      adminDb<{ events: number; pages: number }[]>`
++        select
++          (select count(*)::integer from public.raw_amo_events) as events,
++          (select count(*)::integer from public.sync_pages) as pages
++      `,
++    ).resolves.toEqual([{ events: 1, pages: 1 }]);
++
++    await expect(
++      appendRawPage(workerDb, {
++        syncRunId: run.id,
++        stream: "events",
++        pageNumber: 1,
++        itemCount: 1,
++        payloadSha256: hashB,
++        objects: [],
++        events: [],
++      }),
++    ).rejects.toMatchObject({ code: "E_CONFLICT" });
++  });
++
++  it("deduplicates string event IDs across runs within an account, not across accounts", async () => {
++    const fixture = await seedFixture();
++    const first = await startFixtureRun(workerDb, fixture, "trace-event-account-1");
++    const event = {
++      accountId: 4242,
++      amoEventId: "event:01/ABC.2",
++      amoLeadId: 7001,
++      eventType: "lead_status_changed",
++      eventAt: receivedAt,
++      payload: { id: "event:01/ABC.2", synthetic: true },
++      payloadSha256: hashA,
++    };
++    await appendRawPage(workerDb, {
++      syncRunId: first.id,
++      stream: "events",
++      pageNumber: 1,
++      itemCount: 1,
++      payloadSha256: hashA,
++      objects: [],
++      events: [event],
++      receivedAt,
++    });
++    await finishSyncRun(workerDb, first.id, {
++      status: "success",
++      counts: { pagesRead: 1, leadsRead: 0, eventsRead: 1, usersRead: 0, retries: 0 },
++      nextCursors: {},
++    }, finishedAt);
++
++    const second = await startFixtureRun(workerDb, fixture, "trace-event-account-2");
++    await appendRawPage(workerDb, {
++      syncRunId: second.id,
++      stream: "events",
++      pageNumber: 1,
++      itemCount: 2,
++      payloadSha256: hashB,
++      objects: [],
++      events: [event, { ...event, accountId: 4343 }],
++      receivedAt: new Date("2026-09-15T09:02:00.000Z"),
++    });
++
++    await expect(
++      adminDb<{ account_id: string; amo_event_id: string }[]>`
++        select account_id, amo_event_id
++        from public.raw_amo_events
++        order by account_id
++      `,
++    ).resolves.toEqual([
++      { account_id: "4242", amo_event_id: "event:01/ABC.2" },
++      { account_id: "4343", amo_event_id: "event:01/ABC.2" },
++    ]);
+   });
+ 
+   it("advances cursors only in the same successful finish transaction", async () => {
+     const fixture = await seedFixture();
+     const first = await startFixtureRun(workerDb, fixture, "trace-success");
+ 
+     await finishSyncRun(
+       workerDb,
+       first.id,
+       {
+         status: "success",
+         counts: { pagesRead: 3, leadsRead: 4, eventsRead: 5, usersRead: 6, retries: 1 },
+         nextCursors: {
++          events: {
++            cursorTime: new Date("2026-09-15T08:50:00.000Z"),
++            cursorExternalId: "event:01/ABC.2",
++          },
+           leads: {
+             cursorTime: new Date("2026-09-15T08:50:00.000Z"),
+-            cursorExternalId: 7001,
++            cursorExternalId: "7001",
+           },
+         },
+       },
+       finishedAt,
+     );
+ 
+     const partial = await startFixtureRun(workerDb, fixture, "trace-partial");
+     await finishSyncRun(
+       workerDb,
+       partial.id,
+@@ -276,57 +352,261 @@ describe("append-only raw amoCRM journal", () => {
+       new Date("2026-09-15T09:02:00.000Z"),
+     );
+ 
+     const cursors = await adminDb<{
+       stream: string;
+       cursor_time: Date;
+       cursor_external_id: string;
+       last_successful_run_id: string;
+     }[]>`
+       select stream, cursor_time, cursor_external_id, last_successful_run_id
+-      from public.sync_cursors
++      from public.sync_cursors order by stream
+     `;
+     expect(cursors).toEqual([
++      {
++        stream: "events",
++        cursor_time: new Date("2026-09-15T08:50:00.000Z"),
++        cursor_external_id: "event:01/ABC.2",
++        last_successful_run_id: first.id,
++      },
+       {
+         stream: "leads",
+         cursor_time: new Date("2026-09-15T08:50:00.000Z"),
+         cursor_external_id: "7001",
+         last_successful_run_id: first.id,
+       },
+     ]);
+     await expect(
+       adminDb<{ status: string; error_summary: string }[]>`
+         select status, error_summary from public.sync_runs where id = ${partial.id}
+       `,
+     ).resolves.toEqual([
+       { status: "partial", error_summary: "Upstream response was incomplete" },
+     ]);
+   });
+ 
+-  it("does not let the worker rewrite a run's pinned identity", async () => {
++  it("does not let the worker rewrite any run fields or advance cursors directly", async () => {
+     const fixture = await seedFixture();
+     const run = await startFixtureRun(workerDb, fixture, "trace-pinned");
+ 
+     await expect(
+       workerDb`
+         update public.sync_runs
+-        set trace_id = 'trace-rewritten'
++        set pages_read = 99
+         where id = ${run.id}
+       `,
+     ).rejects.toMatchObject({ code: "42501" });
++    await expect(
++      workerDb`
++        insert into public.sync_cursors (
++          connection_id, stream, cursor_external_id, last_successful_run_id
++        ) values (${fixture.connectionId}, 'events', '01pz-direct', ${run.id})
++      `,
++    ).rejects.toMatchObject({ code: "42501" });
++    await expect(
++      workerDb`
++        insert into public.sync_runs (
++          trace_id, connection_id, config_id, kind, status, finished_at,
++          pages_read
++        ) values (
++          'trace-forged-terminal', ${fixture.connectionId}, ${fixture.configId},
++          'incremental', 'success', ${finishedAt}, 99
++        )
++      `,
++    ).rejects.toMatchObject({ code: "42501" });
+     await expect(
+       adminDb<{ trace_id: string }[]>`
+         select trace_id from public.sync_runs where id = ${run.id}
+       `,
+     ).resolves.toEqual([{ trace_id: "trace-pinned" }]);
+   });
+ 
++  it.each(["", 9001, "x".repeat(129)])("rolls back a direct atomic finish for invalid cursor ID %s", async (invalidId) => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-invalid-cursor");
++
++    await expect(
++      workerDb`
++        select app.finish_sync_run(
++          ${run.id}::uuid,
++          'success'::public.sync_status,
++          ${finishedAt},
++          1, 1, 1, 1, 0,
++          null, null, null, null,
++          ${workerDb.json({ events: { cursor_time: null, cursor_external_id: invalidId } })}
++        )
++      `,
++    ).rejects.toMatchObject({ code: "22023" });
++
++    await expect(
++      adminDb<{ status: string; pages_read: number; cursors: number }[]>`
++        select status, pages_read,
++          (select count(*)::integer from public.sync_cursors) as cursors
++        from public.sync_runs
++        where id = ${run.id}
++      `,
++    ).resolves.toEqual([{ status: "running", pages_read: 0, cursors: 0 }]);
++  });
++
++  it.each(["success", "partial", "failed"] as const)("seals all journal writes after a run becomes %s", async (status) => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-terminal-seal");
++    await finishSyncRun(workerDb, run.id, {
++      status,
++      counts: { pagesRead: 0, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
++      nextCursors: {},
++      safeError: "Synthetic terminal outcome",
++    }, finishedAt);
++
++    await expect(workerDb`
++      update public.sync_runs set status = 'failed', pages_read = 99 where id = ${run.id}
++    `).rejects.toMatchObject({ code: "42501" });
++    await expect(workerDb`
++      update public.sync_cursors set cursor_external_id = 'forged'
++      where connection_id = ${fixture.connectionId}
++    `).rejects.toMatchObject({ code: "42501" });
++    await expect(finishSyncRun(workerDb, run.id, {
++      status: "success",
++      counts: { pagesRead: 99, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
++      nextCursors: { events: { cursorTime: receivedAt, cursorExternalId: "forged" } },
++    })).rejects.toMatchObject({ code: "E_CONFLICT" });
++    await expect(adminDb<{ status: string; pages_read: number; cursors: number }[]>`
++      select status, pages_read,
++        (select count(*)::integer from public.sync_cursors) as cursors
++      from public.sync_runs where id = ${run.id}
++    `).resolves.toEqual([{ status, pages_read: 0, cursors: 0 }]);
++
++    await expect(
++      appendRawPage(workerDb, {
++        syncRunId: run.id,
++        stream: "leads",
++        pageNumber: 1,
++        itemCount: 0,
++        payloadSha256: hashA,
++        objects: [],
++        events: [],
++        receivedAt,
++      }),
++    ).rejects.toMatchObject({ code: "23514" });
++    await expect(
++      workerDb`
++        insert into public.raw_amo_objects (
++          sync_run_id, account_id, entity_type, external_id,
++          payload, payload_sha256
++        ) values (
++          ${run.id}, 4242, 'lead', 7001,
++          ${workerDb.json({ id: 7001, synthetic: true })}, ${hashA}
++        )
++      `,
++    ).rejects.toMatchObject({ code: "23514" });
++    await expect(
++      workerDb`
++        insert into public.raw_amo_events (
++          sync_run_id, account_id, amo_event_id, amo_lead_id,
++          event_type, event_at, payload, payload_sha256
++        ) values (
++          ${run.id}, 4242, '01pz-terminal', 7001,
++          'lead_status_changed', ${receivedAt},
++          ${workerDb.json({ id: "01pz-terminal", synthetic: true })}, ${hashB}
++        )
++      `,
++    ).rejects.toMatchObject({ code: "23514" });
++    await expect(
++      workerDb`
++        insert into public.raw_amo_quarantine (
++          sync_run_id, stream, page_number, reason_code,
++          payload, payload_sha256
++        ) values (
++          ${run.id}, 'leads', 2, 'E_AMO_SCHEMA',
++          ${workerDb.json({ synthetic: true })}, ${hashB}
++        )
++      `,
++    ).rejects.toMatchObject({ code: "23514" });
++    await expect(
++      quarantineRawPage(workerDb, {
++        syncRunId: run.id,
++        stream: "leads",
++        pageNumber: 2,
++        reasonCode: "E_AMO_SCHEMA",
++        payload: { synthetic: true },
++        payloadSha256: hashB,
++        receivedAt,
++      }),
++    ).rejects.toMatchObject({ code: "23514" });
++    await expect(
++      appendAmoApiAudit(workerDb, {
++        syncRunId: run.id,
++        traceId: "trace-terminal-audit",
++        method: "GET",
++        normalizedPath: "/api/v4/leads",
++        responseStatus: 200,
++        durationMs: 1,
++        attempt: 1,
++        result: "success",
++      }),
++    ).rejects.toMatchObject({ code: "23514" });
++  });
++
++  it.each(["append", "finish"] as const)("serializes concurrent append/finalize when %s acquires the run lock first", async (firstOperation) => {
++    const fixture = await seedFixture();
++    const run = await startFixtureRun(workerDb, fixture, "trace-concurrent-seal");
++    const concurrentDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
++    const [connection] = await concurrentDb<{ pid: number }[]>`select pg_backend_pid() as pid`;
++    if (!connection) throw new Error("synthetic concurrent connection is missing");
++    const { pid } = connection;
++    let release!: () => void;
++    let ready!: () => void;
++    const held = new Promise<void>((resolve) => { release = resolve; });
++    const locked = new Promise<void>((resolve) => { ready = resolve; });
++    const finish = (db: Database) => finishSyncRun(db, run.id, {
++      status: "success",
++      counts: { pagesRead: 0, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
++      nextCursors: {},
++    });
++    const append = (db: Database) => appendAmoApiAudit(db, {
++      syncRunId: run.id,
++      traceId: "trace-concurrent-audit",
++      method: "GET",
++      normalizedPath: "/api/v4/leads",
++      durationMs: 1,
++      attempt: 1,
++      result: "success",
++    });
++    const first = workerDb.begin(async (transaction) => {
++      const tx = transaction as unknown as Database;
++      await (firstOperation === "append" ? append(tx) : finish(tx));
++      ready();
++      await held;
++    });
++    let second: Promise<unknown> | undefined;
++    try {
++      await locked;
++      second = (firstOperation === "append" ? finish(concurrentDb) : append(concurrentDb))
++        .then(() => ({ success: true }), (error: unknown) => error);
++      await expect.poll(async () => {
++        const [row] = await adminDb<{ blocked: boolean }[]>`
++          select cardinality(pg_blocking_pids(${pid})) > 0 as blocked
++        `;
++        return row?.blocked;
++      }, { timeout: 3000 }).toBe(true);
++      release();
++      await first;
++      expect(await second).toMatchObject(
++        firstOperation === "append" ? { success: true } : { code: "23514" },
++      );
++    } finally {
++      release();
++      await Promise.allSettled([first, ...(second ? [second] : [])]);
++      await closeDbClient(concurrentDb);
++    }
++  });
++
+   it("quarantines malformed payloads idempotently without changing the cursor", async () => {
+     const fixture = await seedFixture();
+     const run = await startFixtureRun(workerDb, fixture, "trace-quarantine");
+     const input = {
+       syncRunId: run.id,
+       stream: "leads" as const,
+       pageNumber: 3,
+       reasonCode: "E_AMO_SCHEMA",
+       payload: { unexpected: "synthetic malformed value" },
+       payloadSha256: hashA,
+@@ -338,99 +618,131 @@ describe("append-only raw amoCRM journal", () => {
+ 
+     await expect(
+       adminDb<{ quarantine: number; cursors: number }[]>`
+         select
+           (select count(*)::integer from public.raw_amo_quarantine) as quarantine,
+           (select count(*)::integer from public.sync_cursors) as cursors
+       `,
+     ).resolves.toEqual([{ quarantine: 1, cursors: 0 }]);
+   });
+ 
+-  it("persists only the safe audit shape and rejects query-bearing paths", async () => {
++  it("persists only the safe audit shape and canonicalizes dynamic or unsafe paths", async () => {
+     const fixture = await seedFixture();
+     const run = await startFixtureRun(workerDb, fixture, "trace-audit-run");
+ 
+     await appendAmoApiAudit(workerDb, {
+       syncRunId: run.id,
+       traceId: "trace-audit-entry",
+       method: "GET",
+       normalizedPath: "/api/v4/leads",
+       responseStatus: 200,
+       durationMs: 17,
+       attempt: 1,
+       result: "success",
+     });
++    await appendAmoApiAudit(workerDb, {
++      syncRunId: run.id,
++      traceId: "trace-dynamic-entry",
++      method: "GET",
++      normalizedPath: "/api/v4/leads/7001",
++      responseStatus: 200,
++      durationMs: 2,
++      attempt: 1,
++      result: "success",
++    });
+ 
+     const [row] = await adminDb<Record<string, unknown>[]>`
+-      select * from public.amo_api_audit
++      select * from public.amo_api_audit order by trace_id
+     `;
+     expect(Object.keys(row ?? {}).sort()).toEqual([
+       "attempt",
+       "created_at",
+       "duration_ms",
+       "id",
+       "method",
+       "normalized_path",
+       "response_status",
+       "result",
+       "sync_run_id",
+       "trace_id",
+     ]);
+     expect(JSON.stringify(row)).not.toContain("token");
+     expect(JSON.stringify(row)).not.toContain("page=2");
+ 
+-    await expect(
+-      workerDb`
++    await workerDb`
+         insert into public.amo_api_audit (
+           sync_run_id, trace_id, method, normalized_path,
+           response_status, duration_ms, attempt, result
+         ) values (
+-          ${run.id}, 'trace-unsafe', 'GET', '/api/v4/leads?page=2',
++          ${run.id}, 'trace-unsafe', 'GET', '/api/v4/leads/Maria@example.com?token=secret',
+           200, 1, 1, 'success'
+         )
++      `;
++
++    await expect(
++      adminDb<{ trace_id: string; normalized_path: string }[]>`
++        select trace_id, normalized_path
++        from public.amo_api_audit
++        order by trace_id
+       `,
+-    ).rejects.toMatchObject({ code: "23514" });
++    ).resolves.toEqual([
++      { trace_id: "trace-audit-entry", normalized_path: "/api/v4/leads" },
++      { trace_id: "trace-dynamic-entry", normalized_path: "/api/v4/leads/:id" },
++      { trace_id: "trace-unsafe", normalized_path: "/denied" },
++    ]);
++    const auditJson = JSON.stringify(
++      await adminDb`select normalized_path from public.amo_api_audit`,
++    );
++    expect(auditJson).not.toMatch(/Maria|token|secret|7001/);
+   });
+ 
+   it("counts exact source-field values from each lead's latest successful raw snapshot", async () => {
+     const fixture = await seedFixture();
+     const first = await startFixtureRun(workerDb, fixture, "trace-values-1");
+     await appendRawPage(workerDb, {
+       syncRunId: first.id,
+       stream: "leads",
+       pageNumber: 1,
+-      itemCount: 2,
++      itemCount: 3,
+       payloadSha256: hashA,
+       objects: [
+         {
+           accountId: 4242,
+           entityType: "lead",
+           externalId: 7001,
+           sourceUpdatedAt: new Date("2026-09-15T08:00:00.000Z"),
+           payload: { id: 7001, custom_fields_values: [{ field_id: 77, values: [{ value: "WhatsApp" }] }] },
+           payloadSha256: "1".repeat(64),
+         },
+         {
+           accountId: 4242,
+           entityType: "lead",
+           externalId: 7002,
+           sourceUpdatedAt: new Date("2026-09-15T08:00:00.000Z"),
+           payload: { id: 7002, custom_fields_values: [{ field_id: 77, values: [{ value: "Avito" }] }] },
+           payloadSha256: "2".repeat(64),
+         },
++        {
++          accountId: 4242,
++          entityType: "lead",
++          externalId: 7003,
++          sourceUpdatedAt: new Date("2026-09-15T08:00:00.000Z"),
++          payload: { id: 7003, custom_fields_values: [{ field_id: 77, values: [{ value: " Avito " }] }] },
++          payloadSha256: "4".repeat(64),
++        },
+       ],
+       events: [],
+       receivedAt,
+     });
+     await finishSyncRun(workerDb, first.id, {
+       status: "success",
+-      counts: { pagesRead: 1, leadsRead: 2, eventsRead: 0, usersRead: 0, retries: 0 },
++      counts: { pagesRead: 1, leadsRead: 3, eventsRead: 0, usersRead: 0, retries: 0 },
+       nextCursors: {},
+     }, finishedAt);
+ 
+     const second = await startFixtureRun(workerDb, fixture, "trace-values-2");
+     await appendRawPage(workerDb, {
+       syncRunId: second.id,
+       stream: "leads",
+       pageNumber: 1,
+       itemCount: 1,
+       payloadSha256: hashB,
+@@ -449,13 +761,16 @@ describe("append-only raw amoCRM journal", () => {
+       status: "success",
+       counts: { pagesRead: 1, leadsRead: 1, eventsRead: 0, usersRead: 0, retries: 0 },
+       nextCursors: {},
+     }, new Date("2026-09-15T09:04:00.000Z"));
+ 
+     await expect(
+       getRawChannelValues(adminDb, {
+         connectionId: fixture.connectionId,
+         sourceFieldId: 77,
+       }),
+-    ).resolves.toEqual([{ value: "Avito", count: 2 }]);
++    ).resolves.toEqual([
++      { value: "Avito", count: 2 },
++      { value: " Avito ", count: 1 },
++    ]);
+   });
+ });
+diff --git a/packages/db/src/raw-amo.ts b/packages/db/src/raw-amo.ts
+index 808c7cf..2a33ba8 100644
+--- a/packages/db/src/raw-amo.ts
++++ b/packages/db/src/raw-amo.ts
+@@ -10,21 +10,21 @@ export type RawAmoObjectInput = Readonly<{
+   accountId: number;
+   entityType: RawEntityType;
+   externalId: number;
+   sourceUpdatedAt?: Date | null;
+   payload: JSONValue;
+   payloadSha256: string;
+ }>;
+ 
+ export type RawAmoEventInput = Readonly<{
+   accountId: number;
+-  amoEventId: number;
++  amoEventId: string;
+   amoLeadId?: number | null;
+   eventType: string;
+   eventAt: Date;
+   payload: JSONValue;
+   payloadSha256: string;
+ }>;
+ 
+ export type AppendRawPageInput = Readonly<{
+   syncRunId: string;
+   stream: SyncStream;
+@@ -61,27 +61,32 @@ export type AmoApiAuditInput = Readonly<{
+ export type RawChannelValue = Readonly<{ value: string; count: number }>;
+ 
+ function conflict(): never {
+   throw new AppError("E_CONFLICT", 409);
+ }
+ 
+ function isSha256(value: string): boolean {
+   return /^[a-f0-9]{64}$/.test(value);
+ }
+ 
++function isBoundedExternalId(value: string): boolean {
++  return typeof value === "string" && value.length >= 1 && value.length <= 128;
++}
++
+ function validatePageInput(input: AppendRawPageInput): void {
+   if (
+     !Number.isSafeInteger(input.pageNumber) ||
+     input.pageNumber <= 0 ||
+     !Number.isSafeInteger(input.itemCount) ||
+     input.itemCount < 0 ||
+-    !isSha256(input.payloadSha256)
++    !isSha256(input.payloadSha256) ||
++    input.events.some((event) => !isBoundedExternalId(event.amoEventId))
+   ) {
+     throw new AppError("E_VALIDATION", 422);
+   }
+ }
+ 
+ async function appendPageMetadata(
+   transaction: TransactionSql,
+   input: Readonly<{
+     syncRunId: string;
+     stream: SyncStream;
+@@ -323,38 +328,38 @@ export async function getRawChannelValues(
+         ) as recency
+       from public.raw_amo_objects as raw
+       join public.sync_runs as run on run.id = raw.sync_run_id
+       where run.connection_id = ${input.connectionId}
+         and run.status = 'success'
+         and raw.entity_type = 'lead'
+     ), exact_values as (
+       select distinct
+         lead.account_id,
+         lead.external_id,
+-        btrim(value_item ->> 'value') as value
++        value_item ->> 'value' as value
+       from ranked_leads as lead
+       cross join lateral jsonb_array_elements(
+         case
+           when jsonb_typeof(lead.payload -> 'custom_fields_values') = 'array'
+             then lead.payload -> 'custom_fields_values'
+           else '[]'::jsonb
+         end
+       ) as field_item
+       cross join lateral jsonb_array_elements(
+         case
+           when jsonb_typeof(field_item -> 'values') = 'array'
+             then field_item -> 'values'
+           else '[]'::jsonb
+         end
+       ) as value_item
+       where lead.recency = 1
+         and field_item ->> 'field_id' = ${String(input.sourceFieldId)}
+         and jsonb_typeof(value_item -> 'value') in ('string', 'number', 'boolean')
+-        and btrim(value_item ->> 'value') <> ''
++        and value_item ->> 'value' <> ''
+     )
+     select value, count(*)::integer as count
+     from exact_values
+     group by value
+     order by count desc, value asc
+   `;
+   return rows;
+ }
+diff --git a/packages/db/src/sync-runs.ts b/packages/db/src/sync-runs.ts
+index 060b095..8db953a 100644
+--- a/packages/db/src/sync-runs.ts
++++ b/packages/db/src/sync-runs.ts
+@@ -1,12 +1,11 @@
+ import { AppError } from "@real2/domain";
+-import type { TransactionSql } from "postgres";
+ 
+ import type { Database } from "./client.js";
+ 
+ export type SyncKind =
+   | "initial_backfill"
+   | "incremental"
+   | "nightly_reconciliation"
+   | "manual";
+ export type SyncStatus = "running" | "success" | "partial" | "failed";
+ export type SyncStream = "leads" | "events" | "users" | "metadata";
+@@ -14,21 +13,21 @@ export type SyncStream = "leads" | "events" | "users" | "metadata";
+ export type SyncCounts = Readonly<{
+   pagesRead: number;
+   leadsRead: number;
+   eventsRead: number;
+   usersRead: number;
+   retries: number;
+ }>;
+ 
+ export type SyncCursorPosition = Readonly<{
+   cursorTime: Date | null;
+-  cursorExternalId: number | null;
++  cursorExternalId: string | null;
+ }>;
+ 
+ export type SyncOutcome =
+   | Readonly<{
+       status: "success";
+       nextCursors: Partial<Record<SyncStream, SyncCursorPosition>>;
+       counts: SyncCounts;
+       sourceMaxUpdatedAt?: Date | null;
+       checksum?: string | null;
+     }>
+@@ -64,21 +63,20 @@ type SyncRunRow = {
+   id: string;
+   trace_id: string;
+   connection_id: string;
+   config_id: string;
+   kind: SyncKind;
+   status: SyncStatus;
+   started_at: Date;
+ };
+ 
+ const streams: readonly SyncStream[] = ["metadata", "users", "events", "leads"];
+-
+ function isNonNegativeInteger(value: number): boolean {
+   return Number.isSafeInteger(value) && value >= 0;
+ }
+ 
+ function validateCounts(counts: SyncCounts): void {
+   if (
+     !isNonNegativeInteger(counts.pagesRead) ||
+     !isNonNegativeInteger(counts.leadsRead) ||
+     !isNonNegativeInteger(counts.eventsRead) ||
+     !isNonNegativeInteger(counts.usersRead) ||
+@@ -119,105 +117,71 @@ export async function startSyncRun(
+       ${input.kind},
+       ${input.startedAt ?? new Date()},
+       ${input.createdBy ?? null}
+     )
+     returning id, trace_id, connection_id, config_id, kind, status, started_at
+   `;
+   if (!row) throw new AppError("E_DB", 500);
+   return mapRun(row);
+ }
+ 
+-async function replaceCursors(
+-  transaction: TransactionSql,
+-  connectionId: string,
+-  runId: string,
++function serializeCursors(
+   nextCursors: Partial<Record<SyncStream, SyncCursorPosition>>,
+-  updatedAt: Date,
+-): Promise<void> {
++): Record<string, { cursor_time: string | null; cursor_external_id: string | null }> {
++  const serialized: Record<
++    string,
++    { cursor_time: string | null; cursor_external_id: string | null }
++  > = {};
+   for (const stream of streams) {
+     const cursor = nextCursors[stream];
+     if (!cursor) continue;
+     if (
+       cursor.cursorExternalId !== null &&
+-      (!Number.isSafeInteger(cursor.cursorExternalId) || cursor.cursorExternalId <= 0)
++      (typeof cursor.cursorExternalId !== "string" ||
++        cursor.cursorExternalId.length < 1 ||
++        cursor.cursorExternalId.length > 128)
+     ) {
+       throw new AppError("E_VALIDATION", 422);
+     }
+-    await transaction`
+-      insert into public.sync_cursors (
+-        connection_id,
+-        stream,
+-        cursor_time,
+-        cursor_external_id,
+-        last_successful_run_id,
+-        updated_at
+-      ) values (
+-        ${connectionId},
+-        ${stream},
+-        ${cursor.cursorTime},
+-        ${cursor.cursorExternalId},
+-        ${runId},
+-        ${updatedAt}
+-      )
+-      on conflict (connection_id, stream) do update set
+-        cursor_time = excluded.cursor_time,
+-        cursor_external_id = excluded.cursor_external_id,
+-        last_successful_run_id = excluded.last_successful_run_id,
+-        updated_at = excluded.updated_at
+-    `;
++    serialized[stream] = {
++      cursor_time: cursor.cursorTime?.toISOString() ?? null,
++      cursor_external_id: cursor.cursorExternalId,
++    };
+   }
++  return serialized;
+ }
+ 
+ export async function finishSyncRun(
+   db: Database,
+   runId: string,
+   outcome: SyncOutcome,
+   finishedAt = new Date(),
+ ): Promise<void> {
+   validateCounts(outcome.counts);
+   if (outcome.status !== "success" && outcome.safeError.length > 500) {
+     throw new AppError("E_VALIDATION", 422);
+   }
+ 
+-  await db.begin(async (transaction) => {
+-    const [run] = await transaction<{
+-      connection_id: string;
+-      status: SyncStatus;
+-    }[]>`
+-      select connection_id, status
+-      from public.sync_runs
+-      where id = ${runId}
+-      for update
+-    `;
+-    if (!run) throw new AppError("E_NOT_FOUND", 404);
+-    if (run.status !== "running") throw new AppError("E_CONFLICT", 409);
+-
+-    const errorCode = outcome.status === "success" ? null : outcome.errorCode ?? null;
+-    const errorSummary = outcome.status === "success" ? null : outcome.safeError;
+-    await transaction`
+-      update public.sync_runs
+-      set
+-        status = ${outcome.status},
+-        finished_at = ${finishedAt},
+-        pages_read = ${outcome.counts.pagesRead},
+-        leads_read = ${outcome.counts.leadsRead},
+-        events_read = ${outcome.counts.eventsRead},
+-        users_read = ${outcome.counts.usersRead},
+-        retries = ${outcome.counts.retries},
+-        source_max_updated_at = ${outcome.sourceMaxUpdatedAt ?? null},
+-        error_code = ${errorCode},
+-        error_summary = ${errorSummary},
+-        checksum = ${outcome.checksum ?? null}
+-      where id = ${runId}
+-    `;
+-
+-    if (outcome.status === "success") {
+-      await replaceCursors(
+-        transaction,
+-        run.connection_id,
+-        runId,
+-        outcome.nextCursors,
+-        finishedAt,
+-      );
+-    }
+-  });
++  const errorCode = outcome.status === "success" ? null : outcome.errorCode ?? null;
++  const errorSummary = outcome.status === "success" ? null : outcome.safeError;
++  const nextCursors =
++    outcome.status === "success" ? serializeCursors(outcome.nextCursors) : {};
++  const [row] = await db<{ result: "finished" | "not_found" | "conflict" }[]>`
++    select app.finish_sync_run(
++      ${runId}::uuid,
++      ${outcome.status}::public.sync_status,
++      ${finishedAt},
++      ${outcome.counts.pagesRead},
++      ${outcome.counts.leadsRead},
++      ${outcome.counts.eventsRead},
++      ${outcome.counts.usersRead},
++      ${outcome.counts.retries},
++      ${outcome.sourceMaxUpdatedAt ?? null},
++      ${errorCode},
++      ${errorSummary},
++      ${outcome.checksum ?? null},
++      ${db.json(nextCursors)}
++    ) as result
++  `;
++  if (!row || row.result === "not_found") throw new AppError("E_NOT_FOUND", 404);
++  if (row.result === "conflict") throw new AppError("E_CONFLICT", 409);
+ }
+diff --git a/packages/integrations/src/amo/schemas.test.ts b/packages/integrations/src/amo/schemas.test.ts
+index 3ba5e81..dc9e6bd 100644
+--- a/packages/integrations/src/amo/schemas.test.ts
++++ b/packages/integrations/src/amo/schemas.test.ts
+@@ -1,14 +1,15 @@
+ import { describe, expect, it } from "vitest";
+ 
+ import {
+   amoEventsResponseSchema,
++  amoEventSchema,
+   amoLeadsResponseSchema,
+   amoUsersResponseSchema,
+ } from "./schemas";
+ 
+ describe("amoCRM synchronization response schemas", () => {
+   it("accepts a complete lead page and preserves raw fields for the journal", () => {
+     const payload = {
+       _page: 2,
+       _links: {
+         self: { href: "https://555151.amocrm.ru/api/v4/leads?page=2" },
+@@ -37,20 +38,101 @@ describe("amoCRM synchronization response schemas", () => {
+     const parsed = amoLeadsResponseSchema.parse(payload);
+ 
+     expect(parsed._embedded.leads[0]).toMatchObject({
+       id: 7001,
+       updated_at: 1_757_638_800,
+       synthetic_extra: "must remain available to raw storage",
+     });
+     expect(parsed._links?.next?.href).toContain("page=3");
+   });
+ 
++  it("accepts bounded official object and chained-list custom-field values", () => {
++    const result = amoLeadsResponseSchema.safeParse({
++      _embedded: {
++        leads: [
++          {
++            id: 7001,
++            account_id: 4242,
++            created_at: 1_757_635_200,
++            updated_at: 1_757_638_800,
++            custom_fields_values: [
++              {
++                field_id: 71,
++                values: [{ value: { name: "Synthetic LLC", entity_type: 2 } }],
++              },
++              {
++                field_id: 72,
++                values: [
++                  {
++                    value: {
++                      name: "Synthetic contact",
++                      entity_id: 501,
++                      entity_type: "contacts",
++                      catalog_id: null,
++                    },
++                  },
++                ],
++              },
++              {
++                field_id: 73,
++                values: [
++                  {
++                    value: {
++                      file_uuid: "3b454645-5c7f-4539-9ef9-0dd1b3638dad",
++                      version_uuid: "13db6652-b3ed-4fff-aed8-0c6f3c43b887",
++                      file_name: "synthetic.pdf",
++                      file_size: 20763,
++                    },
++                  },
++                ],
++              },
++              {
++                field_id: 74,
++                values: [{ catalog_id: 1001, catalog_element_id: 12235 }],
++              },
++            ],
++          },
++        ],
++      },
++    });
++
++    expect(result.success).toBe(true);
++    if (result.success) {
++      const fields = result.data._embedded.leads[0]?.custom_fields_values;
++      expect(fields?.[0]?.values).toEqual([{ value: { name: "Synthetic LLC", entity_type: 2 } }]);
++      expect(fields?.[1]?.values[0]?.value).toMatchObject({ catalog_id: null });
++      expect(fields?.[2]?.values[0]?.value).toMatchObject({ file_name: "synthetic.pdf" });
++      expect(fields?.[3]?.values).toEqual([{ catalog_id: 1001, catalog_element_id: 12235 }]);
++    }
++  });
++
++  it("rejects pathologically deep custom-field values", () => {
++    let value: unknown = "leaf";
++    for (let depth = 0; depth < 12; depth += 1) value = { nested: value };
++
++    expect(
++      amoLeadsResponseSchema.safeParse({
++        _embedded: {
++          leads: [
++            {
++              id: 7001,
++              account_id: 4242,
++              created_at: 1_757_635_200,
++              updated_at: 1_757_638_800,
++              custom_fields_values: [{ field_id: 77, values: [{ value }] }],
++            },
++          ],
++        },
++      }).success,
++    ).toBe(false);
++  });
++
+   it("rejects a 200 lead page without the fields needed for durable ordering", () => {
+     const result = amoLeadsResponseSchema.safeParse({
+       _embedded: {
+         leads: [
+           {
+             id: 7001,
+             account_id: 4242,
+             created_at: 1_757_635_200,
+           },
+         ],
+@@ -59,21 +141,21 @@ describe("amoCRM synchronization response schemas", () => {
+ 
+     expect(result.success).toBe(false);
+   });
+ 
+   it("requires event identity, timestamp, type, and account ownership", () => {
+     expect(
+       amoEventsResponseSchema.safeParse({
+         _embedded: {
+           events: [
+             {
+-              id: 9001,
++              id: "01pz58t6p04ymgsgfbmfyfy1mf",
+               type: "lead_status_changed",
+               entity_id: 7001,
+               entity_type: "lead",
+               created_at: 1_757_638_900,
+               account_id: 4242,
+             },
+           ],
+         },
+       }).success,
+     ).toBe(true);
+@@ -85,20 +167,59 @@ describe("amoCRM synchronization response schemas", () => {
+             {
+               type: "lead_status_changed",
+               entity_id: 7001,
+               created_at: 1_757_638_900,
+               account_id: 4242,
+             },
+           ],
+         },
+       }).success,
+     ).toBe(false);
++
++    expect(
++      amoEventsResponseSchema.safeParse({
++        _embedded: {
++          events: [
++            {
++              id: 9001,
++              type: "lead_status_changed",
++              entity_id: 7001,
++              entity_type: "lead",
++              created_at: 1_757_638_900,
++              account_id: 4242,
++            },
++          ],
++        },
++      }).success,
++    ).toBe(false);
++  });
++
++  it("treats a bounded event ID as opaque instead of imposing a numeric or slug shape", () => {
++    expect(amoEventSchema.safeParse({
++      id: "event:01/ABC.2",
++      type: "lead_status_changed",
++      entity_id: 7001,
++      entity_type: "lead",
++      created_at: 1_757_638_900,
++      account_id: 4242,
++    }).success).toBe(true);
+   });
+ 
+   it("rejects a user page without an immutable external id", () => {
+     expect(
+       amoUsersResponseSchema.safeParse({
+         _embedded: { users: [{ name: "Synthetic User" }] },
+       }).success,
+     ).toBe(false);
+   });
++
++  it.each(["", "x".repeat(129), 9001])("rejects invalid opaque event ID %s", (id) => {
++    expect(amoEventSchema.safeParse({
++      id,
++      type: "lead_status_changed",
++      entity_id: 7001,
++      entity_type: "lead",
++      created_at: 1_757_638_900,
++      account_id: 4242,
++    }).success).toBe(false);
++  });
+ });
+diff --git a/packages/integrations/src/amo/schemas.ts b/packages/integrations/src/amo/schemas.ts
+index d811596..e6fd403 100644
+--- a/packages/integrations/src/amo/schemas.ts
++++ b/packages/integrations/src/amo/schemas.ts
+@@ -1,31 +1,74 @@
+ import { z } from "zod";
+ 
+ const positiveId = z.number().int().positive();
+ const unixTimestamp = z.number().int().nonnegative();
++const amoEventId = z.string().min(1).max(128);
++
++const MAX_CUSTOM_FIELD_DEPTH = 8;
++const MAX_CUSTOM_FIELD_ITEMS = 1_000;
++const MAX_CUSTOM_FIELD_KEYS = 128;
++const MAX_CUSTOM_FIELD_STRING_LENGTH = 65_536;
++
++function isBoundedJson(value: unknown, depth = 0): boolean {
++  if (depth > MAX_CUSTOM_FIELD_DEPTH) return false;
++  if (value === null || typeof value === "boolean") return true;
++  if (typeof value === "string") {
++    return value.length <= MAX_CUSTOM_FIELD_STRING_LENGTH;
++  }
++  if (typeof value === "number") return Number.isFinite(value);
++  if (Array.isArray(value)) {
++    return (
++      value.length <= MAX_CUSTOM_FIELD_ITEMS &&
++      value.every((item) => isBoundedJson(item, depth + 1))
++    );
++  }
++  if (typeof value !== "object") return false;
++
++  const entries = Object.entries(value);
++  return (
++    entries.length <= MAX_CUSTOM_FIELD_KEYS &&
++    entries.every(
++      ([key, item]) =>
++        key.length <= 256 && isBoundedJson(item, depth + 1),
++    )
++  );
++}
++
++const boundedJsonSchema = z.unknown().refine(isBoundedJson);
+ 
+ const amoLinkSchema = z.looseObject({
+   href: z.string().min(1),
+ });
+ 
+ const amoPageLinksSchema = z.looseObject({
+   self: amoLinkSchema.optional(),
+   next: amoLinkSchema.optional(),
+ });
+ 
++const amoCustomFieldValueItemSchema = z
++  .object({
++    value: boundedJsonSchema.optional(),
++    enum_id: positiveId.optional(),
++    enum_code: z.string().max(200).optional(),
++    catalog_id: positiveId.optional(),
++    catalog_element_id: positiveId.optional(),
++  })
++  .catchall(boundedJsonSchema)
++  .refine((item) => {
++    const keys = Object.keys(item);
++    return keys.length > 0 && keys.length <= MAX_CUSTOM_FIELD_KEYS;
++  });
++
+ const amoCustomFieldValueSchema = z.looseObject({
+   field_id: positiveId,
+-  values: z.array(
+-    z.looseObject({
+-      value: z.union([z.string(), z.number(), z.boolean()]),
+-    }),
+-  ),
++  values: z.array(amoCustomFieldValueItemSchema).max(MAX_CUSTOM_FIELD_ITEMS),
+ });
+ 
+ export const amoAccountResponseSchema = z.looseObject({
+   id: positiveId,
+   subdomain: z.string().min(1),
+ });
+ 
+ export const amoPipelineSchema = z.looseObject({
+   id: positiveId,
+   name: z.string().min(1),
+@@ -45,25 +88,29 @@ export const amoUserSchema = z.looseObject({
+ });
+ 
+ export const amoLeadSchema = z.looseObject({
+   id: positiveId,
+   account_id: positiveId,
+   created_at: unixTimestamp,
+   updated_at: unixTimestamp,
+   status_id: positiveId.optional(),
+   pipeline_id: positiveId.optional(),
+   responsible_user_id: positiveId.optional(),
+-  custom_fields_values: z.array(amoCustomFieldValueSchema).nullable().optional(),
++  custom_fields_values: z
++    .array(amoCustomFieldValueSchema)
++    .max(MAX_CUSTOM_FIELD_ITEMS)
++    .nullable()
++    .optional(),
+ });
+ 
+ export const amoEventSchema = z.looseObject({
+-  id: positiveId,
++  id: amoEventId,
+   type: z.string().min(1),
+   entity_id: positiveId,
+   entity_type: z.string().min(1),
+   created_at: unixTimestamp,
+   account_id: positiveId,
+ });
+ 
+ function pageSchema<TKey extends string, TItem extends z.ZodType>(
+   key: TKey,
+   item: TItem,
+diff --git a/supabase/migrations/0005_raw_sync.sql b/supabase/migrations/0005_raw_sync.sql
+index 6361a6f..b7cd1f0 100644
+--- a/supabase/migrations/0005_raw_sync.sql
++++ b/supabase/migrations/0005_raw_sync.sql
+@@ -42,21 +42,24 @@ create table public.sync_runs (
+   check (
+     (status = 'running' and finished_at is null)
+     or (status <> 'running' and finished_at is not null)
+   )
+ );
+ 
+ create table public.sync_cursors (
+   connection_id uuid not null references public.amo_connections(id),
+   stream text not null check (stream in ('leads', 'events', 'users', 'metadata')),
+   cursor_time timestamptz,
+-  cursor_external_id bigint check (cursor_external_id is null or cursor_external_id > 0),
++  cursor_external_id text check (
++    cursor_external_id is null
++    or char_length(cursor_external_id) between 1 and 128
++  ),
+   last_successful_run_id uuid references public.sync_runs(id),
+   updated_at timestamptz not null default now(),
+   primary key (connection_id, stream)
+ );
+ 
+ create table public.sync_pages (
+   id uuid primary key default gen_random_uuid(),
+   sync_run_id uuid not null references public.sync_runs(id),
+   stream text not null check (stream in ('leads', 'events', 'users', 'metadata')),
+   page_number integer not null check (page_number > 0),
+@@ -76,21 +79,23 @@ create table public.raw_amo_objects (
+   payload jsonb not null check (jsonb_typeof(payload) = 'object'),
+   payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
+   received_at timestamptz not null default now(),
+   unique (sync_run_id, entity_type, external_id)
+ );
+ 
+ create table public.raw_amo_events (
+   id uuid primary key default gen_random_uuid(),
+   sync_run_id uuid not null references public.sync_runs(id),
+   account_id bigint not null check (account_id > 0),
+-  amo_event_id bigint not null check (amo_event_id > 0),
++  amo_event_id text not null check (
++    char_length(amo_event_id) between 1 and 128
++  ),
+   amo_lead_id bigint check (amo_lead_id is null or amo_lead_id > 0),
+   event_type text not null check (char_length(event_type) between 1 and 200),
+   event_at timestamptz not null,
+   payload jsonb not null check (jsonb_typeof(payload) = 'object'),
+   payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
+   received_at timestamptz not null default now(),
+   unique (account_id, amo_event_id)
+ );
+ 
+ create table public.raw_amo_quarantine (
+@@ -134,20 +139,242 @@ on public.raw_amo_quarantine (sync_run_id, stream, page_number);
+ 
+ create index sync_pages_run_idx
+ on public.sync_pages (sync_run_id, stream, page_number);
+ 
+ create index sync_runs_status_idx
+ on public.sync_runs (status, started_at desc);
+ 
+ create index amo_api_audit_run_idx
+ on public.amo_api_audit (sync_run_id, created_at);
+ 
++create function app.canonical_amo_audit_path(input_path text)
++returns text
++language sql
++immutable
++set search_path = ''
++as $$
++  select case
++    when input_path in (
++      '/oauth2/access_token',
++      '/api/v4/account',
++      '/api/v4/users',
++      '/api/v4/leads',
++      '/api/v4/leads/custom_fields',
++      '/api/v4/leads/pipelines',
++      '/api/v4/events',
++      '/api/v4/leads/:id',
++      '/api/v4/leads/pipelines/:id',
++      '/api/v4/leads/pipelines/:id/statuses',
++      '/denied'
++    ) then input_path
++    when input_path ~ '^/api/v4/leads/[0-9]+$'
++      then '/api/v4/leads/:id'
++    when input_path ~ '^/api/v4/leads/pipelines/[0-9]+$'
++      then '/api/v4/leads/pipelines/:id'
++    when input_path ~ '^/api/v4/leads/pipelines/[0-9]+/statuses$'
++      then '/api/v4/leads/pipelines/:id/statuses'
++    else '/denied'
++  end
++$$;
++
++create function app.canonicalize_amo_api_audit_path()
++returns trigger
++language plpgsql
++security definer
++set search_path = ''
++as $$
++begin
++  new.normalized_path := app.canonical_amo_audit_path(new.normalized_path);
++  return new;
++end
++$$;
++
++create trigger amo_api_audit_canonicalize_path
++before insert on public.amo_api_audit
++for each row execute function app.canonicalize_amo_api_audit_path();
++
++create function app.require_running_sync_run()
++returns trigger
++language plpgsql
++security definer
++set search_path = ''
++as $$
++begin
++  if new.sync_run_id is null then
++    return new;
++  end if;
++
++  perform 1
++  from public.sync_runs
++  where id = new.sync_run_id
++    and status = 'running'
++  -- Held until the whole append transaction commits; conflicts with the
++  -- finalizer's FOR UPDATE lock so no append can straddle a terminal seal.
++  for key share;
++
++  if not found then
++    raise exception 'sync run is not running'
++      using errcode = '23514';
++  end if;
++
++  return new;
++end
++$$;
++
++create trigger sync_pages_require_running_run
++before insert on public.sync_pages
++for each row execute function app.require_running_sync_run();
++
++create trigger raw_amo_objects_require_running_run
++before insert on public.raw_amo_objects
++for each row execute function app.require_running_sync_run();
++
++create trigger raw_amo_events_require_running_run
++before insert on public.raw_amo_events
++for each row execute function app.require_running_sync_run();
++
++create trigger raw_amo_quarantine_require_running_run
++before insert on public.raw_amo_quarantine
++for each row execute function app.require_running_sync_run();
++
++create trigger amo_api_audit_require_running_run
++before insert on public.amo_api_audit
++for each row execute function app.require_running_sync_run();
++
++create function app.finish_sync_run(
++  p_run_id uuid,
++  p_status public.sync_status,
++  p_finished_at timestamptz,
++  p_pages_read integer,
++  p_leads_read integer,
++  p_events_read integer,
++  p_users_read integer,
++  p_retries integer,
++  p_source_max_updated_at timestamptz,
++  p_error_code text,
++  p_error_summary text,
++  p_checksum text,
++  p_next_cursors jsonb
++)
++returns text
++language plpgsql
++security definer
++set search_path = ''
++as $$
++declare
++  run_connection_id uuid;
++  run_status public.sync_status;
++  cursor_entry record;
++  cursor_time timestamptz;
++  cursor_external_id text;
++begin
++  if p_status = 'running'
++    or p_finished_at is null
++    or p_pages_read < 0
++    or p_leads_read < 0
++    or p_events_read < 0
++    or p_users_read < 0
++    or p_retries < 0
++    or (p_checksum is not null and p_checksum !~ '^[a-f0-9]{64}$')
++  then
++    raise exception 'invalid sync outcome' using errcode = '22023';
++  end if;
++
++  if jsonb_typeof(p_next_cursors) is distinct from 'object' then
++    raise exception 'invalid cursor payload' using errcode = '22023';
++  end if;
++
++  if p_status = 'success' then
++    if p_error_code is not null or p_error_summary is not null then
++      raise exception 'successful run cannot contain an error'
++        using errcode = '22023';
++    end if;
++  elsif p_error_summary is null or p_next_cursors <> '{}'::jsonb then
++    raise exception 'non-successful run requires an error and cannot advance cursors'
++      using errcode = '22023';
++  end if;
++
++  select connection_id, status
++  into run_connection_id, run_status
++  from public.sync_runs
++  where id = p_run_id
++  for update;
++
++  if not found then
++    return 'not_found';
++  end if;
++  if run_status <> 'running' then
++    return 'conflict';
++  end if;
++
++  update public.sync_runs
++  set
++    status = p_status,
++    finished_at = p_finished_at,
++    pages_read = p_pages_read,
++    leads_read = p_leads_read,
++    events_read = p_events_read,
++    users_read = p_users_read,
++    retries = p_retries,
++    source_max_updated_at = p_source_max_updated_at,
++    error_code = p_error_code,
++    error_summary = p_error_summary,
++    checksum = p_checksum
++  where id = p_run_id;
++
++  if p_status = 'success' then
++    for cursor_entry in select key, value from jsonb_each(p_next_cursors)
++    loop
++      if cursor_entry.key not in ('leads', 'events', 'users', 'metadata')
++        or jsonb_typeof(cursor_entry.value) <> 'object'
++        or cursor_entry.value - array['cursor_time', 'cursor_external_id'] <> '{}'::jsonb
++        or (cursor_entry.value ? 'cursor_external_id' and
++          jsonb_typeof(cursor_entry.value -> 'cursor_external_id') not in ('string', 'null'))
++      then
++        raise exception 'invalid cursor payload' using errcode = '22023';
++      end if;
++
++      cursor_time := (cursor_entry.value ->> 'cursor_time')::timestamptz;
++      cursor_external_id := cursor_entry.value ->> 'cursor_external_id';
++      if cursor_external_id is not null and (
++        char_length(cursor_external_id) not between 1 and 128
++      ) then
++        raise exception 'invalid cursor external ID' using errcode = '22023';
++      end if;
++
++      insert into public.sync_cursors (
++        connection_id,
++        stream,
++        cursor_time,
++        cursor_external_id,
++        last_successful_run_id,
++        updated_at
++      ) values (
++        run_connection_id,
++        cursor_entry.key,
++        cursor_time,
++        cursor_external_id,
++        p_run_id,
++        p_finished_at
++      )
++      on conflict (connection_id, stream) do update set
++        cursor_time = excluded.cursor_time,
++        cursor_external_id = excluded.cursor_external_id,
++        last_successful_run_id = excluded.last_successful_run_id,
++        updated_at = excluded.updated_at;
++    end loop;
++  end if;
++
++  return 'finished';
++end
++$$;
++
+ alter table public.sync_runs enable row level security;
+ alter table public.sync_cursors enable row level security;
+ alter table public.sync_pages enable row level security;
+ alter table public.raw_amo_objects enable row level security;
+ alter table public.raw_amo_events enable row level security;
+ alter table public.raw_amo_quarantine enable row level security;
+ alter table public.amo_api_audit enable row level security;
+ 
+ revoke all on table public.sync_runs from anon, authenticated;
+ revoke all on table public.sync_cursors from anon, authenticated;
+@@ -193,41 +420,40 @@ on public.raw_amo_events
+ for select
+ to authenticated
+ using ((select app.current_role()) = 'admin');
+ 
+ create policy raw_amo_quarantine_admin_select
+ on public.raw_amo_quarantine
+ for select
+ to authenticated
+ using ((select app.current_role()) = 'admin');
+ 
+-grant select, insert on table public.sync_runs to service_worker;
+-grant update (
+-  status,
+-  finished_at,
+-  pages_read,
+-  leads_read,
+-  events_read,
+-  users_read,
+-  retries,
+-  source_max_updated_at,
+-  error_code,
+-  error_summary,
+-  checksum
++grant select on table public.sync_runs to service_worker;
++grant insert (
++  trace_id,
++  connection_id,
++  config_id,
++  kind,
++  started_at,
++  created_by
+ ) on public.sync_runs to service_worker;
+ 
+-grant select, insert on table public.sync_cursors to service_worker;
+-grant update (
+-  cursor_time,
+-  cursor_external_id,
+-  last_successful_run_id,
+-  updated_at
+-) on public.sync_cursors to service_worker;
++grant select on table public.sync_cursors to service_worker;
+ grant select, insert on table public.sync_pages to service_worker;
+ grant select, insert on table public.raw_amo_objects to service_worker;
+ grant select, insert on table public.raw_amo_events to service_worker;
+ grant select, insert on table public.raw_amo_quarantine to service_worker;
+ grant select, insert on table public.amo_api_audit to service_worker;
++grant usage on schema app to service_worker;
++
++revoke all on function app.finish_sync_run(
++  uuid, public.sync_status, timestamptz, integer, integer, integer,
++  integer, integer, timestamptz, text, text, text, jsonb
++) from public;
++grant execute on function app.finish_sync_run(
++  uuid, public.sync_status, timestamptz, integer, integer, integer,
++  integer, integer, timestamptz, text, text, text, jsonb
++) to service_worker;
+ 
+ -- Deliberately no raw UPDATE/DELETE grant exists for service_worker or a user
+ -- role. The separately reviewed retention job owns the only future deletion
+ -- path and must first preserve hashes and normalized history.
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index 7c0b4b6..c705116 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -300,93 +300,118 @@ describe("raw synchronization RLS", () => {
+       ) values (
+         ${connection.id}, 10243278, 'РЕАЛ ДВА', 11,
+         'Завершение (самовывоз или доставка)', 99,
+         'Успешно реализовано', 1, true, ${testUsers.admin.id}
+       )
+       returning id
+     `;
+     if (!config) throw new Error("pipeline fixture is missing");
+     const [run] = await adminDb<{ id: string }[]>`
+       insert into public.sync_runs (
+-        trace_id, connection_id, config_id, kind, status, finished_at
++        trace_id, connection_id, config_id, kind
+       ) values (
+-        'trace-rls', ${connection.id}, ${config.id}, 'incremental',
+-        'success', '2026-09-15T09:01:00.000Z'
++        'trace-rls', ${connection.id}, ${config.id}, 'incremental'
+       )
+       returning id
+     `;
+     if (!run) throw new Error("sync run fixture is missing");
+     await adminDb`
+       insert into public.sync_pages (
+         sync_run_id, stream, page_number, item_count, payload_sha256
+       ) values (${run.id}, 'leads', 1, 1, ${"a".repeat(64)})
+     `;
+     await adminDb`
+       insert into public.raw_amo_objects (
+         sync_run_id, account_id, entity_type, external_id,
+         payload, payload_sha256
+       ) values (
+         ${run.id}, 555151, 'lead', 7001,
+         ${adminDb.json({ id: 7001, synthetic: true })}, ${"b".repeat(64)}
+       )
+     `;
++    await adminDb`
++      insert into public.raw_amo_events (
++        sync_run_id, account_id, amo_event_id, amo_lead_id,
++        event_type, event_at, payload, payload_sha256
++      ) values (
++        ${run.id}, 555151, '01pz58t6p04ymgsgfbmfyfy1mf', 7001,
++        'lead_status_changed', '2026-09-15T09:00:30.000Z',
++        ${adminDb.json({ id: "01pz58t6p04ymgsgfbmfyfy1mf", synthetic: true })},
++        ${"c".repeat(64)}
++      )
++    `;
+     await adminDb`
+       insert into public.amo_api_audit (
+         sync_run_id, trace_id, method, normalized_path,
+         response_status, duration_ms, attempt, result
+       ) values (
+         ${run.id}, 'trace-rls', 'GET', '/api/v4/leads',
+         200, 3, 1, 'success'
+       )
+     `;
++    await adminDb`
++      update public.sync_runs
++      set status = 'success', finished_at = '2026-09-15T09:01:00.000Z'
++      where id = ${run.id}
++    `;
+   }
+ 
+   async function visibleJournalCounts(authUserId: string) {
+     return adminDb.begin(async (transaction) => {
+       await transaction.unsafe("set local role authenticated");
+       await transaction`
+         select set_config('request.jwt.claim.sub', ${authUserId}, true)
+       `;
+       const [counts] = await transaction<{
+         runs: number;
+         pages: number;
+         audits: number;
+         raw_objects: number;
++        raw_events: number;
+       }[]>`
+         select
+           (select count(*)::integer from public.sync_runs) as runs,
+           (select count(*)::integer from public.sync_pages) as pages,
+           (select count(*)::integer from public.amo_api_audit) as audits,
+-          (select count(*)::integer from public.raw_amo_objects) as raw_objects
++          (select count(*)::integer from public.raw_amo_objects) as raw_objects,
++          (select count(*)::integer from public.raw_amo_events) as raw_events
+       `;
+       return counts;
+     });
+   }
+ 
+   it("shows safe run evidence to leadership but raw payloads only to admin", async () => {
+     await seedRawJournal();
+ 
+     await expect(visibleJournalCounts(testUsers.admin.authUserId)).resolves.toEqual({
+       runs: 1,
+       pages: 1,
+       audits: 1,
+       raw_objects: 1,
++      raw_events: 1,
+     });
+     await expect(visibleJournalCounts(testUsers.head.authUserId)).resolves.toEqual({
+       runs: 1,
+       pages: 1,
+       audits: 1,
+       raw_objects: 0,
++      raw_events: 0,
+     });
+     await expect(
+       visibleJournalCounts(testUsers.managerOne.authUserId),
+-    ).resolves.toEqual({ runs: 0, pages: 0, audits: 0, raw_objects: 0 });
++    ).resolves.toEqual({
++      runs: 0,
++      pages: 0,
++      audits: 0,
++      raw_objects: 0,
++      raw_events: 0,
++    });
+   });
+ 
+   it("keeps cursors and direct writes unavailable to authenticated users", async () => {
+     await seedRawJournal();
+ 
+     await expect(
+       adminDb.begin(async (transaction) => {
+         await transaction.unsafe("set local role authenticated");
+         await transaction`
+           select set_config(
+@@ -407,11 +432,38 @@ describe("raw synchronization RLS", () => {
+             ${testUsers.admin.authUserId},
+             true
+           )
+         `;
+         await transaction`
+           delete from public.raw_amo_objects where external_id = 7001
+         `;
+       }),
+     ).rejects.toMatchObject({ code: "42501" });
+   });
++
++  it("denies anonymous raw-event access and user execution of the finalizer", async () => {
++    await seedRawJournal();
++    await expect(adminDb.begin(async (transaction) => {
++      await transaction.unsafe("set local role anon");
++      await transaction`select amo_event_id from public.raw_amo_events`;
++    })).rejects.toMatchObject({ code: "42501" });
++    await expect(adminDb.begin(async (transaction) => {
++      await transaction.unsafe("set local role authenticated");
++      await transaction`
++        select set_config('request.jwt.claim.sub', ${testUsers.admin.authUserId}, true)
++      `;
++      await transaction`
++        select app.finish_sync_run(
++          '00000000-0000-4000-8000-000000000001'::uuid,
++          'success'::public.sync_status, now(), 0, 0, 0, 0, 0,
++          null, null, null, null, '{}'::jsonb
++        )
++      `;
++    })).rejects.toMatchObject({ code: "42501" });
++    await expect(adminDb.begin(async (transaction) => {
++      await transaction.unsafe("set local role authenticated");
++      await transaction`
++        update public.raw_amo_events set event_type = 'tampered'
++      `;
++    })).rejects.toMatchObject({ code: "42501" });
++  });
+ });

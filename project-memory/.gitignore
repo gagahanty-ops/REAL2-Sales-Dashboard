@@ -1,0 +1,20 @@
+# Local OS noise
+.DS_Store
+
+# Never commit local runtime secrets.
+.env
+.env.*
+!.env.example
+!.env.compose.example
+
+# Never embed copies of the source repository inside its own memory folder.
+raw-context/repository-snapshot/
+raw-context/repository-snapshot-worktree-copy/
+raw-context/repository-bundles/
+
+# Dependency/build caches if a future agent runs the snapshot locally.
+node_modules/
+.next/
+dist/
+.turbo/
+supabase/.temp/

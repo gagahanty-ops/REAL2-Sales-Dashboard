@@ -1,0 +1,545 @@
+# Review package: 0f45cd7940f6abffccd656adaf31a36c42595866..0ae530f65a02059a4535f628fd19daf1fe15c70f
+
+## Commits
+0ae530f fix: harden normalized lead repositories
+
+## Files changed
+ packages/db/src/leads.integration.test.ts     | 94 ++++++++++++++++++++++++++-
+ packages/db/src/leads.ts                      | 53 ++++++++++++++-
+ packages/db/src/quality.ts                    | 40 ++++++++++--
+ supabase/migrations/0010_normalized_leads.sql |  5 +-
+ tests/security/rls.security.test.ts           | 20 ++++++
+ 5 files changed, 200 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/packages/db/src/leads.integration.test.ts b/packages/db/src/leads.integration.test.ts
+index 722012b..5cf2870 100644
+--- a/packages/db/src/leads.integration.test.ts
++++ b/packages/db/src/leads.integration.test.ts
+@@ -1,14 +1,15 @@
+ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+ 
+ import { createNormalizedLeadRepository } from "./leads";
+ import { createQualityRepository } from "./quality";
++import { AppError } from "@real2/domain";
+ import {
+   createAdminDb,
+   ensureRestrictedTestLogins,
+   resetAndSeedUsers,
+   testUsers,
+ } from "../../../tests/helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+ const fixtureConfig = {
+   accountId: 1,
+@@ -163,21 +164,21 @@ describe("normalized lead database invariants", () => {
+       isWon: false,
+       sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
+     });
+     await leads.upsertLead({
+       accountId: 1,
+       amoLeadId: 55,
+       pipelineId: 10,
+       currentStatusId: 20,
+       currentResponsibleUserId: 101,
+       name: "Synthetic lead",
+-      priceRub: 5000,
++      priceRub: "5000.00",
+       createdAt: new Date("2026-09-15T09:00:00.000Z"),
+       createdDate: "2026-09-15",
+       sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
+       normalizedChannel: "site",
+       channelRuleId: null,
+       normalizationConfigId: configId,
+       amoUrl: "https://555151.amocrm.ru/leads/55",
+       isDeleted: false,
+     });
+     await leads.appendStageEvent({
+@@ -232,11 +233,102 @@ describe("normalized lead database invariants", () => {
+     `).resolves.toEqual([{
+       users: 1,
+       statuses: 1,
+       stageEvents: 1,
+       responsibleEvents: 1,
+       milestones: 1,
+     }]);
+     await expect(quality.countOpen({ accountId: 1, amoLeadId: 55 }, "missing_responsible"))
+       .resolves.toBe(1);
+   });
++
++  it("preserves exact decimal prices and rejects malformed money and unsafe IDs", async () => {
++    const configId = await seedNormalizedLead();
++    const leads = createNormalizedLeadRepository(adminDb);
++    const quality = createQualityRepository(adminDb);
++    const leadInput = {
++      accountId: 1,
++      amoLeadId: 55,
++      pipelineId: 10,
++      currentStatusId: 20,
++      currentResponsibleUserId: 101,
++      name: "Synthetic lead",
++      createdAt: new Date("2026-09-15T09:00:00.000Z"),
++      createdDate: "2026-09-15",
++      sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
++      normalizedChannel: "site",
++      channelRuleId: null,
++      normalizationConfigId: configId,
++      amoUrl: "https://555151.amocrm.ru/leads/55",
++      isDeleted: false,
++    };
++
++    await leads.upsertLead({ ...leadInput, priceRub: "999999999999.99" });
++    await expect(adminDb<{ price_rub: string }[]>`
++      select price_rub::text from public.leads where account_id = 1 and amo_lead_id = 55
++    `).resolves.toEqual([{ price_rub: "999999999999.99" }]);
++    await expect(
++      leads.upsertLead({ ...leadInput, priceRub: "100.1" }),
++    ).rejects.toBeInstanceOf(AppError);
++    await expect(quality.open({
++      accountId: Number.MAX_SAFE_INTEGER + 1,
++      amoLeadId: 55,
++      code: "unsafe_id",
++      severity: "blocking",
++    })).rejects.toBeInstanceOf(AppError);
++  });
++
++  it("counts a single account-level quality issue with a null lead key", async () => {
++    const quality = createQualityRepository(adminDb);
++    const issue = {
++      accountId: 1,
++      amoLeadId: null,
++      code: "account_scope",
++      severity: "warning" as const,
++    };
++
++    const first = await quality.open(issue);
++    const second = await quality.open(issue);
++
++    expect(second.id).toBe(first.id);
++    await expect(quality.countOpen({ accountId: 1, amoLeadId: null }, "account_scope"))
++      .resolves.toBe(1);
++  });
++
++  it("rolls normalized writes back when repositories share a transaction", async () => {
++    const configId = await seedNormalizedLead();
++
++    await expect(adminDb.begin(async (transaction) => {
++      const leads = createNormalizedLeadRepository(transaction);
++      const quality = createQualityRepository(transaction);
++      await leads.upsertLead({
++        accountId: 1,
++        amoLeadId: 56,
++        pipelineId: 10,
++        currentStatusId: 20,
++        currentResponsibleUserId: 101,
++        name: "Rolled back lead",
++        priceRub: "1.00",
++        createdAt: new Date("2026-09-15T09:00:00.000Z"),
++        createdDate: "2026-09-15",
++        sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
++        normalizedChannel: "site",
++        channelRuleId: null,
++        normalizationConfigId: configId,
++        amoUrl: "https://555151.amocrm.ru/leads/56",
++        isDeleted: false,
++      });
++      await quality.open({
++        accountId: 1,
++        amoLeadId: 56,
++        code: "rolled_back",
++        severity: "warning",
++      });
++      throw new Error("abort normalized transaction");
++    })).rejects.toThrow("abort normalized transaction");
++    await expect(adminDb<{ leads: number; issues: number }[]>`
++      select
++        (select count(*)::integer from public.leads where amo_lead_id = 56) as leads,
++        (select count(*)::integer from public.data_quality_issues where code = 'rolled_back') as issues
++    `).resolves.toEqual([{ leads: 0, issues: 0 }]);
++  });
+ });
+diff --git a/packages/db/src/leads.ts b/packages/db/src/leads.ts
+index 6d77cdc..239bf2a 100644
+--- a/packages/db/src/leads.ts
++++ b/packages/db/src/leads.ts
+@@ -1,12 +1,17 @@
++import { AppError } from "@real2/domain";
++import type { TransactionSql } from "postgres";
++
+ import type { Database } from "./client.js";
+ 
++export type NormalizedLeadDb = Database | TransactionSql;
++
+ export type NormalizedLeadKey = Readonly<{
+   accountId: number;
+   amoLeadId: number;
+ }>;
+ 
+ export type UpsertAmoUserInput = Readonly<{
+   accountId: number;
+   amoUserId: number;
+   name: string;
+   email: string | null;
+@@ -25,21 +30,21 @@ export type UpsertPipelineStatusInput = Readonly<{
+   sourceUpdatedAt: Date | null;
+ }>;
+ 
+ export type UpsertLeadInput = Readonly<{
+   accountId: number;
+   amoLeadId: number;
+   pipelineId: number;
+   currentStatusId: number;
+   currentResponsibleUserId: number | null;
+   name: string;
+-  priceRub: number | null;
++  priceRub: string | null;
+   createdAt: Date;
+   createdDate: string;
+   sourceUpdatedAt: Date;
+   normalizedChannel: string;
+   channelRuleId: string | null;
+   normalizationConfigId: string;
+   amoUrl: string;
+   isDeleted: boolean;
+ }>;
+ 
+@@ -75,61 +80,92 @@ export type UpsertLeadMilestoneInput = Readonly<{
+ 
+ export type NormalizedLeadRepository = Readonly<{
+   upsertAmoUser(input: UpsertAmoUserInput): Promise<void>;
+   upsertPipelineStatus(input: UpsertPipelineStatusInput): Promise<void>;
+   upsertLead(input: UpsertLeadInput): Promise<void>;
+   appendStageEvent(input: AppendStageEventInput): Promise<void>;
+   appendResponsibleEvent(input: AppendResponsibleEventInput): Promise<void>;
+   upsertMilestone(input: UpsertLeadMilestoneInput): Promise<void>;
+ }>;
+ 
++function isPositiveSafeInteger(value: number): boolean {
++  return Number.isSafeInteger(value) && value > 0;
++}
++
++function validateIdentity(value: number | null, required = false): void {
++  if ((value === null && required) || (value !== null && !isPositiveSafeInteger(value))) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++}
++
++function validateLeadInput(input: UpsertLeadInput): void {
++  validateIdentity(input.accountId, true);
++  validateIdentity(input.amoLeadId, true);
++  validateIdentity(input.pipelineId, true);
++  validateIdentity(input.currentStatusId, true);
++  validateIdentity(input.currentResponsibleUserId);
++  if (
++    input.priceRub !== null
++    && !/^(?:0|[1-9]\d{0,11})\.\d{2}$/.test(input.priceRub)
++  ) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++}
++
+ export function createNormalizedLeadRepository(
+-  db: Database,
++  db: NormalizedLeadDb,
+ ): NormalizedLeadRepository {
+   return {
+     async upsertAmoUser(input) {
++      validateIdentity(input.accountId, true);
++      validateIdentity(input.amoUserId, true);
+       await db`
+         insert into public.amo_users (
+           account_id, amo_user_id, name, email, is_active, source_updated_at
+         ) values (
+           ${input.accountId}, ${input.amoUserId}, ${input.name}, ${input.email},
+           ${input.isActive}, ${input.sourceUpdatedAt}
+         )
+         on conflict (account_id, amo_user_id) do update set
+           name = excluded.name,
+           email = excluded.email,
+           is_active = excluded.is_active,
+           source_updated_at = excluded.source_updated_at,
+           normalized_at = now()
+       `;
+     },
+ 
+     async upsertPipelineStatus(input) {
++      validateIdentity(input.accountId, true);
++      validateIdentity(input.pipelineId, true);
++      validateIdentity(input.statusId, true);
++      if (!Number.isSafeInteger(input.sortOrder)) throw new AppError("E_VALIDATION", 422);
+       await db`
+         insert into public.pipeline_statuses (
+           account_id, pipeline_id, status_id, name, sort_order, is_closed,
+           is_won, source_updated_at
+         ) values (
+           ${input.accountId}, ${input.pipelineId}, ${input.statusId}, ${input.name},
+           ${input.sortOrder}, ${input.isClosed}, ${input.isWon}, ${input.sourceUpdatedAt}
+         )
+         on conflict (account_id, status_id) do update set
+           pipeline_id = excluded.pipeline_id,
+           name = excluded.name,
+           sort_order = excluded.sort_order,
+           is_closed = excluded.is_closed,
+           is_won = excluded.is_won,
+           source_updated_at = excluded.source_updated_at
+       `;
+     },
+ 
+     async upsertLead(input) {
++      validateLeadInput(input);
+       await db`
+         insert into public.leads (
+           account_id, amo_lead_id, pipeline_id, current_status_id,
+           current_responsible_user_id, name, price_rub, created_at, created_date,
+           source_updated_at, normalized_channel, channel_rule_id,
+           normalization_config_id, amo_url, is_deleted
+         ) values (
+           ${input.accountId}, ${input.amoLeadId}, ${input.pipelineId},
+           ${input.currentStatusId}, ${input.currentResponsibleUserId}, ${input.name},
+           ${input.priceRub}, ${input.createdAt}, ${input.createdDate},
+@@ -148,47 +184,60 @@ export function createNormalizedLeadRepository(
+           normalized_channel = excluded.normalized_channel,
+           channel_rule_id = excluded.channel_rule_id,
+           normalization_config_id = excluded.normalization_config_id,
+           amo_url = excluded.amo_url,
+           is_deleted = excluded.is_deleted,
+           normalized_at = now()
+       `;
+     },
+ 
+     async appendStageEvent(input) {
++      validateIdentity(input.accountId, true);
++      validateIdentity(input.amoLeadId, true);
++      validateIdentity(input.fromStatusId);
++      validateIdentity(input.toStatusId, true);
++      validateIdentity(input.responsibleUserId);
+       await db`
+         insert into public.lead_stage_events (
+           account_id, amo_event_id, amo_lead_id, from_status_id, to_status_id,
+           responsible_user_id, occurred_at
+         ) values (
+           ${input.accountId}, ${input.amoEventId}, ${input.amoLeadId},
+           ${input.fromStatusId}, ${input.toStatusId}, ${input.responsibleUserId},
+           ${input.occurredAt}
+         )
+         on conflict (account_id, amo_event_id) do nothing
+       `;
+     },
+ 
+     async appendResponsibleEvent(input) {
++      validateIdentity(input.accountId, true);
++      validateIdentity(input.amoLeadId, true);
++      validateIdentity(input.fromUserId);
++      validateIdentity(input.toUserId);
+       await db`
+         insert into public.lead_responsible_events (
+           account_id, amo_event_id, amo_lead_id, from_user_id, to_user_id,
+           occurred_at
+         ) values (
+           ${input.accountId}, ${input.amoEventId}, ${input.amoLeadId},
+           ${input.fromUserId}, ${input.toUserId}, ${input.occurredAt}
+         )
+         on conflict (account_id, amo_event_id) do nothing
+       `;
+     },
+ 
+     async upsertMilestone(input) {
++      validateIdentity(input.accountId, true);
++      validateIdentity(input.amoLeadId, true);
++      validateIdentity(input.applicationResponsibleUserId);
++      validateIdentity(input.wonResponsibleUserId);
+       await db`
+         insert into public.lead_milestones (
+           account_id, amo_lead_id, application_at, application_responsible_user_id,
+           won_at, won_responsible_user_id, currently_won, recalculated_at
+         ) values (
+           ${input.accountId}, ${input.amoLeadId}, ${input.applicationAt},
+           ${input.applicationResponsibleUserId}, ${input.wonAt},
+           ${input.wonResponsibleUserId}, ${input.currentlyWon},
+           ${input.recalculatedAt ?? new Date()}
+         )
+diff --git a/packages/db/src/quality.ts b/packages/db/src/quality.ts
+index 5ca0dad..86dab93 100644
+--- a/packages/db/src/quality.ts
++++ b/packages/db/src/quality.ts
+@@ -1,14 +1,14 @@
+ import type { JSONValue } from "postgres";
++import { AppError } from "@real2/domain";
+ 
+-import type { NormalizedLeadKey } from "./leads.js";
+-import type { Database } from "./client.js";
++import type { NormalizedLeadDb } from "./leads.js";
+ 
+ export type QualitySeverity = "info" | "warning" | "blocking";
+ export type QualityStatus = "open" | "resolved" | "accepted";
+ 
+ export type OpenQualityIssueInput = Readonly<{
+   accountId: number;
+   amoLeadId: number | null;
+   syncRunId?: string | null;
+   code: string;
+   severity: QualitySeverity;
+@@ -19,52 +19,76 @@ export type QualityIssue = Readonly<{
+   id: string;
+   accountId: number;
+   amoLeadId: number | null;
+   code: string;
+   severity: QualitySeverity;
+   status: QualityStatus;
+   firstSeenAt: Date;
+   lastSeenAt: Date;
+ }>;
+ 
++export type QualityLeadKey = Readonly<{
++  accountId: number;
++  amoLeadId: number | null;
++}>;
++
+ type QualityIssueRow = {
+   id: string;
+   account_id: string;
+   amo_lead_id: string | null;
+   code: string;
+   severity: QualitySeverity;
+   status: QualityStatus;
+   first_seen_at: Date;
+   last_seen_at: Date;
+ };
+ 
+ export type QualityRepository = Readonly<{
+   open(input: OpenQualityIssueInput): Promise<QualityIssue>;
+-  countOpen(leadKey: Readonly<Pick<NormalizedLeadKey, "accountId" | "amoLeadId">>, code: string): Promise<number>;
++  countOpen(leadKey: QualityLeadKey, code: string): Promise<number>;
+ }>;
+ 
++function safePositiveInteger(value: string): number {
++  const parsed = Number(value);
++  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new AppError("E_DB", 500);
++  return parsed;
++}
++
++function validateIdentity(value: number | null, required = false): void {
++  if (
++    (value === null && required)
++    || (value !== null && (!Number.isSafeInteger(value) || value <= 0))
++  ) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++}
++
+ function mapQualityIssue(row: QualityIssueRow): QualityIssue {
+   return {
+     id: row.id,
+-    accountId: Number(row.account_id),
+-    amoLeadId: row.amo_lead_id === null ? null : Number(row.amo_lead_id),
++    accountId: safePositiveInteger(row.account_id),
++    amoLeadId: row.amo_lead_id === null ? null : safePositiveInteger(row.amo_lead_id),
+     code: row.code,
+     severity: row.severity,
+     status: row.status,
+     firstSeenAt: row.first_seen_at,
+     lastSeenAt: row.last_seen_at,
+   };
+ }
+ 
+-export function createQualityRepository(db: Database): QualityRepository {
++export function createQualityRepository(
++  db: NormalizedLeadDb,
++): QualityRepository {
+   return {
+     async open(input) {
++      validateIdentity(input.accountId, true);
++      validateIdentity(input.amoLeadId);
+       const [row] = await db<QualityIssueRow[]>`
+         insert into public.data_quality_issues (
+           account_id, amo_lead_id, sync_run_id, code, severity, safe_details
+         ) values (
+           ${input.accountId}, ${input.amoLeadId}, ${input.syncRunId ?? null},
+           ${input.code}, ${input.severity}, ${db.json(input.safeDetails ?? {})}
+         )
+         on conflict (account_id, (coalesce(amo_lead_id, 0)), code)
+           where status = 'open'
+         do update set
+@@ -73,23 +97,25 @@ export function createQualityRepository(db: Database): QualityRepository {
+           safe_details = excluded.safe_details,
+           last_seen_at = excluded.last_seen_at
+         returning id, account_id, amo_lead_id, code, severity, status,
+           first_seen_at, last_seen_at
+       `;
+       if (!row) throw new Error("quality issue insert returned no row");
+       return mapQualityIssue(row);
+     },
+ 
+     async countOpen(leadKey, code) {
++      validateIdentity(leadKey.accountId, true);
++      validateIdentity(leadKey.amoLeadId);
+       const [row] = await db<{ count: number }[]>`
+         select count(*)::integer as count
+         from public.data_quality_issues
+         where account_id = ${leadKey.accountId}
+-          and amo_lead_id = ${leadKey.amoLeadId}
++          and amo_lead_id is not distinct from ${leadKey.amoLeadId}
+           and code = ${code}
+           and status = 'open'
+       `;
+       if (!row) throw new Error("quality issue count returned no row");
+       return row.count;
+     },
+   };
+ }
+diff --git a/supabase/migrations/0010_normalized_leads.sql b/supabase/migrations/0010_normalized_leads.sql
+index 9a6f7e0..8b8f780 100644
+--- a/supabase/migrations/0010_normalized_leads.sql
++++ b/supabase/migrations/0010_normalized_leads.sql
+@@ -218,12 +218,13 @@ using (
+   )
+ );
+ 
+ create policy data_quality_issues_leadership_select
+ on public.data_quality_issues
+ for select
+ to authenticated
+ using ((select app.current_role()) in ('admin', 'head'));
+ 
+ grant select, insert, update on table public.amo_users, public.pipeline_statuses,
+-  public.leads, public.lead_stage_events, public.lead_responsible_events,
+-  public.lead_milestones, public.data_quality_issues to service_worker;
++  public.leads, public.lead_milestones, public.data_quality_issues to service_worker;
++grant select, insert on table public.lead_stage_events,
++  public.lead_responsible_events to service_worker;
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index 8b218de..a5e811f 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -609,11 +609,31 @@ describe("normalized lead RLS", () => {
+     ).resolves.toEqual({
+       users: 0,
+       statuses: 0,
+       leads: 1,
+       stage_events: 1,
+       responsible_events: 1,
+       milestones: 1,
+       quality_issues: 0,
+     });
+   });
++
++  it("does not let the worker rewrite append-only normalized history", async () => {
++    await seedNormalizedLeads();
++    const workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl);
++
++    try {
++      await expect(workerDb`
++        update public.lead_stage_events
++        set to_status_id = 999
++        where account_id = 555151 and amo_event_id = 'stage-7001'
++      `).rejects.toMatchObject({ code: "42501" });
++      await expect(workerDb`
++        update public.lead_responsible_events
++        set to_user_id = 999
++        where account_id = 555151 and amo_event_id = 'responsible-7001'
++      `).rejects.toMatchObject({ code: "42501" });
++    } finally {
++      await closeDbClient(workerDb);
++    }
++  });
+ });

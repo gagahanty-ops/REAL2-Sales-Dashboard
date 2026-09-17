@@ -1,0 +1,1639 @@
+# Review package: 70121b92cc64ba68aeef17bf8b580643ab53924d..HEAD
+
+## Commits
+ff500c5 feat: secure amoCRM OAuth credentials
+
+## Files changed
+ .env.example                                |   4 +
+ apps/worker/src/jobs/refresh-amo-token.ts   | 175 ++++++++++++
+ apps/worker/src/main.test.mts               |   6 +
+ packages/db/src/amo-connections.ts          | 362 ++++++++++++++++++++++++
+ packages/db/src/index.ts                    |  18 ++
+ packages/domain/src/env.test.ts             |  31 +++
+ packages/domain/src/env.ts                  |  13 +
+ packages/integrations/src/amo/crypto.ts     |  80 ++++++
+ packages/integrations/src/amo/oauth.test.ts | 408 ++++++++++++++++++++++++++++
+ packages/integrations/src/amo/oauth.ts      |  97 +++++++
+ packages/integrations/src/index.ts          |  13 +
+ supabase/migrations/0002_amo_oauth.sql      |  76 ++++++
+ tests/security/rls.security.test.ts         |  82 ++++++
+ vitest.config.ts                            |   3 +
+ 14 files changed, 1368 insertions(+)
+
+## Diff
+diff --git a/.env.example b/.env.example
+index fe9d21e..44e9222 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,11 +1,15 @@
+ APP_URL=http://localhost:3000
+ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
+ SUPABASE_URL=http://127.0.0.1:54321
+ SUPABASE_ANON_KEY=local-anon-key
+ SUPABASE_SERVICE_ROLE_KEY=local-service-role-key
+ TRUSTED_PROXY_SECRET=local-placeholder-change-before-production
++AMO_CLIENT_ID=synthetic-client-id
++AMO_CLIENT_SECRET=synthetic-client-secret-change-before-use
++AMO_REDIRECT_URI=https://dashboard.example.invalid/api/integrations/amo/callback
++TOKEN_ENCRYPTION_KEY=bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=
+ BOOTSTRAP_ADMIN_EMAIL=admin@example.local
+ BOOTSTRAP_ADMIN_PASSWORD=change-me-before-use
+ BOOTSTRAP_ADMIN_FULL_NAME=Первый администратор
+ SYNC_ENABLED=false
+ SHEET_PUBLISH_ENABLED=false
+diff --git a/apps/worker/src/jobs/refresh-amo-token.ts b/apps/worker/src/jobs/refresh-amo-token.ts
+new file mode 100644
+index 0000000..6608b7f
+--- /dev/null
++++ b/apps/worker/src/jobs/refresh-amo-token.ts
+@@ -0,0 +1,175 @@
++import {
++  findDueAmoConnectionIds,
++  getAmoConnectionCredentials,
++  withLockedAmoConnection,
++  type Database,
++} from "@real2/db";
++import { AppError } from "@real2/domain";
++import {
++  decryptToken,
++  encryptToken,
++  refreshOAuthToken,
++  type AmoOAuthConfig,
++  type AmoOAuthTransport,
++  type AmoTokenProvider,
++  type TokenEncryptionKey,
++} from "@real2/integrations";
++
++const REFRESH_WINDOW_MS = 10 * 60_000;
++const inFlightRefreshes = new Map<string, Promise<string>>();
++
++export type RefreshAmoTokenDependencies = Readonly<{
++  db: Database;
++  encryptionKey: TokenEncryptionKey;
++  oauthConfig: AmoOAuthConfig;
++  transport: AmoOAuthTransport;
++}>;
++
++type TokenProviderDependencies = RefreshAmoTokenDependencies &
++  Readonly<{ now?: () => Date }>;
++
++type RefreshResult =
++  | Readonly<{ ok: true; accessToken: string }>
++  | Readonly<{ ok: false; error: AppError }>;
++
++export async function refreshConnection(
++  connectionId: string,
++  dependencies: RefreshAmoTokenDependencies,
++  now = new Date(),
++): Promise<string> {
++  const inFlight = inFlightRefreshes.get(connectionId);
++  if (inFlight) {
++    return inFlight;
++  }
++
++  const refresh = refreshConnectionLocked(connectionId, dependencies, now);
++  inFlightRefreshes.set(connectionId, refresh);
++
++  try {
++    return await refresh;
++  } finally {
++    if (inFlightRefreshes.get(connectionId) === refresh) {
++      inFlightRefreshes.delete(connectionId);
++    }
++  }
++}
++
++async function refreshConnectionLocked(
++  connectionId: string,
++  dependencies: RefreshAmoTokenDependencies,
++  now: Date,
++): Promise<string> {
++  const observedConnection = await getAmoConnectionCredentials(
++    dependencies.db,
++    connectionId,
++  );
++  const result = await withLockedAmoConnection(
++    dependencies.db,
++    connectionId,
++    async (connection, actions): Promise<RefreshResult> => {
++      if (connection.status !== "active") {
++        return { ok: false, error: new AppError("E_AMO_AUTH", 502) };
++      }
++
++      if (
++        !connection.refreshTokenCiphertext.equals(
++          observedConnection.refreshTokenCiphertext,
++        )
++      ) {
++        return {
++          ok: true,
++          accessToken: decryptToken(
++            connection.accessTokenCiphertext,
++            dependencies.encryptionKey,
++          ),
++        };
++      }
++
++      try {
++        const currentRefreshToken = decryptToken(
++          connection.refreshTokenCiphertext,
++          dependencies.encryptionKey,
++        );
++        const tokenPair = await refreshOAuthToken(
++          currentRefreshToken,
++          dependencies.oauthConfig,
++          dependencies.transport,
++        );
++        const tokenExpiresAt = new Date(
++          now.getTime() + tokenPair.expiresInSeconds * 1000,
++        );
++
++        await actions.rotateTokens({
++          accessTokenCiphertext: encryptToken(
++            tokenPair.accessToken,
++            dependencies.encryptionKey,
++          ),
++          refreshTokenCiphertext: encryptToken(
++            tokenPair.refreshToken,
++            dependencies.encryptionKey,
++          ),
++          tokenExpiresAt,
++          refreshedAt: now,
++        });
++
++        return { ok: true, accessToken: tokenPair.accessToken };
++      } catch {
++        await actions.markReauthRequired(now);
++        return { ok: false, error: new AppError("E_AMO_AUTH", 502) };
++      }
++    },
++  );
++
++  if (!result.ok) {
++    throw result.error;
++  }
++  return result.accessToken;
++}
++
++export async function refreshDueConnections(
++  dependencies: RefreshAmoTokenDependencies,
++  now = new Date(),
++): Promise<string[]> {
++  const cutoff = new Date(now.getTime() + REFRESH_WINDOW_MS);
++  const connectionIds = await findDueAmoConnectionIds(
++    dependencies.db,
++    cutoff,
++  );
++
++  for (const connectionId of connectionIds) {
++    await refreshConnection(connectionId, dependencies, now);
++  }
++
++  return connectionIds;
++}
++
++export function createAmoTokenProvider(
++  connectionId: string,
++  dependencies: TokenProviderDependencies,
++): AmoTokenProvider {
++  return {
++    async getAccessToken() {
++      const now = dependencies.now?.() ?? new Date();
++      const connection = await getAmoConnectionCredentials(
++        dependencies.db,
++        connectionId,
++      );
++
++      if (connection.status !== "active") {
++        throw new AppError("E_AMO_AUTH", 502);
++      }
++
++      if (
++        connection.tokenExpiresAt.getTime() <=
++        now.getTime() + REFRESH_WINDOW_MS
++      ) {
++        return refreshConnection(connectionId, dependencies, now);
++      }
++
++      return decryptToken(
++        connection.accessTokenCiphertext,
++        dependencies.encryptionKey,
++      );
++    },
++  };
++}
+diff --git a/apps/worker/src/main.test.mts b/apps/worker/src/main.test.mts
+index 80740cc..e7a3ad7 100644
+--- a/apps/worker/src/main.test.mts
++++ b/apps/worker/src/main.test.mts
+@@ -23,20 +23,26 @@ test("worker refuses enabled network switches before integrations are configured
+ test("worker CLI validates disabled switches and emits a safe one-shot result", async () => {
+   const lines: string[] = [];
+ 
+   await runWorkerCli(
+     {
+       APP_URL: "http://localhost:3000",
+       DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
+       SUPABASE_URL: "http://supabase:54321",
+       SUPABASE_ANON_KEY: "local-anon-key",
+       SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
++      AMO_CLIENT_ID: "synthetic-client-id",
++      AMO_CLIENT_SECRET: "synthetic-client-secret",
++      AMO_REDIRECT_URI:
++        "https://dashboard.example.invalid/api/integrations/amo/callback",
++      TOKEN_ENCRYPTION_KEY:
++        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
+       SYNC_ENABLED: "false",
+       SHEET_PUBLISH_ENABLED: "false",
+     },
+     (line) => lines.push(line),
+   );
+ 
+   assert.deepEqual(lines.map((line) => JSON.parse(line)), [
+     { status: "idle", networkRequests: 0 },
+   ]);
+ });
+diff --git a/packages/db/src/amo-connections.ts b/packages/db/src/amo-connections.ts
+new file mode 100644
+index 0000000..2909952
+--- /dev/null
++++ b/packages/db/src/amo-connections.ts
+@@ -0,0 +1,362 @@
++import { createHash, randomBytes } from "node:crypto";
++
++import { AppError } from "@real2/domain";
++import type { TransactionSql } from "postgres";
++
++import type { Database } from "./client.js";
++
++const OAUTH_STATE_TTL_MS = 10 * 60_000;
++const OAUTH_STATE_RETENTION_MS = 24 * 60 * 60_000;
++const DISABLED_CIPHERTEXT_BYTES = 64;
++
++export type AmoConnectionStatusValue =
++  | "pending"
++  | "active"
++  | "reauth_required"
++  | "disabled";
++
++export type OAuthState = Readonly<{
++  createdBy: string;
++  redirectAfter: string;
++  expiresAt: Date;
++}>;
++
++export type CreatedOAuthState = OAuthState & Readonly<{ value: string }>;
++
++export type SafeAmoConnectionStatus = Readonly<{
++  id: string;
++  accountId: number;
++  subdomain: string;
++  baseUrl: string;
++  tokenExpiresAt: Date;
++  status: AmoConnectionStatusValue;
++  installedBy: string;
++  installedAt: Date;
++  refreshedAt: Date | null;
++  disabledAt: Date | null;
++  updatedAt: Date;
++}>;
++
++export type AmoConnectionCredentials = SafeAmoConnectionStatus &
++  Readonly<{
++    accessTokenCiphertext: Buffer;
++    refreshTokenCiphertext: Buffer;
++  }>;
++
++export type CreateAmoConnectionInput = Readonly<{
++  accountId: number;
++  subdomain: string;
++  baseUrl: string;
++  accessTokenCiphertext: Uint8Array;
++  refreshTokenCiphertext: Uint8Array;
++  tokenExpiresAt: Date;
++  status: AmoConnectionStatusValue;
++  installedBy: string;
++}>;
++
++type OAuthStateRow = {
++  created_by: string;
++  redirect_after: string;
++  expires_at: Date;
++};
++
++type AmoConnectionRow = {
++  id: string;
++  account_id: string;
++  subdomain: string;
++  base_url: string;
++  access_token_ciphertext: Uint8Array;
++  refresh_token_ciphertext: Uint8Array;
++  token_expires_at: Date;
++  status: AmoConnectionStatusValue;
++  installed_by: string;
++  installed_at: Date;
++  refreshed_at: Date | null;
++  disabled_at: Date | null;
++  updated_at: Date;
++};
++
++export type LockedAmoConnectionActions = Readonly<{
++  rotateTokens(input: {
++    accessTokenCiphertext: Uint8Array;
++    refreshTokenCiphertext: Uint8Array;
++    tokenExpiresAt: Date;
++    refreshedAt: Date;
++  }): Promise<void>;
++  markReauthRequired(at: Date): Promise<void>;
++}>;
++
++function stateHash(value: string): string {
++  return createHash("sha256").update(value, "utf8").digest("hex");
++}
++
++function safeAccountId(value: string): number {
++  const parsed = Number(value);
++  if (!Number.isSafeInteger(parsed)) {
++    throw new AppError("E_DB", 500);
++  }
++  return parsed;
++}
++
++function mapConnection(row: AmoConnectionRow): AmoConnectionCredentials {
++  return {
++    id: row.id,
++    accountId: safeAccountId(row.account_id),
++    subdomain: row.subdomain,
++    baseUrl: row.base_url,
++    accessTokenCiphertext: Buffer.from(row.access_token_ciphertext),
++    refreshTokenCiphertext: Buffer.from(row.refresh_token_ciphertext),
++    tokenExpiresAt: row.token_expires_at,
++    status: row.status,
++    installedBy: row.installed_by,
++    installedAt: row.installed_at,
++    refreshedAt: row.refreshed_at,
++    disabledAt: row.disabled_at,
++    updatedAt: row.updated_at,
++  };
++}
++
++function safeProjection(
++  connection: AmoConnectionCredentials,
++): SafeAmoConnectionStatus {
++  return {
++    id: connection.id,
++    accountId: connection.accountId,
++    subdomain: connection.subdomain,
++    baseUrl: connection.baseUrl,
++    tokenExpiresAt: connection.tokenExpiresAt,
++    status: connection.status,
++    installedBy: connection.installedBy,
++    installedAt: connection.installedAt,
++    refreshedAt: connection.refreshedAt,
++    disabledAt: connection.disabledAt,
++    updatedAt: connection.updatedAt,
++  };
++}
++
++async function findConnection(
++  db: Database | TransactionSql,
++  connectionId: string,
++  lock = false,
++): Promise<AmoConnectionCredentials | null> {
++  const rows = await db.unsafe<AmoConnectionRow[]>(
++    `select
++      id,
++      account_id,
++      subdomain,
++      base_url,
++      access_token_ciphertext,
++      refresh_token_ciphertext,
++      token_expires_at,
++      status,
++      installed_by,
++      installed_at,
++      refreshed_at,
++      disabled_at,
++      updated_at
++    from public.amo_connections
++    where id = $1
++    limit 1${lock ? " for update" : ""}`,
++    [connectionId],
++  );
++  const row = rows[0];
++  return row ? mapConnection(row) : null;
++}
++
++export async function createOAuthState(
++  db: Database,
++  adminUserId: string,
++  now = new Date(),
++  redirectAfter = "/settings/integrations",
++): Promise<CreatedOAuthState> {
++  const value = randomBytes(32).toString("base64url");
++  const expiresAt = new Date(now.getTime() + OAUTH_STATE_TTL_MS);
++
++  await db`
++    insert into public.oauth_states (
++      state_hash,
++      created_by,
++      redirect_after,
++      expires_at,
++      created_at
++    ) values (
++      ${stateHash(value)},
++      ${adminUserId},
++      ${redirectAfter},
++      ${expiresAt},
++      ${now}
++    )
++  `;
++
++  return { value, createdBy: adminUserId, redirectAfter, expiresAt };
++}
++
++export async function consumeOAuthState(
++  db: Database,
++  value: string,
++  now = new Date(),
++): Promise<OAuthState> {
++  const [row] = await db<OAuthStateRow[]>`
++    update public.oauth_states
++    set consumed_at = ${now}
++    where state_hash = ${stateHash(value)}
++      and consumed_at is null
++      and expires_at > ${now}
++    returning created_by, redirect_after, expires_at
++  `;
++
++  if (!row) {
++    throw new AppError("E_CONFLICT", 422);
++  }
++
++  return {
++    createdBy: row.created_by,
++    redirectAfter: row.redirect_after,
++    expiresAt: row.expires_at,
++  };
++}
++
++export async function purgeExpiredOAuthStates(
++  db: Database,
++  now = new Date(),
++): Promise<number> {
++  const cutoff = new Date(now.getTime() - OAUTH_STATE_RETENTION_MS);
++  const rows = await db<{ state_hash: string }[]>`
++    delete from public.oauth_states
++    where expires_at < ${cutoff}
++    returning state_hash
++  `;
++  return rows.length;
++}
++
++export async function createAmoConnection(
++  db: Database,
++  input: CreateAmoConnectionInput,
++): Promise<SafeAmoConnectionStatus> {
++  const [row] = await db<AmoConnectionRow[]>`
++    insert into public.amo_connections (
++      account_id,
++      subdomain,
++      base_url,
++      access_token_ciphertext,
++      refresh_token_ciphertext,
++      token_expires_at,
++      status,
++      installed_by
++    ) values (
++      ${input.accountId},
++      ${input.subdomain},
++      ${input.baseUrl},
++      ${Buffer.from(input.accessTokenCiphertext)},
++      ${Buffer.from(input.refreshTokenCiphertext)},
++      ${input.tokenExpiresAt},
++      ${input.status},
++      ${input.installedBy}
++    )
++    returning *
++  `;
++
++  if (!row) {
++    throw new AppError("E_DB", 500);
++  }
++  return safeProjection(mapConnection(row));
++}
++
++export async function getAmoConnectionCredentials(
++  db: Database,
++  connectionId: string,
++): Promise<AmoConnectionCredentials> {
++  const connection = await findConnection(db, connectionId);
++  if (!connection) {
++    throw new AppError("E_NOT_FOUND", 404);
++  }
++  return connection;
++}
++
++export async function getSafeAmoConnectionStatus(
++  db: Database,
++  connectionId: string,
++): Promise<SafeAmoConnectionStatus> {
++  return safeProjection(await getAmoConnectionCredentials(db, connectionId));
++}
++
++export async function findDueAmoConnectionIds(
++  db: Database,
++  cutoff: Date,
++): Promise<string[]> {
++  const rows = await db<{ id: string }[]>`
++    select id
++    from public.amo_connections
++    where status = 'active'
++      and token_expires_at <= ${cutoff}
++    order by id
++  `;
++  return rows.map((row) => row.id);
++}
++
++export async function withLockedAmoConnection<T>(
++  db: Database,
++  connectionId: string,
++  callback: (
++    connection: AmoConnectionCredentials,
++    actions: LockedAmoConnectionActions,
++  ) => Promise<T>,
++): Promise<T> {
++  const result = await db.begin(async (transaction) => {
++    await transaction`
++      select pg_advisory_xact_lock(hashtextextended(${connectionId}, 0))
++    `;
++    const connection = await findConnection(transaction, connectionId, true);
++    if (!connection) {
++      throw new AppError("E_NOT_FOUND", 404);
++    }
++
++    const actions: LockedAmoConnectionActions = {
++      async rotateTokens(input) {
++        await transaction`
++          update public.amo_connections
++          set
++            access_token_ciphertext = ${Buffer.from(input.accessTokenCiphertext)},
++            refresh_token_ciphertext = ${Buffer.from(input.refreshTokenCiphertext)},
++            token_expires_at = ${input.tokenExpiresAt},
++            status = 'active',
++            refreshed_at = ${input.refreshedAt},
++            disabled_at = null,
++            updated_at = ${input.refreshedAt}
++          where id = ${connectionId}
++        `;
++      },
++      async markReauthRequired(at) {
++        await transaction`
++          update public.amo_connections
++          set status = 'reauth_required', updated_at = ${at}
++          where id = ${connectionId}
++        `;
++      },
++    };
++
++    return { value: await callback(connection, actions) };
++  });
++  return result.value;
++}
++
++export async function disableAmoConnection(
++  db: Database,
++  connectionId: string,
++  now = new Date(),
++): Promise<void> {
++  const result = await db`
++    update public.amo_connections
++    set
++      access_token_ciphertext = ${randomBytes(DISABLED_CIPHERTEXT_BYTES)},
++      refresh_token_ciphertext = ${randomBytes(DISABLED_CIPHERTEXT_BYTES)},
++      status = 'disabled',
++      disabled_at = ${now},
++      updated_at = ${now}
++    where id = ${connectionId}
++  `;
++
++  if (result.count !== 1) {
++    throw new AppError("E_NOT_FOUND", 404);
++  }
++}
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index e6139dd..03a53b8 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -6,10 +6,28 @@ export {
+ export {
+   AppIdentityError,
+   findAppUserByAuthId,
+   getSystemControl,
+   requireActiveAppUser,
+   type AppRole,
+   type AppUser,
+   type SystemControl,
+   type SystemControlKey,
+ } from "./identity.js";
++export {
++  consumeOAuthState,
++  createAmoConnection,
++  createOAuthState,
++  disableAmoConnection,
++  findDueAmoConnectionIds,
++  getAmoConnectionCredentials,
++  getSafeAmoConnectionStatus,
++  purgeExpiredOAuthStates,
++  withLockedAmoConnection,
++  type AmoConnectionCredentials,
++  type AmoConnectionStatusValue,
++  type CreatedOAuthState,
++  type CreateAmoConnectionInput,
++  type LockedAmoConnectionActions,
++  type OAuthState,
++  type SafeAmoConnectionStatus,
++} from "./amo-connections.js";
+diff --git a/packages/domain/src/env.test.ts b/packages/domain/src/env.test.ts
+index 46f455a..13d3167 100644
+--- a/packages/domain/src/env.test.ts
++++ b/packages/domain/src/env.test.ts
+@@ -1,20 +1,26 @@
+ import { describe, expect, it } from "vitest";
+ 
+ import { parseServerEnv } from "./env";
+ 
+ const base = {
+   APP_URL: "http://localhost:3000",
+   DATABASE_URL: "postgres://postgres:postgres@localhost:54322/postgres",
+   SUPABASE_URL: "http://localhost:54321",
+   SUPABASE_ANON_KEY: "local-anon-key",
+   SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
++  AMO_CLIENT_ID: "synthetic-client-id",
++  AMO_CLIENT_SECRET: "synthetic-client-secret",
++  AMO_REDIRECT_URI:
++    "https://dashboard.example.invalid/api/integrations/amo/callback",
++  TOKEN_ENCRYPTION_KEY:
++    "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
+ };
+ 
+ describe("parseServerEnv", () => {
+   it("defaults both network switches to false", () => {
+     const env = parseServerEnv(base);
+ 
+     expect(env.SYNC_ENABLED).toBe(false);
+     expect(env.SHEET_PUBLISH_ENABLED).toBe(false);
+   });
+ 
+@@ -37,11 +43,36 @@ describe("parseServerEnv", () => {
+ 
+   it("accepts only a sufficiently long optional trusted proxy secret", () => {
+     expect(
+       parseServerEnv({ ...base, TRUSTED_PROXY_SECRET: "p".repeat(32) })
+         .TRUSTED_PROXY_SECRET,
+     ).toBe("p".repeat(32));
+     expect(() =>
+       parseServerEnv({ ...base, TRUSTED_PROXY_SECRET: "too-short" }),
+     ).toThrow("TRUSTED_PROXY_SECRET");
+   });
++
++  it("accepts the server-only amoCRM OAuth configuration", () => {
++    const env = parseServerEnv(base);
++
++    expect(env).toMatchObject({
++      AMO_CLIENT_ID: "synthetic-client-id",
++      AMO_CLIENT_SECRET: "synthetic-client-secret",
++      AMO_REDIRECT_URI:
++        "https://dashboard.example.invalid/api/integrations/amo/callback",
++      TOKEN_ENCRYPTION_KEY:
++        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
++    });
++  });
++
++  it("requires an HTTPS redirect and an exactly 32-byte encryption key", () => {
++    expect(() =>
++      parseServerEnv({ ...base, AMO_REDIRECT_URI: "http://example.invalid/callback" }),
++    ).toThrow("AMO_REDIRECT_URI");
++    expect(() =>
++      parseServerEnv({
++        ...base,
++        TOKEN_ENCRYPTION_KEY: Buffer.alloc(31).toString("base64"),
++      }),
++    ).toThrow("TOKEN_ENCRYPTION_KEY");
++  });
+ });
+diff --git a/packages/domain/src/env.ts b/packages/domain/src/env.ts
+index 8681ce7..c2ec7e8 100644
+--- a/packages/domain/src/env.ts
++++ b/packages/domain/src/env.ts
+@@ -1,37 +1,50 @@
+ import { z } from "zod";
+ 
+ const booleanFlag = z
+   .enum(["true", "false"])
+   .default("false")
+   .transform((value) => value === "true");
+ 
++const tokenEncryptionKey = z.string().refine((value) => {
++  const decoded = Buffer.from(value, "base64");
++  return decoded.byteLength === 32 && decoded.toString("base64") === value;
++});
++
+ const serverEnvSchema = z
+   .object({
+     APP_URL: z.url(),
+     DATABASE_URL: z.url({ protocol: /^postgres(?:ql)?$/ }),
+     SUPABASE_URL: z.url(),
+     SUPABASE_ANON_KEY: z.string().min(8),
+     SUPABASE_SERVICE_ROLE_KEY: z.string().min(8),
+     TRUSTED_PROXY_SECRET: z.string().min(32).optional(),
++    AMO_CLIENT_ID: z.string().min(1),
++    AMO_CLIENT_SECRET: z.string().min(8),
++    AMO_REDIRECT_URI: z.url({ protocol: /^https$/ }),
++    TOKEN_ENCRYPTION_KEY: tokenEncryptionKey,
+     SYNC_ENABLED: booleanFlag,
+     SHEET_PUBLISH_ENABLED: booleanFlag,
+   })
+   .strict();
+ 
+ const serverEnvKeys = [
+   "APP_URL",
+   "DATABASE_URL",
+   "SUPABASE_URL",
+   "SUPABASE_ANON_KEY",
+   "SUPABASE_SERVICE_ROLE_KEY",
+   "TRUSTED_PROXY_SECRET",
++  "AMO_CLIENT_ID",
++  "AMO_CLIENT_SECRET",
++  "AMO_REDIRECT_URI",
++  "TOKEN_ENCRYPTION_KEY",
+   "SYNC_ENABLED",
+   "SHEET_PUBLISH_ENABLED",
+ ] as const;
+ 
+ export type ServerEnv = z.infer<typeof serverEnvSchema>;
+ 
+ export class ServerEnvValidationError extends Error {
+   constructor(fields: readonly string[]) {
+     super(`Invalid server configuration: ${fields.join(", ")}`);
+     this.name = "ServerEnvValidationError";
+diff --git a/packages/integrations/src/amo/crypto.ts b/packages/integrations/src/amo/crypto.ts
+new file mode 100644
+index 0000000..e288494
+--- /dev/null
++++ b/packages/integrations/src/amo/crypto.ts
+@@ -0,0 +1,80 @@
++import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
++
++import { AppError } from "@real2/domain";
++
++const KEY_BYTES = 32;
++const IV_BYTES = 12;
++const TAG_BYTES = 16;
++const FORMAT_VERSION = 1;
++
++export type TokenEncryptionKey = Uint8Array;
++
++function checkedKey(key: TokenEncryptionKey): Buffer {
++  if (key.byteLength !== KEY_BYTES) {
++    throw new AppError("E_CONFIG_INCOMPLETE", 500);
++  }
++
++  return Buffer.from(key);
++}
++
++export function decodeTokenEncryptionKey(value: string): Buffer {
++  const decoded = Buffer.from(value, "base64");
++  const canonical = decoded.toString("base64");
++
++  if (decoded.byteLength !== KEY_BYTES || canonical !== value) {
++    throw new AppError("E_CONFIG_INCOMPLETE", 500);
++  }
++
++  return decoded;
++}
++
++export function encryptToken(
++  plaintext: string,
++  key: TokenEncryptionKey,
++): Buffer {
++  const iv = randomBytes(IV_BYTES);
++  const cipher = createCipheriv("aes-256-gcm", checkedKey(key), iv);
++  const ciphertext = Buffer.concat([
++    cipher.update(plaintext, "utf8"),
++    cipher.final(),
++  ]);
++  const tag = cipher.getAuthTag();
++
++  return Buffer.concat([
++    Buffer.from([FORMAT_VERSION]),
++    iv,
++    tag,
++    ciphertext,
++  ]);
++}
++
++export function decryptToken(
++  encrypted: Uint8Array,
++  key: TokenEncryptionKey,
++): string {
++  try {
++    const blob = Buffer.from(encrypted);
++    const minimumLength = 1 + IV_BYTES + TAG_BYTES + 1;
++
++    if (blob.byteLength < minimumLength || blob[0] !== FORMAT_VERSION) {
++      throw new Error("invalid ciphertext");
++    }
++
++    const ivStart = 1;
++    const tagStart = ivStart + IV_BYTES;
++    const ciphertextStart = tagStart + TAG_BYTES;
++    const decipher = createDecipheriv(
++      "aes-256-gcm",
++      checkedKey(key),
++      blob.subarray(ivStart, tagStart),
++    );
++    decipher.setAuthTag(blob.subarray(tagStart, ciphertextStart));
++
++    return Buffer.concat([
++      decipher.update(blob.subarray(ciphertextStart)),
++      decipher.final(),
++    ]).toString("utf8");
++  } catch {
++    throw new AppError("E_AMO_AUTH", 502);
++  }
++}
+diff --git a/packages/integrations/src/amo/oauth.test.ts b/packages/integrations/src/amo/oauth.test.ts
+new file mode 100644
+index 0000000..f315931
+--- /dev/null
++++ b/packages/integrations/src/amo/oauth.test.ts
+@@ -0,0 +1,408 @@
++import postgres from "postgres";
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import {
++  createAmoConnection,
++  createOAuthState,
++  disableAmoConnection,
++  getAmoConnectionCredentials,
++  getSafeAmoConnectionStatus,
++  purgeExpiredOAuthStates,
++  consumeOAuthState,
++  withLockedAmoConnection,
++} from "@real2/db";
++import { AppError } from "@real2/domain";
++import {
++  createAmoTokenProvider,
++  refreshConnection,
++  refreshDueConnections,
++} from "../../../../apps/worker/src/jobs/refresh-amo-token";
++import { localDatabaseUrl, resetAndSeedUsers, testUsers } from "../../../../tests/helpers/local-db";
++import { decryptToken, encryptToken } from "./crypto";
++import { exchangeAuthorizationCode } from "./oauth";
++
++const encryptionKey = Buffer.from("local-synthetic-encryption-key!!");
++const now = new Date("2026-09-12T12:00:00.000Z");
++const tokenEndpoint = "https://555151.amocrm.ru/oauth2/access_token";
++
++const oauthConfig = {
++  clientId: "synthetic-client-id",
++  clientSecret: "synthetic-client-secret",
++  redirectUri: "https://dashboard.example.invalid/api/integrations/amo/callback",
++} as const;
++
++const adminDb = postgres(localDatabaseUrl, { max: 4 });
++
++function tokenResponse(
++  accessToken = "synthetic-access-next",
++  refreshToken = "synthetic-refresh-next",
++): Response {
++  return new Response(
++    JSON.stringify({
++      token_type: "Bearer",
++      expires_in: 86_400,
++      access_token: accessToken,
++      refresh_token: refreshToken,
++    }),
++    { status: 200, headers: { "content-type": "application/json" } },
++  );
++}
++
++function createOAuthTransport(response: Response = tokenResponse()) {
++  const audits: unknown[] = [];
++  const requests: Array<{ url: string; init: RequestInit }> = [];
++  const fetchFn = vi.fn(async (url: string | URL, init: RequestInit) => {
++    requests.push({ url: String(url), init });
++    return response.clone();
++  });
++
++  return {
++    audits,
++    requests,
++    fetchFn,
++    transport: {
++      fetchFn,
++      auditSink: {
++        record(entry: unknown) {
++          audits.push(entry);
++        },
++      },
++      traceId: "01J00000000000000000000000",
++    },
++  };
++}
++
++async function insertConnection(overrides: {
++  accountId?: number;
++  subdomain?: string;
++  tokenExpiresAt?: Date;
++} = {}) {
++  return createAmoConnection(adminDb, {
++    accountId: overrides.accountId ?? 555_151,
++    subdomain: overrides.subdomain ?? "555151",
++    baseUrl: "https://555151.amocrm.ru",
++    accessTokenCiphertext: encryptToken("synthetic-access-old", encryptionKey),
++    refreshTokenCiphertext: encryptToken("synthetic-refresh-old", encryptionKey),
++    tokenExpiresAt:
++      overrides.tokenExpiresAt ?? new Date(now.getTime() + 5 * 60_000),
++    status: "active",
++    installedBy: testUsers.admin.id,
++  });
++}
++
++beforeEach(async () => {
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
++  await resetAndSeedUsers(adminDb, [
++    testUsers.admin,
++    testUsers.head,
++    testUsers.managerOne,
++  ]);
++});
++
++afterEach(async () => {
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
++});
++
++afterAll(async () => {
++  await adminDb.end();
++});
++
++describe("OAuth state storage", () => {
++  it("consumes a state exactly once within ten minutes", async () => {
++    const state = await createOAuthState(adminDb, testUsers.admin.id, now);
++
++    await expect(
++      consumeOAuthState(
++        adminDb,
++        state.value,
++        new Date(now.getTime() + 9 * 60_000),
++      ),
++    ).resolves.toMatchObject({ createdBy: testUsers.admin.id });
++    await expect(
++      consumeOAuthState(
++        adminDb,
++        state.value,
++        new Date(now.getTime() + 9 * 60_000),
++      ),
++    ).rejects.toThrow("E_CONFLICT");
++  });
++
++  it("rejects an expired state without consuming it", async () => {
++    const state = await createOAuthState(adminDb, testUsers.admin.id, now);
++
++    await expect(
++      consumeOAuthState(
++        adminDb,
++        state.value,
++        new Date(now.getTime() + 10 * 60_000 + 1),
++      ),
++    ).rejects.toThrow("E_CONFLICT");
++  });
++
++  it("purges states only after their post-expiry retention period", async () => {
++    await createOAuthState(
++      adminDb,
++      testUsers.admin.id,
++      new Date(now.getTime() - 24 * 60 * 60_000 - 10 * 60_001),
++    );
++    await createOAuthState(adminDb, testUsers.admin.id, now);
++
++    await expect(purgeExpiredOAuthStates(adminDb, now)).resolves.toBe(1);
++  });
++});
++
++describe("OAuth token encryption", () => {
++  it("uses a fresh authenticated ciphertext for every token", () => {
++    const first = encryptToken("synthetic-secret", encryptionKey);
++    const second = encryptToken("synthetic-secret", encryptionKey);
++
++    expect(first).not.toEqual(second);
++    expect(first.includes(Buffer.from("synthetic-secret"))).toBe(false);
++    expect(decryptToken(first, encryptionKey)).toBe("synthetic-secret");
++    expect(decryptToken(second, encryptionKey)).toBe("synthetic-secret");
++  });
++
++  it("rejects keys that are not exactly 32 bytes", () => {
++    expect(() => encryptToken("synthetic-secret", Buffer.alloc(31))).toThrow(
++      "E_CONFIG_INCOMPLETE",
++    );
++  });
++});
++
++describe("OAuth exchange", () => {
++  it("uses the guarded OAuth POST without bearer auth or unsafe audit fields", async () => {
++    const { audits, requests, transport } = createOAuthTransport();
++
++    await expect(
++      exchangeAuthorizationCode("synthetic-code", oauthConfig, transport),
++    ).resolves.toMatchObject({ expiresInSeconds: 86_400 });
++
++    expect(requests).toHaveLength(1);
++    expect(requests[0]?.url).toBe(tokenEndpoint);
++    expect(requests[0]?.init).toMatchObject({
++      method: "POST",
++      redirect: "error",
++    });
++    expect((requests[0]?.init.headers as Headers).get("authorization")).toBeNull();
++    expect(String(requests[0]?.init.body)).toContain("authorization_code");
++    expect(JSON.stringify(audits)).not.toMatch(
++      /synthetic-code|synthetic-client-secret|synthetic-access-next|synthetic-refresh-next/i,
++    );
++  });
++
++  it("maps malformed upstream data to a safe error", async () => {
++    const malformed = new Response(
++      JSON.stringify({ access_token: "synthetic-leaked-token" }),
++      { status: 200 },
++    );
++    const { transport } = createOAuthTransport(malformed);
++
++    const exchange = exchangeAuthorizationCode(
++      "synthetic-code",
++      oauthConfig,
++      transport,
++    );
++
++    await expect(exchange).rejects.toMatchObject({ code: "E_AMO_UPSTREAM" });
++    await expect(exchange).rejects.not.toThrow("synthetic-leaked-token");
++  });
++});
++
++describe("amoCRM connection repository", () => {
++  it("returns a status projection that cannot serialize token material", async () => {
++    const connection = await insertConnection();
++
++    const status = await getSafeAmoConnectionStatus(adminDb, connection.id);
++
++    expect(status).toMatchObject({
++      id: connection.id,
++      accountId: 555_151,
++      subdomain: "555151",
++      status: "active",
++    });
++    expect(JSON.stringify(status)).not.toMatch(
++      /access_token|refresh_token|ciphertext|synthetic-secret/i,
++    );
++  });
++
++  it("overwrites both ciphertexts when a connection is disabled", async () => {
++    const connection = await insertConnection();
++    const before = await getAmoConnectionCredentials(adminDb, connection.id);
++
++    await disableAmoConnection(adminDb, connection.id, now);
++
++    const after = await getAmoConnectionCredentials(adminDb, connection.id);
++    expect(after.status).toBe("disabled");
++    expect(after.accessTokenCiphertext).not.toEqual(before.accessTokenCiphertext);
++    expect(after.refreshTokenCiphertext).not.toEqual(before.refreshTokenCiphertext);
++    expect(() => decryptToken(after.accessTokenCiphertext, encryptionKey)).toThrow(
++      "E_AMO_AUTH",
++    );
++    expect(() => decryptToken(after.refreshTokenCiphertext, encryptionKey)).toThrow(
++      "E_AMO_AUTH",
++    );
++  });
++});
++
++describe("token rotation", () => {
++  it("takes a transaction-scoped advisory lock for a connection", async () => {
++    const connection = await insertConnection();
++
++    await withLockedAmoConnection(adminDb, connection.id, async () => {
++      const [lockAttempt] = await adminDb<{ acquired: boolean }[]>`
++        select pg_try_advisory_xact_lock(hashtextextended(${connection.id}, 0))
++          as acquired
++      `;
++
++      expect(lockAttempt?.acquired).toBe(false);
++    });
++  });
++
++  it("rotates the whole token pair once across concurrent refreshes", async () => {
++    const connection = await insertConnection();
++    const audits: unknown[] = [];
++    let releaseUpstream!: () => void;
++    let signalUpstreamStarted!: () => void;
++    const upstreamGate = new Promise<void>((resolve) => {
++      releaseUpstream = resolve;
++    });
++    const upstreamStarted = new Promise<void>((resolve) => {
++      signalUpstreamStarted = resolve;
++    });
++    const fetchFn = vi.fn(async () => {
++      signalUpstreamStarted();
++      await upstreamGate;
++      return tokenResponse();
++    });
++    const transport = {
++      fetchFn,
++      auditSink: {
++        record(entry: unknown) {
++          audits.push(entry);
++        },
++      },
++      traceId: "01J00000000000000000000000",
++    };
++    const dependencies = {
++      db: adminDb,
++      encryptionKey,
++      oauthConfig,
++      transport,
++    };
++
++    const firstPromise = refreshConnection(connection.id, dependencies, now);
++    const secondPromise = refreshConnection(connection.id, dependencies, now);
++    await upstreamStarted;
++    releaseUpstream();
++    const [first, second] = await Promise.all([firstPromise, secondPromise]);
++
++    expect(first).toBe("synthetic-access-next");
++    expect(second).toBe("synthetic-access-next");
++    expect(fetchFn).toHaveBeenCalledTimes(1);
++    const stored = await getAmoConnectionCredentials(adminDb, connection.id);
++    expect(decryptToken(stored.accessTokenCiphertext, encryptionKey)).toBe(
++      "synthetic-access-next",
++    );
++    expect(decryptToken(stored.refreshTokenCiphertext, encryptionKey)).toBe(
++      "synthetic-refresh-next",
++    );
++    expect(stored.refreshedAt).toEqual(now);
++    expect(JSON.stringify(audits)).not.toMatch(
++      /synthetic-access|synthetic-refresh|synthetic-client-secret/i,
++    );
++  });
++
++  it("does not mistake a later explicit refresh for a concurrent waiter", async () => {
++    const connection = await insertConnection();
++    const { fetchFn, transport } = createOAuthTransport();
++    const dependencies = {
++      db: adminDb,
++      encryptionKey,
++      oauthConfig,
++      transport,
++    };
++
++    await refreshConnection(connection.id, dependencies, now);
++    await refreshConnection(connection.id, dependencies, now);
++
++    expect(fetchFn).toHaveBeenCalledTimes(2);
++  });
++
++  it("marks the connection reauth_required when refresh fails", async () => {
++    const connection = await insertConnection();
++    const { transport } = createOAuthTransport(
++      new Response(JSON.stringify({ message: "synthetic-upstream-detail" }), {
++        status: 500,
++      }),
++    );
++
++    const refresh = refreshConnection(
++      connection.id,
++      { db: adminDb, encryptionKey, oauthConfig, transport },
++      now,
++    );
++
++    await expect(refresh).rejects.toMatchObject({ code: "E_AMO_AUTH" });
++    await expect(refresh).rejects.not.toThrow("synthetic-upstream-detail");
++    await expect(
++      getSafeAmoConnectionStatus(adminDb, connection.id),
++    ).resolves.toMatchObject({ status: "reauth_required" });
++
++    const provider = createAmoTokenProvider(connection.id, {
++      db: adminDb,
++      encryptionKey,
++      oauthConfig,
++      transport,
++      now: () => now,
++    });
++    await expect(provider.getAccessToken()).rejects.toEqual(
++      new AppError("E_AMO_AUTH", 502),
++    );
++  });
++
++  it("starts proactive refresh at the exact ten-minute boundary", async () => {
++    const due = await insertConnection({
++      accountId: 555_151,
++      subdomain: "555151",
++      tokenExpiresAt: new Date(now.getTime() + 10 * 60_000),
++    });
++    await insertConnection({
++      accountId: 555_152,
++      subdomain: "555152",
++      tokenExpiresAt: new Date(now.getTime() + 10 * 60_000 + 1),
++    });
++    const { fetchFn, transport } = createOAuthTransport();
++
++    await expect(
++      refreshDueConnections(
++        { db: adminDb, encryptionKey, oauthConfig, transport },
++        now,
++      ),
++    ).resolves.toEqual([due.id]);
++    expect(fetchFn).toHaveBeenCalledTimes(1);
++  });
++
++  it("provides tokens only for an active connection", async () => {
++    const connection = await insertConnection({
++      tokenExpiresAt: new Date(now.getTime() + 60 * 60_000),
++    });
++    const { transport } = createOAuthTransport();
++    const provider = createAmoTokenProvider(connection.id, {
++      db: adminDb,
++      encryptionKey,
++      oauthConfig,
++      transport,
++      now: () => now,
++    });
++
++    await expect(provider.getAccessToken()).resolves.toBe(
++      "synthetic-access-old",
++    );
++    await disableAmoConnection(adminDb, connection.id, now);
++    await expect(provider.getAccessToken()).rejects.toEqual(
++      new AppError("E_AMO_AUTH", 502),
++    );
++  });
++});
+diff --git a/packages/integrations/src/amo/oauth.ts b/packages/integrations/src/amo/oauth.ts
+new file mode 100644
+index 0000000..50e0bd7
+--- /dev/null
++++ b/packages/integrations/src/amo/oauth.ts
+@@ -0,0 +1,97 @@
++import { z } from "zod";
++
++import type { AmoAuditSink, AmoFetchFn } from "./types";
++import { amoFetch } from "./transport";
++
++const AMO_TOKEN_ENDPOINT = "https://555151.amocrm.ru/oauth2/access_token";
++
++const tokenResponseSchema = z
++  .object({
++    token_type: z.string().min(1),
++    expires_in: z.number().int().positive(),
++    access_token: z.string().min(1),
++    refresh_token: z.string().min(1),
++  })
++  .strict();
++
++export type AmoOAuthConfig = Readonly<{
++  clientId: string;
++  clientSecret: string;
++  redirectUri: string;
++}>;
++
++export type AmoOAuthTransport = Readonly<{
++  fetchFn: AmoFetchFn;
++  auditSink: AmoAuditSink;
++  traceId: string;
++}>;
++
++export type AmoTokenPair = Readonly<{
++  accessToken: string;
++  refreshToken: string;
++  expiresInSeconds: number;
++}>;
++
++const oauthTokenProvider = {
++  async getAccessToken(): Promise<string> {
++    throw new Error("OAuth requests must not resolve a bearer token");
++  },
++};
++
++async function exchangeToken(
++  payload: Record<string, string>,
++  transport: AmoOAuthTransport,
++): Promise<AmoTokenPair> {
++  const response = await amoFetch({
++    method: "POST",
++    url: AMO_TOKEN_ENDPOINT,
++    schema: tokenResponseSchema,
++    traceId: transport.traceId,
++    tokenProvider: oauthTokenProvider,
++    fetchFn: transport.fetchFn,
++    auditSink: transport.auditSink,
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify(payload),
++    redirect: "error",
++  });
++
++  return {
++    accessToken: response.access_token,
++    refreshToken: response.refresh_token,
++    expiresInSeconds: response.expires_in,
++  };
++}
++
++export function exchangeAuthorizationCode(
++  code: string,
++  config: AmoOAuthConfig,
++  transport: AmoOAuthTransport,
++): Promise<AmoTokenPair> {
++  return exchangeToken(
++    {
++      client_id: config.clientId,
++      client_secret: config.clientSecret,
++      grant_type: "authorization_code",
++      code,
++      redirect_uri: config.redirectUri,
++    },
++    transport,
++  );
++}
++
++export function refreshOAuthToken(
++  refreshToken: string,
++  config: AmoOAuthConfig,
++  transport: AmoOAuthTransport,
++): Promise<AmoTokenPair> {
++  return exchangeToken(
++    {
++      client_id: config.clientId,
++      client_secret: config.clientSecret,
++      grant_type: "refresh_token",
++      refresh_token: refreshToken,
++      redirect_uri: config.redirectUri,
++    },
++    transport,
++  );
++}
+diff --git a/packages/integrations/src/index.ts b/packages/integrations/src/index.ts
+index ace7292..898ff54 100644
+--- a/packages/integrations/src/index.ts
++++ b/packages/integrations/src/index.ts
+@@ -1,10 +1,23 @@
+ export { assertAmoRequestAllowed } from "./amo/policy.js";
++export {
++  decodeTokenEncryptionKey,
++  decryptToken,
++  encryptToken,
++  type TokenEncryptionKey,
++} from "./amo/crypto.js";
++export {
++  exchangeAuthorizationCode,
++  refreshOAuthToken,
++  type AmoOAuthConfig,
++  type AmoOAuthTransport,
++  type AmoTokenPair,
++} from "./amo/oauth.js";
+ export { amoFetch } from "./amo/transport.js";
+ export type {
+   AmoAuditEntry,
+   AmoAuditSink,
+   AmoFetchFn,
+   AmoFetchRequest,
+   AmoTokenProvider,
+   NormalizedAmoRequest,
+ } from "./amo/types.js";
+diff --git a/supabase/migrations/0002_amo_oauth.sql b/supabase/migrations/0002_amo_oauth.sql
+new file mode 100644
+index 0000000..5409eec
+--- /dev/null
++++ b/supabase/migrations/0002_amo_oauth.sql
+@@ -0,0 +1,76 @@
++create type public.connection_status as enum (
++  'pending',
++  'active',
++  'reauth_required',
++  'disabled'
++);
++
++create table public.oauth_states (
++  state_hash text primary key,
++  created_by uuid not null references public.app_users(id),
++  redirect_after text not null default '/settings/integrations',
++  expires_at timestamptz not null,
++  consumed_at timestamptz,
++  created_at timestamptz not null default now()
++);
++
++create table public.amo_connections (
++  id uuid primary key default gen_random_uuid(),
++  account_id bigint not null unique,
++  subdomain text not null unique check (subdomain ~ '^[a-z0-9-]+$'),
++  base_url text not null check (base_url = 'https://555151.amocrm.ru'),
++  access_token_ciphertext bytea not null,
++  refresh_token_ciphertext bytea not null,
++  token_expires_at timestamptz not null,
++  status public.connection_status not null,
++  installed_by uuid not null references public.app_users(id),
++  installed_at timestamptz not null default now(),
++  refreshed_at timestamptz,
++  disabled_at timestamptz,
++  updated_at timestamptz not null default now()
++);
++
++create index amo_connections_refresh_due_idx
++on public.amo_connections (token_expires_at)
++where status = 'active';
++
++alter table public.oauth_states enable row level security;
++alter table public.amo_connections enable row level security;
++
++revoke all on table public.oauth_states from anon, authenticated;
++revoke all on table public.amo_connections from anon, authenticated;
++
++grant select (
++  id,
++  account_id,
++  subdomain,
++  base_url,
++  token_expires_at,
++  status,
++  installed_by,
++  installed_at,
++  refreshed_at,
++  disabled_at,
++  updated_at
++) on public.amo_connections to authenticated;
++
++create policy amo_connections_admin_status_select
++on public.amo_connections
++for select
++to authenticated
++using ((select app.current_role()) = 'admin');
++
++do $$
++begin
++  if not exists (select 1 from pg_roles where rolname = 'service_worker') then
++    create role service_worker nologin noinherit bypassrls;
++  end if;
++end
++$$;
++
++grant usage on schema public to service_worker;
++grant select, insert, update, delete
++on public.oauth_states, public.amo_connections
++to service_worker;
++
++grant service_worker to postgres, service_role;
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index 99f915f..8fa7fa3 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -6,21 +6,44 @@ import {
+   testUsers,
+   updateOwnNameAsManager,
+   visibleAppUserIds,
+   visibleControlKeys,
+ } from "../helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+ const allUsers = Object.values(testUsers);
+ 
+ beforeEach(async () => {
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
+   await resetAndSeedUsers(adminDb, allUsers);
++  await adminDb`
++    insert into public.amo_connections (
++      account_id,
++      subdomain,
++      base_url,
++      access_token_ciphertext,
++      refresh_token_ciphertext,
++      token_expires_at,
++      status,
++      installed_by
++    ) values (
++      555151,
++      '555151',
++      'https://555151.amocrm.ru',
++      ${Buffer.alloc(64)},
++      ${Buffer.alloc(64)},
++      '2026-09-12T13:00:00.000Z',
++      'active',
++      ${testUsers.admin.id}
++    )
++  `;
+ });
+ 
+ afterAll(async () => {
+   await adminDb.end();
+ });
+ 
+ describe("identity RLS deny-by-default rules", () => {
+   it.each([testUsers.admin, testUsers.head])(
+     "$role can read every application user",
+     async (user) => {
+@@ -67,10 +90,69 @@ describe("identity RLS deny-by-default rules", () => {
+       visibleControlKeys(adminDb, testUsers.managerOne.authUserId),
+     ).resolves.toEqual([]);
+   });
+ 
+   it("does not allow a manager to update even their own row", async () => {
+     await expect(
+       updateOwnNameAsManager(adminDb, testUsers.managerOne),
+     ).rejects.toMatchObject({ code: "42501" });
+   });
+ });
++
++describe("amoCRM credential RLS", () => {
++  it("lets an admin read only the safe connection projection", async () => {
++    await expect(
++      adminDb.begin(async (transaction) => {
++        await transaction.unsafe("set local role authenticated");
++        await transaction`
++          select set_config(
++            'request.jwt.claim.sub',
++            ${testUsers.admin.authUserId},
++            true
++          )
++        `;
++        return transaction<{
++          account_id: string;
++          subdomain: string;
++          status: string;
++        }[]>`
++          select account_id, subdomain, status
++          from public.amo_connections
++        `;
++      }),
++    ).resolves.toEqual([
++      { account_id: "555151", subdomain: "555151", status: "active" },
++    ]);
++  });
++
++  it("does not grant user-facing roles token or OAuth-state access", async () => {
++    await expect(
++      adminDb.begin(async (transaction) => {
++        await transaction.unsafe("set local role authenticated");
++        await transaction`
++          select set_config(
++            'request.jwt.claim.sub',
++            ${testUsers.admin.authUserId},
++            true
++          )
++        `;
++        await transaction`
++          select access_token_ciphertext from public.amo_connections
++        `;
++      }),
++    ).rejects.toMatchObject({ code: "42501" });
++
++    await expect(
++      adminDb.begin(async (transaction) => {
++        await transaction.unsafe("set local role authenticated");
++        await transaction`
++          select set_config(
++            'request.jwt.claim.sub',
++            ${testUsers.admin.authUserId},
++            true
++          )
++        `;
++        await transaction`select state_hash from public.oauth_states`;
++      }),
++    ).rejects.toMatchObject({ code: "42501" });
++  });
++});
+diff --git a/vitest.config.ts b/vitest.config.ts
+index d4facea..bb806bf 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -1,20 +1,23 @@
+ import { configDefaults, defineConfig } from "vitest/config";
+ import { fileURLToPath } from "node:url";
+ 
+ const workspaceAliases = {
+   "@real2/db": fileURLToPath(
+     new URL("./packages/db/src/index.ts", import.meta.url),
+   ),
+   "@real2/domain": fileURLToPath(
+     new URL("./packages/domain/src/index.ts", import.meta.url),
+   ),
++  "@real2/integrations": fileURLToPath(
++    new URL("./packages/integrations/src/index.ts", import.meta.url),
++  ),
+   "@real2/testkit": fileURLToPath(
+     new URL("./packages/testkit/src/index.ts", import.meta.url),
+   ),
+ };
+ 
+ export default defineConfig({
+   resolve: {
+     alias: workspaceAliases,
+   },
+   test: {

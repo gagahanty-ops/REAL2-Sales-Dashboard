@@ -1,0 +1,454 @@
+# Review package: 6c43c702a445a70978c347b11605f15f4997ee49..HEAD
+
+## Commits
+70121b9 feat: enforce amoCRM read-only transport
+
+## Files changed
+ packages/integrations/src/amo/policy.test.ts       |  45 +++++++
+ packages/integrations/src/amo/policy.ts            |  53 ++++++++
+ .../src/amo/transport.integration.test.ts          | 141 +++++++++++++++++++++
+ packages/integrations/src/amo/transport.ts         | 111 ++++++++++++++++
+ packages/integrations/src/amo/types.ts             |  43 +++++++
+ packages/integrations/src/index.ts                 |  11 +-
+ 6 files changed, 403 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/packages/integrations/src/amo/policy.test.ts b/packages/integrations/src/amo/policy.test.ts
+new file mode 100644
+index 0000000..55bdf6e
+--- /dev/null
++++ b/packages/integrations/src/amo/policy.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, it } from "vitest";
++
++import { assertAmoRequestAllowed } from "./policy";
++
++describe("assertAmoRequestAllowed", () => {
++  it.each([
++    ["GET", "/api/v4/account"],
++    ["GET", "/api/v4/leads"],
++    ["GET", "/api/v4/leads/123"],
++    ["GET", "/api/v4/leads/pipelines"],
++    ["GET", "/api/v4/leads/pipelines/77/statuses"],
++    ["GET", "/api/v4/leads/custom_fields"],
++    ["GET", "/api/v4/users"],
++    ["GET", "/api/v4/events"],
++    ["POST", "/oauth2/access_token"],
++  ])("allows %s %s", (method, path) => {
++    expect(
++      assertAmoRequestAllowed({
++        method,
++        url: `https://555151.amocrm.ru${path}`,
++      }),
++    ).toMatchObject({ method, normalizedPath: path });
++  });
++
++  it.each(["POST", "PATCH", "PUT", "DELETE"])(
++    "denies %s on business paths",
++    (method) => {
++      expect(() =>
++        assertAmoRequestAllowed({
++          method,
++          url: "https://555151.amocrm.ru/api/v4/leads/123",
++        }),
++      ).toThrowError("E_AMO_METHOD_DENIED");
++    },
++  );
++
++  it("denies an attacker-controlled host", () => {
++    expect(() =>
++      assertAmoRequestAllowed({
++        method: "GET",
++        url: "https://example.org/api/v4/leads",
++      }),
++    ).toThrowError("E_AMO_PATH_DENIED");
++  });
++});
+diff --git a/packages/integrations/src/amo/policy.ts b/packages/integrations/src/amo/policy.ts
+new file mode 100644
+index 0000000..b257fce
+--- /dev/null
++++ b/packages/integrations/src/amo/policy.ts
+@@ -0,0 +1,53 @@
++import { AppError } from "@real2/domain";
++
++import type { NormalizedAmoRequest } from "./types";
++
++const AMO_HOST = "555151.amocrm.ru";
++
++const businessGetPaths = [
++  /^\/api\/v4\/account$/,
++  /^\/api\/v4\/users$/,
++  /^\/api\/v4\/leads(?:\/\d+)?$/,
++  /^\/api\/v4\/leads\/custom_fields$/,
++  /^\/api\/v4\/leads\/pipelines(?:\/\d+(?:\/statuses)?)?$/,
++  /^\/api\/v4\/events$/,
++];
++
++export function assertAmoRequestAllowed(input: {
++  method: string;
++  url: string;
++}): NormalizedAmoRequest {
++  let url: URL;
++
++  try {
++    url = new URL(input.url);
++  } catch {
++    throw new AppError("E_AMO_PATH_DENIED", 403);
++  }
++
++  const method = input.method.toUpperCase();
++
++  if (
++    url.protocol !== "https:" ||
++    url.hostname !== AMO_HOST ||
++    url.port ||
++    url.username ||
++    url.password
++  ) {
++    throw new AppError("E_AMO_PATH_DENIED", 403);
++  }
++
++  if (method === "POST" && url.pathname === "/oauth2/access_token") {
++    return { method, url, normalizedPath: url.pathname, kind: "oauth" };
++  }
++
++  if (method !== "GET") {
++    throw new AppError("E_AMO_METHOD_DENIED", 403);
++  }
++
++  if (!businessGetPaths.some((pattern) => pattern.test(url.pathname))) {
++    throw new AppError("E_AMO_PATH_DENIED", 403);
++  }
++
++  return { method, url, normalizedPath: url.pathname, kind: "business" };
++}
+diff --git a/packages/integrations/src/amo/transport.integration.test.ts b/packages/integrations/src/amo/transport.integration.test.ts
+new file mode 100644
+index 0000000..c599df3
+--- /dev/null
++++ b/packages/integrations/src/amo/transport.integration.test.ts
+@@ -0,0 +1,141 @@
++import { z } from "zod";
++import { describe, expect, it, vi } from "vitest";
++
++import { amoFetch } from "./transport";
++
++const accountSchema = z.object({ id: z.number() });
++const allowedUrl = "https://555151.amocrm.ru/api/v4/account?page=2";
++
++function createRequest(overrides: Record<string, unknown> = {}) {
++  const ledger: Array<{ url: string; init?: RequestInit | undefined }> = [];
++  const audit: unknown[] = [];
++  const tokenProvider = { getAccessToken: vi.fn(async () => "synthetic-token") };
++  const fetchFn = vi.fn(async (url: string | URL, init?: RequestInit) => {
++    ledger.push({ url: String(url), init });
++    return new Response(JSON.stringify({ id: 1 }), { status: 200 });
++  });
++
++  return {
++    ledger,
++    audit,
++    tokenProvider,
++    fetchFn,
++    request: {
++      method: "GET",
++      url: allowedUrl,
++      schema: accountSchema,
++      traceId: "trace-123",
++      tokenProvider,
++      fetchFn,
++      auditSink: {
++        record: (entry: unknown) => {
++          audit.push(entry);
++        },
++      },
++      ...overrides,
++    },
++  };
++}
++
++describe("amoFetch", () => {
++  it("preserves allowed GET query parameters while auditing only the normalized path", async () => {
++    const { audit, fetchFn, ledger, request, tokenProvider } = createRequest();
++
++    await expect(amoFetch(request)).resolves.toEqual({ id: 1 });
++
++    expect(tokenProvider.getAccessToken).toHaveBeenCalledOnce();
++    expect(fetchFn).toHaveBeenCalledOnce();
++    expect(ledger).toEqual([
++      {
++        url: allowedUrl,
++        init: expect.objectContaining({
++          method: "GET",
++          redirect: "error",
++          headers: expect.any(Headers),
++        }),
++      },
++    ]);
++    expect((ledger[0]?.init?.headers as Headers).get("authorization")).toBe(
++      "Bearer synthetic-token",
++    );
++    expect(audit).toHaveLength(1);
++    expect(audit[0]).toMatchObject({
++      method: "GET",
++      normalizedPath: "/api/v4/account",
++      responseStatus: 200,
++      traceId: "trace-123",
++      result: "success",
++    });
++    expect(JSON.stringify(audit[0])).not.toContain("page=2");
++  });
++
++  it("does not resolve a bearer token for the OAuth POST", async () => {
++    const { fetchFn, request, tokenProvider } = createRequest({
++      method: "POST",
++      url: "https://555151.amocrm.ru/oauth2/access_token",
++      body: "grant_type=authorization_code",
++      headers: { "content-type": "application/x-www-form-urlencoded" },
++    });
++
++    await expect(amoFetch(request)).resolves.toEqual({ id: 1 });
++
++    expect(tokenProvider.getAccessToken).not.toHaveBeenCalled();
++    const headers = fetchFn.mock.calls[0]?.[1]?.headers as Headers;
++    expect(headers.get("authorization")).toBeNull();
++    expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({ redirect: "error" });
++  });
++
++  it("records only safe fields when a response fails schema validation", async () => {
++    const { audit, fetchFn, request } = createRequest();
++    fetchFn.mockResolvedValue(
++      new Response(JSON.stringify({ unexpected: "synthetic-private-value" }), {
++        status: 200,
++      }),
++    );
++
++    await expect(amoFetch(request)).rejects.toThrow("E_AMO_UPSTREAM");
++
++    expect(audit).toHaveLength(1);
++    expect(audit[0]).toMatchObject({
++      normalizedPath: "/api/v4/account",
++      responseStatus: 200,
++      result: "error",
++    });
++    expect(JSON.stringify(audit[0])).not.toContain("synthetic-private-value");
++  });
++
++  it.each([
++    ["forbidden method", { method: "PATCH" }, "E_AMO_METHOD_DENIED"],
++    [
++      "forbidden path",
++      { url: "https://555151.amocrm.ru/api/v4/contacts" },
++      "E_AMO_PATH_DENIED",
++    ],
++    [
++      "forbidden host",
++      { url: "https://example.org/api/v4/leads" },
++      "E_AMO_PATH_DENIED",
++    ],
++    [
++      "forbidden protocol",
++      { url: "http://555151.amocrm.ru/api/v4/leads" },
++      "E_AMO_PATH_DENIED",
++    ],
++    ["redirect override", { redirect: "follow" }, "E_AMO_PATH_DENIED"],
++  ])("keeps %s out of the network", async (_name, overrides, errorCode) => {
++    const { audit, fetchFn, ledger, request, tokenProvider } = createRequest(
++      overrides,
++    );
++
++    await expect(amoFetch(request)).rejects.toThrow(errorCode);
++
++    expect(tokenProvider.getAccessToken).not.toHaveBeenCalled();
++    expect(fetchFn).not.toHaveBeenCalled();
++    expect(ledger).toHaveLength(0);
++    expect(audit).toHaveLength(1);
++    expect(audit[0]).toMatchObject({
++      traceId: "trace-123",
++      result: "denied",
++    });
++  });
++});
+diff --git a/packages/integrations/src/amo/transport.ts b/packages/integrations/src/amo/transport.ts
+new file mode 100644
+index 0000000..a9f9179
+--- /dev/null
++++ b/packages/integrations/src/amo/transport.ts
+@@ -0,0 +1,111 @@
++import { AppError } from "@real2/domain";
++
++import { assertAmoRequestAllowed } from "./policy";
++import type {
++  AmoAuditEntry,
++  AmoFetchRequest,
++  NormalizedAmoRequest,
++} from "./types";
++
++function durationSince(startedAt: number): number {
++  return Math.max(0, Date.now() - startedAt);
++}
++
++async function recordAudit(
++  request: AmoFetchRequest<unknown>,
++  entry: AmoAuditEntry,
++): Promise<void> {
++  await request.auditSink.record(entry);
++}
++
++function deniedRedirect(): AppError {
++  return new AppError("E_AMO_PATH_DENIED", 403);
++}
++
++function upstreamError(): AppError {
++  return new AppError("E_AMO_UPSTREAM", 502);
++}
++
++export async function amoFetch<T>(request: AmoFetchRequest<T>): Promise<T> {
++  const startedAt = Date.now();
++  let normalized: NormalizedAmoRequest;
++
++  try {
++    normalized = assertAmoRequestAllowed(request);
++    if (request.redirect !== undefined && request.redirect !== "error") {
++      throw deniedRedirect();
++    }
++  } catch (error) {
++    const normalizedPath = safeNormalizedPath(request.url);
++    await recordAudit(request, {
++      method: request.method.toUpperCase(),
++      normalizedPath,
++      durationMs: durationSince(startedAt),
++      traceId: request.traceId,
++      result: "denied",
++    });
++    throw error;
++  }
++
++  const headers = new Headers(request.headers);
++  headers.delete("authorization");
++  let responseStatus: number | undefined;
++
++  try {
++    if (normalized.kind === "business") {
++      const accessToken = await request.tokenProvider.getAccessToken();
++      headers.set("authorization", `Bearer ${accessToken}`);
++    }
++
++    const response = await request.fetchFn(normalized.url, {
++      method: normalized.method,
++      headers,
++      ...(request.body !== undefined ? { body: request.body } : {}),
++      redirect: "error",
++    });
++    responseStatus = response.status;
++
++    if (!response.ok) {
++      throw upstreamError();
++    }
++
++    const parsed = request.schema.safeParse(await response.json());
++    if (!parsed.success) {
++      throw upstreamError();
++    }
++
++    await recordAudit(request, {
++      method: normalized.method,
++      normalizedPath: normalized.normalizedPath,
++      responseStatus,
++      durationMs: durationSince(startedAt),
++      traceId: request.traceId,
++      result: "success",
++    });
++
++    return parsed.data;
++  } catch (error) {
++    await recordAudit(request, {
++      method: normalized.method,
++      normalizedPath: normalized.normalizedPath,
++      ...(responseStatus !== undefined ? { responseStatus } : {}),
++      durationMs: durationSince(startedAt),
++      traceId: request.traceId,
++      result: "error",
++    });
++
++    if (error instanceof AppError) {
++      throw error;
++    }
++
++    throw upstreamError();
++  }
++}
++
++function safeNormalizedPath(value: string): string {
++  try {
++    return new URL(value).pathname;
++  } catch {
++    return "/";
++  }
++}
+diff --git a/packages/integrations/src/amo/types.ts b/packages/integrations/src/amo/types.ts
+new file mode 100644
+index 0000000..af65683
+--- /dev/null
++++ b/packages/integrations/src/amo/types.ts
+@@ -0,0 +1,43 @@
++import type { ZodType } from "zod";
++
++export interface NormalizedAmoRequest {
++  method: string;
++  url: URL;
++  normalizedPath: string;
++  kind: "business" | "oauth";
++}
++
++export interface AmoTokenProvider {
++  getAccessToken(): Promise<string>;
++}
++
++export interface AmoAuditEntry {
++  method: string;
++  normalizedPath: string;
++  responseStatus?: number;
++  durationMs: number;
++  traceId: string;
++  result: "denied" | "success" | "error";
++}
++
++export interface AmoAuditSink {
++  record(entry: AmoAuditEntry): void | Promise<void>;
++}
++
++export type AmoFetchFn = (
++  input: string | URL,
++  init: RequestInit,
++) => Promise<Response>;
++
++export interface AmoFetchRequest<T> {
++  method: string;
++  url: string;
++  schema: ZodType<T>;
++  traceId: string;
++  tokenProvider: AmoTokenProvider;
++  fetchFn: AmoFetchFn;
++  auditSink: AmoAuditSink;
++  body?: BodyInit | null;
++  headers?: HeadersInit;
++  redirect?: RequestRedirect;
++}
+diff --git a/packages/integrations/src/index.ts b/packages/integrations/src/index.ts
+index cb0ff5c..ace7292 100644
+--- a/packages/integrations/src/index.ts
++++ b/packages/integrations/src/index.ts
+@@ -1 +1,10 @@
+-export {};
++export { assertAmoRequestAllowed } from "./amo/policy.js";
++export { amoFetch } from "./amo/transport.js";
++export type {
++  AmoAuditEntry,
++  AmoAuditSink,
++  AmoFetchFn,
++  AmoFetchRequest,
++  AmoTokenProvider,
++  NormalizedAmoRequest,
++} from "./amo/types.js";

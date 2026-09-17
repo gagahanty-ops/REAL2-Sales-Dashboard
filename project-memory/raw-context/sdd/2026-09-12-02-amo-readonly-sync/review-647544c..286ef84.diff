@@ -1,0 +1,571 @@
+# Review package: 647544c8b19ea752702827e3593a8d5685d5e892..HEAD
+
+## Commits
+286ef84 fix: validate amoCRM refresh before token commit
+
+## Files changed
+ .../task-3-report.md                               | 72 ++++++++++++++++++++++
+ .../api/integrations/amo/oauth.integration.test.ts | 24 +++++++-
+ .../src/app/api/integrations/amo/refresh/route.ts  | 51 ++++++---------
+ packages/integrations/src/amo/oauth.test.ts        | 24 +++++++-
+ packages/integrations/src/amo/refresh.ts           | 12 ++++
+ packages/integrations/src/index.ts                 |  1 +
+ 6 files changed, 148 insertions(+), 36 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md
+index e4decf2..dbe17ce 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md
+@@ -166,10 +166,82 @@ node "$REAL2_PNPM" check:secrets
+ passed
+ ```
+ 
+ Covering test files include
+ `apps/web/src/app/api/integrations/amo/oauth.integration.test.ts` (actual
+ start state, distinct account ID, refreshed account GET, wrong refreshed
+ binding, and reauth status),
+ `apps/web/src/components/amo-integration-manager.test.tsx` (disabled and
+ reauth action availability), `packages/integrations/src/amo/oauth.test.ts`,
+ and the existing RLS/log-redaction security tests.
++
++## Fix round 2
++
++### Review fix
++
++- The locked shared refresh primitive now requires a server-side validation
++  callback and invokes it after the OAuth refresh exchange but before rotating
++  ciphertext, setting `active`, or advancing `last_checked_at`.
++- The admin refresh route supplies that callback. It permits only the fixed
++  amoCRM host, performs exactly one guarded `GET /api/v4/account` with the
++  newly returned server-only access token, and checks the fixed subdomain plus
++  the stored account ID.
++- A failed exchange or account validation remains fail-closed: the transaction
++  preserves the prior ciphertext and check timestamp, then marks the
++  connection `reauth_required`. The newly returned token pair is therefore
++  neither stored as `active` nor useable.
++- The callback is mandatory in the shared dependency type, so worker/token
++  provider callers cannot rotate a pair without deliberately supplying the
++  equivalent server-only validation policy.
++
++### RED / GREEN evidence
++
++The new wrong-account refresh regression was written first in
++`apps/web/src/app/api/integrations/amo/oauth.integration.test.ts`. Before the
++transaction-boundary change it failed as expected because the route rejected
++the account after committing the rotated pair:
++
++```text
++expected 502 to be 409
++```
++
++After the fix, all commands below completed with the mandated Node/pnpm
++runtime and synthetic local Supabase fixtures only:
++
++```text
++node "$REAL2_PNPM" test:integration -- apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
++4 files passed; 30 integration tests passed
++
++node "$REAL2_PNPM" exec vitest run --project unit -- packages/integrations/src/amo/oauth.test.ts
++11 unit files passed; 60 unit tests passed
++
++node "$REAL2_PNPM" test:security
++2 security files passed; 13 security tests passed
++
++node "$REAL2_PNPM" lint
++passed
++
++node "$REAL2_PNPM" --filter @real2/integrations build
++passed
++
++node "$REAL2_PNPM" typecheck
++passed
++
++node "$REAL2_PNPM" build
++passed; web routes and settings page compiled
++
++node "$REAL2_PNPM" check:secrets
++passed
++```
++
++The focused regression asserts that a refreshed token whose guarded account
++GET returns a mismatched numeric account ID results in `502`/`reauth_required`,
++keeps both previous ciphertext values byte-for-byte, and does not advance
++`last_checked_at`.
++
++### Concerns
++
++- This fail-closed state deliberately retains the previous encrypted pair for
++  local audit/reinstallation continuity, but `reauth_required` prevents the
++  token provider from returning either prior or newly returned material. A
++  failed OAuth refresh may already have invalidated the old refresh token, so
++  administrator reauthorization is required before any further use.
+diff --git a/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts b/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
+index ec28432..c06f058 100644
+--- a/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
++++ b/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
+@@ -1,21 +1,21 @@
+ import {
+   afterAll,
+   afterEach,
+   beforeEach,
+   describe,
+   expect,
+   it,
+   vi,
+ } from "vitest";
+ 
+-import { createOAuthState } from "@real2/db";
++import { createOAuthState, getAmoConnectionCredentials } from "@real2/db";
+ import {
+   createAdminDb,
+   resetAndSeedUsers,
+   testUsers,
+ } from "../../../../../../../tests/helpers/local-db";
+ 
+ import { GET as callbackRoute } from "./callback/route";
+ import { POST as disconnectRoute } from "./disconnect/route";
+ import { POST as refreshRoute } from "./refresh/route";
+ import { POST as startRoute } from "./start/route";
+@@ -387,42 +387,60 @@ describe("amoCRM OAuth administration", () => {
+     expect(response.status).toBe(200);
+     expect(await response.json()).toMatchObject({ data: { refreshed: true } });
+     expect(amoMock.requests.map(({ url, init }) => [url, init.method])).toEqual([
+       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+       ["https://555151.amocrm.ru/api/v4/account", "GET"],
+       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+       ["https://555151.amocrm.ru/api/v4/account", "GET"],
+     ]);
+   });
+ 
+-  it("does not report a successful read check when the refreshed token sees another account", async () => {
++  it("fails closed without persisting mismatched refreshed credentials", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+     amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     amoMock.queueTokenPair({
+       ...syntheticTokenPair,
+       accessToken: "synthetic-access-refreshed",
+       refreshToken: "synthetic-refresh-refreshed",
+     });
+     amoMock.queueAccount({ id: 999, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
++    const [connection] = await adminDb<{ id: string }[]>`
++      select id from public.amo_connections
++    `;
++    const beforeCredentials = await getAmoConnectionCredentials(
++      adminDb,
++      connection!.id,
++    );
+     const [before] = await adminDb<{ last_checked_at: Date }[]>`
+       select last_checked_at from public.amo_connections
+     `;
+ 
+     const response = await refreshRoute(
+       sameOriginPost("/api/integrations/amo/refresh"),
+     );
+ 
+-    expect(response.status).toBe(409);
++    expect(response.status).toBe(502);
++    const afterCredentials = await getAmoConnectionCredentials(
++      adminDb,
++      connection!.id,
++    );
++    expect(afterCredentials.status).toBe("reauth_required");
++    expect(afterCredentials.accessTokenCiphertext).toEqual(
++      beforeCredentials.accessTokenCiphertext,
++    );
++    expect(afterCredentials.refreshTokenCiphertext).toEqual(
++      beforeCredentials.refreshTokenCiphertext,
++    );
+     const [after] = await adminDb<{ last_checked_at: Date }[]>`
+       select last_checked_at from public.amo_connections
+     `;
+     expect(after?.last_checked_at).toEqual(before?.last_checked_at);
+     expect(amoMock.requests.map(({ url, init }) => [url, init.method])).toEqual([
+       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+       ["https://555151.amocrm.ru/api/v4/account", "GET"],
+       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+       ["https://555151.amocrm.ru/api/v4/account", "GET"],
+     ]);
+diff --git a/apps/web/src/app/api/integrations/amo/refresh/route.ts b/apps/web/src/app/api/integrations/amo/refresh/route.ts
+index 3cf60dd..d0e16eb 100644
+--- a/apps/web/src/app/api/integrations/amo/refresh/route.ts
++++ b/apps/web/src/app/api/integrations/amo/refresh/route.ts
+@@ -1,14 +1,11 @@
+-import {
+-  getCurrentSafeAmoConnectionStatus,
+-  withLockedAmoConnection,
+-} from "@real2/db";
++import { getCurrentSafeAmoConnectionStatus } from "@real2/db";
+ import { AppError } from "@real2/domain";
+ import {
+   amoFetch,
+   decodeTokenEncryptionKey,
+   refreshConnection,
+ } from "@real2/integrations";
+ 
+ import { requireRole } from "../../../../../lib/auth/authorization";
+ import { requireUser } from "../../../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../../../lib/http-security";
+@@ -25,50 +22,42 @@ export const POST = withRoute(async (request, context) => {
+   requireRole(await requireUser(), ["admin"]);
+   requireSameOrigin(request);
+   const db = getDatabase();
+   const connection = await getCurrentSafeAmoConnectionStatus(db);
+   if (!connection) {
+     throw new AppError("E_NOT_FOUND", 404);
+   }
+ 
+   const env = getServerEnv();
+   const auditSink = createAmoAdminAuditSink();
+-  const accessToken = await refreshConnection(connection.id, {
++  await refreshConnection(connection.id, {
+     db,
+     encryptionKey: decodeTokenEncryptionKey(env.TOKEN_ENCRYPTION_KEY),
+     oauthConfig: {
+       clientId: env.AMO_CLIENT_ID,
+       clientSecret: env.AMO_CLIENT_SECRET,
+       redirectUri: env.AMO_REDIRECT_URI,
+     },
+     transport: { auditSink, traceId: context.traceId },
+-  });
+-  const account = await amoFetch({
+-    method: "GET",
+-    url: `${AMO_BASE_URL}/api/v4/account`,
+-    schema: amoAccountSchema,
+-    traceId: context.traceId,
+-    tokenProvider: {
+-      async getAccessToken() {
+-        return accessToken;
+-      },
++    async validateRefreshedAccessToken(accessToken, lockedConnection) {
++      if (lockedConnection.baseUrl !== AMO_BASE_URL) {
++        throw new AppError("E_CONFLICT", 409);
++      }
++      const account = await amoFetch({
++        method: "GET",
++        url: `${AMO_BASE_URL}/api/v4/account`,
++        schema: amoAccountSchema,
++        traceId: context.traceId,
++        tokenProvider: {
++          async getAccessToken() {
++            return accessToken;
++          },
++        },
++        auditSink,
++        redirect: "error",
++      });
++      assertAmoAccountBinding(account, lockedConnection.accountId);
+     },
+-    auditSink,
+-    redirect: "error",
+-  });
+-  assertAmoAccountBinding(account, connection.accountId);
+-
+-  const checkedAt = new Date();
+-  await withLockedAmoConnection(db, connection.id, async (locked, actions) => {
+-    if (
+-      locked.status !== "active" ||
+-      locked.accountId !== account.id ||
+-      locked.subdomain !== account.subdomain ||
+-      locked.baseUrl !== AMO_BASE_URL
+-    ) {
+-      throw new AppError("E_CONFLICT", 409);
+-    }
+-    await actions.markCheckedAt(checkedAt);
+   });
+ 
+   return { refreshed: true };
+ });
+diff --git a/packages/integrations/src/amo/oauth.test.ts b/packages/integrations/src/amo/oauth.test.ts
+index 0838210..647acfb 100644
+--- a/packages/integrations/src/amo/oauth.test.ts
++++ b/packages/integrations/src/amo/oauth.test.ts
+@@ -9,35 +9,39 @@ import {
+   getSafeAmoConnectionStatus,
+   purgeExpiredOAuthStates,
+   consumeOAuthState,
+   withLockedAmoConnection,
+ } from "@real2/db";
+ import { AppError } from "@real2/domain";
+ import {
+   createAmoTokenProvider,
+   refreshConnection,
+   refreshDueConnections,
++  type RefreshedAccessTokenValidator,
+ } from "./refresh";
+ import { localDatabaseUrl, resetAndSeedUsers, testUsers } from "../../../../tests/helpers/local-db";
+ import { decryptToken, encryptToken } from "./crypto";
+ import { exchangeAuthorizationCode } from "./oauth";
+ 
+ const encryptionKey = Buffer.from("local-synthetic-encryption-key!!");
+ const now = new Date("2026-09-12T12:00:00.000Z");
+ const tokenEndpoint = "https://555151.amocrm.ru/oauth2/access_token";
+ 
+ const oauthConfig = {
+   clientId: "synthetic-client-id",
+   clientSecret: "synthetic-client-secret",
+   redirectUri: "https://dashboard.example.invalid/api/integrations/amo/callback",
+ } as const;
+ 
++const validateRefreshedAccessToken: RefreshedAccessTokenValidator = async () =>
++  undefined;
++
+ const adminDb = postgres(localDatabaseUrl, { max: 4 });
+ 
+ function tokenResponse(
+   accessToken = "synthetic-access-next",
+   refreshToken = "synthetic-refresh-next",
+ ): Response {
+   return new Response(
+     JSON.stringify({
+       token_type: "Bearer",
+       expires_in: 86_400,
+@@ -284,20 +288,21 @@ describe("token rotation", () => {
+           audits.push(entry);
+         },
+       },
+       traceId: "01J00000000000000000000000",
+     };
+     const dependencies = {
+       db: adminDb,
+       encryptionKey,
+       oauthConfig,
+       transport,
++      validateRefreshedAccessToken,
+     };
+ 
+     const firstPromise = refreshConnection(connection.id, dependencies, now);
+     const secondPromise = refreshConnection(connection.id, dependencies, now);
+     await upstreamStarted;
+     releaseUpstream();
+     const [first, second] = await Promise.all([firstPromise, secondPromise]);
+ 
+     expect(first).toBe("synthetic-access-next");
+     expect(second).toBe("synthetic-access-next");
+@@ -316,53 +321,61 @@ describe("token rotation", () => {
+   });
+ 
+   it("does not mistake a later explicit refresh for a concurrent waiter", async () => {
+     const connection = await insertConnection();
+     const { fetchFn, transport } = createOAuthTransport();
+     const dependencies = {
+       db: adminDb,
+       encryptionKey,
+       oauthConfig,
+       transport,
++      validateRefreshedAccessToken,
+     };
+ 
+     await refreshConnection(connection.id, dependencies, now);
+     await refreshConnection(connection.id, dependencies, now);
+ 
+     expect(fetchFn).toHaveBeenCalledTimes(2);
+   });
+ 
+   it("marks the connection reauth_required when refresh fails", async () => {
+     const connection = await insertConnection();
+     const { transport } = createOAuthTransport(
+       new Response(JSON.stringify({ message: "synthetic-upstream-detail" }), {
+         status: 500,
+       }),
+     );
+ 
+     const refresh = refreshConnection(
+       connection.id,
+-      { db: adminDb, encryptionKey, oauthConfig, transport },
++      {
++        db: adminDb,
++        encryptionKey,
++        oauthConfig,
++        transport,
++        validateRefreshedAccessToken,
++      },
+       now,
+     );
+ 
+     await expect(refresh).rejects.toMatchObject({ code: "E_AMO_AUTH" });
+     await expect(refresh).rejects.not.toThrow("synthetic-upstream-detail");
+     await expect(
+       getSafeAmoConnectionStatus(adminDb, connection.id),
+     ).resolves.toMatchObject({ status: "reauth_required" });
+ 
+     const provider = createAmoTokenProvider(connection.id, {
+       db: adminDb,
+       encryptionKey,
+       oauthConfig,
+       transport,
++      validateRefreshedAccessToken,
+       now: () => now,
+     });
+     await expect(provider.getAccessToken()).rejects.toEqual(
+       new AppError("E_AMO_AUTH", 502),
+     );
+   });
+ 
+   it("starts proactive refresh at the exact ten-minute boundary", async () => {
+     const due = await insertConnection({
+       accountId: 555_151,
+@@ -371,37 +384,44 @@ describe("token rotation", () => {
+     });
+     await insertConnection({
+       accountId: 555_152,
+       subdomain: "555152",
+       tokenExpiresAt: new Date(now.getTime() + 10 * 60_000 + 1),
+     });
+     const { fetchFn, transport } = createOAuthTransport();
+ 
+     await expect(
+       refreshDueConnections(
+-        { db: adminDb, encryptionKey, oauthConfig, transport },
++        {
++          db: adminDb,
++          encryptionKey,
++          oauthConfig,
++          transport,
++          validateRefreshedAccessToken,
++        },
+         now,
+       ),
+     ).resolves.toEqual([due.id]);
+     expect(fetchFn).toHaveBeenCalledTimes(1);
+   });
+ 
+   it("provides tokens only for an active connection", async () => {
+     const connection = await insertConnection({
+       tokenExpiresAt: new Date(now.getTime() + 60 * 60_000),
+     });
+     const { transport } = createOAuthTransport();
+     const provider = createAmoTokenProvider(connection.id, {
+       db: adminDb,
+       encryptionKey,
+       oauthConfig,
+       transport,
++      validateRefreshedAccessToken,
+       now: () => now,
+     });
+ 
+     await expect(provider.getAccessToken()).resolves.toBe(
+       "synthetic-access-old",
+     );
+     await disableAmoConnection(adminDb, connection.id, now);
+     await expect(provider.getAccessToken()).rejects.toEqual(
+       new AppError("E_AMO_AUTH", 502),
+     );
+diff --git a/packages/integrations/src/amo/refresh.ts b/packages/integrations/src/amo/refresh.ts
+index 5118846..347bfb5 100644
+--- a/packages/integrations/src/amo/refresh.ts
++++ b/packages/integrations/src/amo/refresh.ts
+@@ -1,34 +1,41 @@
+ import {
+   findDueAmoConnectionIds,
+   getAmoConnectionCredentials,
+   withLockedAmoConnection,
++  type AmoConnectionCredentials,
+   type Database,
+ } from "@real2/db";
+ import { AppError } from "@real2/domain";
+ 
+ import { decryptToken, encryptToken, type TokenEncryptionKey } from "./crypto";
+ import {
+   refreshOAuthToken,
+   type AmoOAuthConfig,
+   type AmoOAuthTransport,
+ } from "./oauth";
+ import type { AmoTokenProvider } from "./types";
+ 
+ const REFRESH_WINDOW_MS = 10 * 60_000;
+ const inFlightRefreshes = new Map<string, Promise<string>>();
+ 
++export type RefreshedAccessTokenValidator = (
++  accessToken: string,
++  connection: Pick<AmoConnectionCredentials, "accountId" | "subdomain" | "baseUrl">,
++) => Promise<void>;
++
+ export type RefreshAmoTokenDependencies = Readonly<{
+   db: Database;
+   encryptionKey: TokenEncryptionKey;
+   oauthConfig: AmoOAuthConfig;
+   transport: AmoOAuthTransport;
++  validateRefreshedAccessToken: RefreshedAccessTokenValidator;
+ }>;
+ 
+ type TokenProviderDependencies = RefreshAmoTokenDependencies &
+   Readonly<{ now?: () => Date }>;
+ 
+ type RefreshResult =
+   | Readonly<{ ok: true; accessToken: string }>
+   | Readonly<{ ok: false; error: AppError }>;
+ 
+ export async function refreshConnection(
+@@ -85,36 +92,41 @@ async function refreshConnectionLocked(
+       try {
+         const currentRefreshToken = decryptToken(
+           connection.refreshTokenCiphertext,
+           dependencies.encryptionKey,
+         );
+         const tokenPair = await refreshOAuthToken(
+           currentRefreshToken,
+           dependencies.oauthConfig,
+           dependencies.transport,
+         );
++        await dependencies.validateRefreshedAccessToken(
++          tokenPair.accessToken,
++          connection,
++        );
+         const tokenExpiresAt = new Date(
+           now.getTime() + tokenPair.expiresInSeconds * 1_000,
+         );
+ 
+         await actions.rotateTokens({
+           accessTokenCiphertext: encryptToken(
+             tokenPair.accessToken,
+             dependencies.encryptionKey,
+           ),
+           refreshTokenCiphertext: encryptToken(
+             tokenPair.refreshToken,
+             dependencies.encryptionKey,
+           ),
+           tokenExpiresAt,
+           refreshedAt: now,
+         });
++        await actions.markCheckedAt(now);
+ 
+         return { ok: true, accessToken: tokenPair.accessToken };
+       } catch {
+         await actions.markReauthRequired(now);
+         return { ok: false, error: new AppError("E_AMO_AUTH", 502) };
+       }
+     },
+   );
+ 
+   if (!result.ok) throw result.error;
+diff --git a/packages/integrations/src/index.ts b/packages/integrations/src/index.ts
+index e18b686..36f3314 100644
+--- a/packages/integrations/src/index.ts
++++ b/packages/integrations/src/index.ts
+@@ -10,20 +10,21 @@ export {
+   refreshOAuthToken,
+   type AmoOAuthConfig,
+   type AmoOAuthTransport,
+   type AmoTokenPair,
+ } from "./amo/oauth.js";
+ export { amoFetch } from "./amo/transport.js";
+ export {
+   createAmoTokenProvider,
+   refreshConnection,
+   refreshDueConnections,
++  type RefreshedAccessTokenValidator,
+   type RefreshAmoTokenDependencies,
+ } from "./amo/refresh.js";
+ export type {
+   AmoAuditEntry,
+   AmoAuditSink,
+   AmoFetchFn,
+   AmoFetchRequest,
+   AmoTokenProvider,
+   NormalizedAmoRequest,
+ } from "./amo/types.js";

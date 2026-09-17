@@ -1,0 +1,3228 @@
+# Review package: 3059a95f65971f9b34a680805f2260173aff87a4..37d240ab80c59e4b7756a05acf4b06dc75cc6624
+
+## Commits
+37d240a fix: harden guarded sync worker
+
+## Files changed
+ .env.compose.example                               |   2 +
+ .env.example                                       |   2 +
+ .../task-6-report.md                               | 208 ++++++++-------
+ apps/web/src/app/api/sync-runs/route.ts            |  21 +-
+ .../api/sync-runs/sync-runs.integration.test.ts    |  41 ++-
+ apps/web/src/app/globals.css                       |  13 +
+ apps/web/src/app/sync/[id]/page.tsx                |   9 +-
+ apps/web/src/app/sync/page.tsx                     |  27 +-
+ apps/web/src/lib/sync-ui.test.ts                   |  22 ++
+ apps/web/src/lib/sync-ui.ts                        |  30 +++
+ apps/worker/src/jobs/amo-sync.test.ts              | 220 +++++++++++++++-
+ apps/worker/src/jobs/amo-sync.ts                   | 161 ++++++++++--
+ apps/worker/src/main.test.mts                      | 278 ++++++++++++++++++---
+ apps/worker/src/main.ts                            | 226 +++++++++++++++--
+ docker-compose.yml                                 |   2 +
+ packages/db/src/client.ts                          |  51 +++-
+ packages/db/src/index.ts                           |   6 +
+ packages/db/src/raw-amo.integration.test.ts        |  14 +-
+ .../db/src/sync-operations.integration.test.ts     | 170 ++++++++++++-
+ packages/db/src/sync-operations.ts                 | 184 +++++++++++++-
+ packages/domain/src/errors.ts                      |   2 +
+ supabase/migrations/0008_sync_queue_worker.sql     |  47 ++++
+ tests/helpers/local-db.ts                          |  11 +
+ tests/repo/container-safety.test.mjs               |   8 +
+ tests/security/rls.security.test.ts                |   6 +-
+ 25 files changed, 1545 insertions(+), 216 deletions(-)
+
+## Diff
+diff --git a/.env.compose.example b/.env.compose.example
+index 4d8f2bd..2c3365f 100644
+--- a/.env.compose.example
++++ b/.env.compose.example
+@@ -1,4 +1,6 @@
+ APP_URL=http://localhost:3000
+ REAL2_SUPABASE_ANON_KEY=local-anon-key
+ REAL2_SUPABASE_SERVICE_ROLE_KEY=local-service-role-key
++REAL2_WORKER_DATABASE_URL=postgresql://service_worker:service-worker-test@host.docker.internal:54322/postgres
++REAL2_RETENTION_DATABASE_URL=postgresql://retention_worker:retention-worker-test@host.docker.internal:54322/postgres
+ WEB_PORT=3000
+diff --git a/.env.example b/.env.example
+index 44e9222..33cfe23 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,12 +1,14 @@
+ APP_URL=http://localhost:3000
+ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres
++WORKER_DATABASE_URL=postgresql://service_worker:service-worker-test@127.0.0.1:54322/postgres
++RETENTION_DATABASE_URL=postgresql://retention_worker:retention-worker-test@127.0.0.1:54322/postgres
+ SUPABASE_URL=http://127.0.0.1:54321
+ SUPABASE_ANON_KEY=local-anon-key
+ SUPABASE_SERVICE_ROLE_KEY=local-service-role-key
+ TRUSTED_PROXY_SECRET=local-placeholder-change-before-production
+ AMO_CLIENT_ID=synthetic-client-id
+ AMO_CLIENT_SECRET=synthetic-client-secret-change-before-use
+ AMO_REDIRECT_URI=https://dashboard.example.invalid/api/integrations/amo/callback
+ TOKEN_ENCRYPTION_KEY=bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=
+ BOOTSTRAP_ADMIN_EMAIL=admin@example.local
+ BOOTSTRAP_ADMIN_PASSWORD=change-me-before-use
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
+index c13d98f..d2d9e85 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
+@@ -1,94 +1,130 @@
+ # Task 6 report — guarded amoCRM synchronization operations
+ 
+-## Fix round 1 — 2026-09-16
+-
+-- Added `0007_sync_hardening.sql`. Raw retention now enforces the 90-day
+-  cutoff and returns zero deletions until a later normalization migration can
+-  prove a concrete normalized row and matching retained hash in the same
+-  transaction. The prior synthetic proof-success claim and test were removed.
+-- Removed ordinary `service_worker` proof access and its membership route to
+-  `retention_worker`; the retention client no longer issues `SET ROLE` and
+-  must use separately authenticated retention credentials when that future
+-  proof path is enabled.
+-- Manual sync HTTP requests now persist `sync_work_queue` work with the
+-  authenticated requester and request trace, returning `202 queued` without
+-  performing a sync in the web request. Durable critical-alert and queue
+-  tables were added for worker processing.
+-- Run setup now starts only inside the terminalized execution block. The sync
+-  loop detects repeated logical page contents even where response envelopes
+-  change, and reconciliation uses distinct lead IDs rather than page lengths.
+-- The worker entrypoint no longer throws a placeholder exception when sync is
+-  enabled; it invokes its guarded scheduled entrypoint at five-minute
+-  boundaries and seals stale runs before dispatch.
+-
+-## Summary
+-
+-- Recovered and independently audited the uncommitted Task 6 diff on top of
+-  `30aa40c`; no existing tracked or untracked work was discarded.
+-- Added migration `0006_sync_operations.sql` and DB operational repositories
+-  for per-connection PostgreSQL advisory locking, safe run/history projections,
+-  cursor reads, full-run count comparison, stale-run sealing, and the
+-  proof-gated retention boundary.
+-- Implemented the guarded worker sync runner: both `SYNC_ENABLED` and the DB
+-  `system_controls.sync_enabled` must be true before a connection, token
+-  provider, lock, or amoCRM request is reached. It uses the sole guarded
+-  `amoFetch` transport, processes account/pipeline/status/user metadata before
+-  events and leads, validates every page before append, follows validated next
+-  links, rejects a repeated page checksum, and advances cursors only in the
+-  existing atomic successful finalizer.
+-- Incremental runs query a ten-minute overlap and retain stable `(event_at,
+-  amo_event_id)` cursor ordering. Retry behavior is deterministic under an
+-  injected clock: one refresh/retry for 401, then 1/3/9/27/60 second retries
+-  with bounded injected jitter for 429 and 5xx. Partial/failed runs retain safe
+-  diagnostics and cannot advance cursors or replace later production data.
+-- Added schedule helpers for five-minute incremental dispatch and the 02:30
+-  `Europe/Moscow` nightly reconciliation, a 20-minute watchdog, and a
+-  90-day raw-retention job. Retention is executable only by the separate
+-  `retention_worker` role through a security-definer function matching each
+-  raw hash to a retained normalized-history proof; normal worker and user
+-  roles receive no raw-delete permission.
+-- Added test-only synthetic amoCRM fixtures/server and exported them solely
+-  from `@real2/testkit`; production networking remains confined to
+-  `@real2/integrations` `amoFetch`.
+-- Added safe admin/head `GET /api/sync-runs` and `GET /api/sync-runs/{id}`
+-  projections, admin-only `POST /api/sync-runs`, and `/sync` / `/sync/{id}`
+-  screens. The manual button explicitly confirms a run begun in the preceding
+-  minute; a held advisory lock becomes `409 E_SYNC_LOCKED` before network use.
+-  The UI exposes only safe counters, page metadata, error summaries, and
+-  aggregate audit paths—never raw payloads, query values, or credentials.
+-
+-## Recovery fixes
+-
+-- The inherited diff omitted the required `/sync` and `/sync/{id}` pages and
+-  the manual trigger component; these were added with existing role and safe
+-  projection patterns.
+-- The web package was missing the installed workspace link to the worker
+-  entrypoint. Its lockfile dependency and Next transpilation configuration now
+-  compile the guarded worker entrypoint rather than relying on ignored stale
+-  build output.
+-- A fresh lint run found one unused `Database` type import in the inherited
+-  DB integration test; it was removed. No behavior changed for that fix.
+-
+-## Fresh verification
+-
+-All commands used Node `v22.23.2` from the required pinned runtime and pnpm
+-`10.34.5`. The database reset was local/synthetic only.
++## Fix round 2/5 — 2026-09-16
++
++Implemented from clean base commit
++`3059a95f65971f9b34a680805f2260173aff87a4`.
++
++This report intentionally replaces the earlier stale Task 6 write-up. It only
++describes behavior present in this round's code and tests.
++
++## What changed
++
++1. Durable manual sync queue ownership is now explicit.
++   `sync_work_queue` has a lease token, lease expiry, attempt counter, terminal
++   error fields, and a retryable running state. `claimNextSyncWork` claims one
++   row with `for update skip locked`, so concurrent workers cannot own the same
++   item. `completeSyncWork` is fenced by the lease token and rejects stale
++   completions. Expired leases are recoverable, and terminal completion/failure
++   persists the real `sync_run_id`, error code, and safe summary.
++
++2. Manual queue acceptance now preflights the same sync advisory lock used by
++   the worker. If a run already owns the per-connection lock, `POST
++   /api/sync-runs` returns `409 E_SYNC_LOCKED` before inserting queue work.
++
++3. Queue traceability is propagated into actual runs. Manual queue `trace_id`
++   and `requested_by` flow into `runSync`, `startSyncRun`, safe API projections,
++   and the UI's created-by attribution.
++
++4. The worker entrypoint is no longer a one-shot placeholder. Production CLI
++   mode loops until process shutdown. Each iteration always runs independent
++   maintenance first: OAuth stale-state purge, stale sync watchdog, and raw
++   retention at the current fail-closed boundary. When sync is enabled by both
++   switches, the iteration dispatches due five-minute incremental syncs, the
++   02:30 `Europe/Moscow` nightly reconciliation, and the manual queue
++   consumer.
++
++5. Advisory-lock ownership is fenced before any sensitive continuation. The
++   lock helper reserves one PostgreSQL session, exposes a `SyncLockFence`, and
++   verifies the backend before token refresh, amoCRM network calls, raw append,
++   audit persistence, alert persistence, and terminal finalization. If the
++   backend is lost or replaced, the runner raises `E_SYNC_FENCE_LOST` and does
++   not continue work under an unfenced lock. Cleanup releases locks after nested
++   failures; when PostgreSQL has already terminated the lock session, cleanup
++   treats the advisory lock as already released.
++
++6. Worker and retention database identities are distinct restricted logins.
++   The migration creates/grants `service_worker` and `retention_worker`
++   separately. Runtime clients now reject admin/postgres usernames, same worker
++   and retention URLs, and any `connection.role`/`SET ROLE` escalation. Local
++   integration helpers create restricted test passwords after reset for the
++   synthetic database only.
++
++7. Critical alert sink failures no longer leave a sync run running. Count-drop
++   failure finalization now seals the run first and records safe alert-delivery
++   failure text in the terminal run summary.
++
++8. Partial/failed/count-drop outcomes preserve the diagnostics needed for
++   follow-up: distinct lead counts remain in `counts.leadsRead`, and checksum
++   diagnostics remain in the safe error summary instead of being overwritten by
++   generic failure text.
++
++9. Sync history now uses explicit `Europe/Moscow` formatting, exposes
++   created-by attribution, and paginates history safely with previous/next page
++   links.
++
++## Safety boundaries preserved
++
++- No live amoCRM, OAuth, Google, spreadsheet, or protected external request was
++  made.
++- Repository switches remain false; tests use synthetic local fixtures.
++- The Task 5 append-only raw journal and terminal/cursor seal remain the normal
++  sync write path.
++- Retention remains fail-closed at zero raw deletes until a later Plan 3
++  migration proves a concrete normalized evidence relation. This round does not
++  fabricate retention proof.
++- Production networking remains through the guarded `GET` amoCRM transport and
++  external OAuth is still the only OAuth path.
++
++## Regression coverage added
++
++- Queue ownership, `skip locked` single-claim behavior, stale lease recovery,
++  lease-token fencing, and terminal queue completion.
++- Manual API `409 E_SYNC_LOCKED` before queue insertion while the same advisory
++  lock is held.
++- Queue consumer execution that creates a real terminal sync run using the
++  queued trace/requester.
++- Production worker recurrence for five-minute incremental sync, 02:30 Moscow
++  nightly sync, queue consumption, watchdog, and fail-closed retention
++  invocation.
++- Actual PostgreSQL backend termination of the advisory-lock owning session:
++  the fence trips with `E_SYNC_FENCE_LOST`, then another worker can acquire the
++  lock.
++- Nested failure cleanup release of advisory locks.
++- Restricted `service_worker` and `retention_worker` login requirements, same
++  URL rejection, admin/postgres rejection, and no `SET ROLE` escalation.
++- Alert-sink failure sealing, partial failure lead-count preservation, checksum
++  diagnostics preservation, Moscow date formatting, history pagination, and
++  created-by projection.
++
++## Fresh verification evidence
++
++All final commands were run locally with:
++
++- Node: `v22.23.2`
++- pnpm: `10.34.5`
++- PATH prefix:
++  `/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/.bin:/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/node/bin`
+ 
+ | Check | Evidence |
+ |---|---|
+-| Local schema | `supabase db reset` applied migrations `0001`–`0006` cleanly. |
+-| Focused Task 6 | 8 files / 29 tests passed: sync, schedule, watchdog, retention, mock server, guarded transport, sync API, and manual trigger. |
+-| Repository + unit | `pnpm test`: 12 repository/worker TAP tests and 99 unit tests passed. |
+-| Integration | `pnpm test:integration`: 8 files / 73 tests passed, including 4 operational DB tests and 5 safe sync-route tests. |
+-| Security | `pnpm test:security`: 18 tests passed. |
+-| Contracts | `pnpm test:contracts` exited 0 with no contract files. |
+-| Static/build | `pnpm lint`, `pnpm typecheck`, and `pnpm build` all passed; build lists `/api/sync-runs`, `/api/sync-runs/[id]`, `/sync`, and `/sync/[id]`. |
++| Local schema | `supabase db reset` applied migrations `0001` through `0008` cleanly. |
++| Focused Task 6 unit/UI | `pnpm vitest run --project unit apps/worker/src/jobs/amo-sync.test.ts apps/web/src/lib/sync-ui.test.ts`: 11 tests passed. |
++| Focused Task 6 DB/API | `pnpm vitest run --project integration packages/db/src/sync-operations.integration.test.ts apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts`: 13 tests passed, including the actual backend-termination fence test. |
++| Worker/repo TAP | `node --test apps/worker/src/main.test.mts tests/repo/container-safety.test.mjs`: 11 tests passed. |
++| Repository + unit | `pnpm test`: 15 TAP tests and 105 unit tests passed. |
++| Integration | `pnpm test:integration`: 8 files / 77 tests passed. |
++| Security | `pnpm test:security`: 2 files / 18 tests passed. |
++| Contracts | `pnpm test:contracts`: exited 0 with no matching contract files. |
++| Static analysis | `pnpm lint` and `pnpm typecheck` passed. |
++| Production build | `pnpm build` passed for all app/package workspaces and generated `/api/sync-runs`, `/api/sync-runs/[id]`, `/sync`, and `/sync/[id]`. |
+ | Hygiene | `pnpm check:secrets` and `git diff --check` passed. |
+ 
+-## Safety boundary
++## Notes for the next plan
+ 
+-- No live amoCRM business request, OAuth action, Google request, credential
+-  lookup, protected spreadsheet operation, or switch enablement occurred.
+-- Both external switches remain false in the repository configuration.
+-- Task 5's append-only raw journal and atomic terminal/cursor seal remain the
+-  only ordinary sync write path; retention is separate and proof-gated.
++- Raw retention is intentionally still zero-delete/fail-closed. Plan 3 must add
++  the normalized evidence relation before any delete-positive retention proof is
++  valid.
++- The actual backend-termination regression is intentionally scoped to the DB
++  lock primitive. End-to-end runner coverage separately verifies that a lost
++  fence cancels before network, append, alert, or finalize work.
+diff --git a/apps/web/src/app/api/sync-runs/route.ts b/apps/web/src/app/api/sync-runs/route.ts
+index edc7db2..d4bd426 100644
+--- a/apps/web/src/app/api/sync-runs/route.ts
++++ b/apps/web/src/app/api/sync-runs/route.ts
+@@ -1,11 +1,17 @@
+-import { enqueueSyncWork, getLatestSyncRun, listSyncRuns } from "@real2/db";
++import {
++  enqueueSyncWork,
++  getCurrentSafeAmoConnectionStatus,
++  getLatestSyncRun,
++  isSyncAdvisoryLockBusy,
++  listSyncRuns,
++} from "@real2/db";
+ import { AppError, success } from "@real2/domain";
+ import { z } from "zod";
+ 
+ import { requireRole } from "../../../lib/auth/authorization";
+ import { requireUser } from "../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../lib/http-security";
+ import { readJson, withRoute } from "../../../lib/http/route";
+ import { getDatabase } from "../../../lib/server/runtime";
+ 
+ const manualSyncSchema = z.strictObject({
+@@ -16,34 +22,43 @@ export const GET = withRoute(async (request) => {
+   requireRole(await requireUser(), ["admin", "head"]);
+   const pageValue = new URL(request.url).searchParams.get("page") ?? "1";
+   const page = Number(pageValue);
+   return listSyncRuns(getDatabase(), { page, pageSize: 25 });
+ });
+ 
+ export const POST = withRoute(async (request, context) => {
+   requireSameOrigin(request);
+   const user = requireRole(await requireUser(), ["admin"]);
+   const input = manualSyncSchema.parse(await readJson(request));
+-  const latest = await getLatestSyncRun(getDatabase());
++  const db = getDatabase();
++  const latest = await getLatestSyncRun(db);
+   if (
+     latest &&
+     Date.now() - latest.startedAt.getTime() < 60_000 &&
+     !input.confirmRecent
+   ) {
+     throw new AppError(
+       "E_CONFLICT",
+       409,
+       "Последняя синхронизация началась менее минуты назад",
+     );
+   }
+ 
+-  const queued = await enqueueSyncWork(getDatabase(), {
++  const connection = await getCurrentSafeAmoConnectionStatus(db);
++  if (
++    connection?.status === "active" &&
++    (await isSyncAdvisoryLockBusy(db, connection.id))
++  ) {
++    throw new AppError("E_SYNC_LOCKED", 409);
++  }
++
++  const queued = await enqueueSyncWork(db, {
+     traceId: context.traceId,
+     kind: "manual",
+     requestedBy: user.id,
+   });
+   return Response.json(
+     success(
+       {
+         requestId: queued.id,
+         traceId: queued.traceId,
+         status: "queued",
+diff --git a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+index c7a19b3..0f1e3e2 100644
+--- a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
++++ b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+@@ -1,15 +1,16 @@
+ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+-import { finishSyncRun, startSyncRun } from "@real2/db";
++import { closeDbClient, createDbClient, finishSyncRun, startSyncRun, withSyncAdvisoryLock } from "@real2/db";
+ import {
+   createAdminDb,
++  localDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+ } from "../../../../../../tests/helpers/local-db";
+ 
+ import { GET, POST } from "./route";
+ import { GET as GET_DETAIL } from "./[id]/route";
+ 
+ const adminDb = createAdminDb();
+ const session = vi.hoisted(() => ({
+   user: {
+@@ -101,20 +102,21 @@ describe("safe synchronization routes", () => {
+     const list = await GET(new Request("https://dashboard.example.test/api/sync-runs?page=1"));
+     const detail = await GET_DETAIL(
+       new Request(`https://dashboard.example.test/api/sync-runs/${run.id}`),
+       { params: Promise.resolve({ id: run.id }) },
+     );
+ 
+     expect(list.status).toBe(200);
+     expect((await list.json()).data.items[0]).toMatchObject({
+       id: run.id,
+       status: "success",
++      createdBy: testUsers.admin.id,
+       counts: { pages: 2, leads: 3, events: 4, users: 1, retries: 1 },
+     });
+     const detailBody = await detail.json();
+     expect(detailBody.data.audit[0]).toMatchObject({
+       normalizedPath: "/api/v4/leads/:id",
+       requestCount: 1,
+     });
+     expect(JSON.stringify(detailBody)).not.toContain("12345");
+   });
+ 
+@@ -136,11 +138,48 @@ describe("safe synchronization routes", () => {
+     const accepted = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
+       method: "POST",
+       headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
+       body: JSON.stringify({ confirmRecent: true }),
+     }));
+     expect(accepted.status).toBe(202);
+     expect((await accepted.json()).data.status).toBe("queued");
+     expect((await adminDb`select count(*)::integer as count from public.sync_work_queue`)[0]?.count).toBe(1);
+   });
+ 
++  it("returns E_SYNC_LOCKED before accepting manual work when a run owns the advisory lock", async () => {
++    const run = await seedRun(new Date("2026-09-15T08:00:00.000Z"));
++    const [row] = await adminDb<{ connection_id: string }[]>`
++      select connection_id from public.sync_runs where id = ${run.id}
++    `;
++    if (!row) throw new Error("missing seeded connection");
++    const lockDb = createDbClient(localDatabaseUrl, { max: 1 });
++    let release!: () => void;
++    const held = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    let entered!: () => void;
++    const acquired = new Promise<void>((resolve) => {
++      entered = resolve;
++    });
++    const locked = withSyncAdvisoryLock(lockDb, row.connection_id, async () => {
++      entered();
++      await held;
++    });
++    await acquired;
++    try {
++      const response = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
++        method: "POST",
++        headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
++        body: JSON.stringify({ confirmRecent: true }),
++      }));
++
++      expect(response.status).toBe(409);
++      expect((await response.json()).error.code).toBe("E_SYNC_LOCKED");
++      expect((await adminDb`select count(*)::integer as count from public.sync_work_queue`)[0]?.count).toBe(0);
++    } finally {
++      release();
++      await locked;
++      await closeDbClient(lockDb);
++    }
++  });
++
+ });
+diff --git a/apps/web/src/app/globals.css b/apps/web/src/app/globals.css
+index 66f9e8f..7a7d304 100644
+--- a/apps/web/src/app/globals.css
++++ b/apps/web/src/app/globals.css
+@@ -333,20 +333,33 @@ p {
+   color: #ffe2a8;
+   font-size: 0.84rem;
+   text-align: right;
+ }
+ 
+ .sync-summary,
+ .sync-history {
+   margin-bottom: 24px;
+ }
+ 
++.sync-pagination {
++  display: flex;
++  align-items: center;
++  justify-content: flex-end;
++  gap: 14px;
++  margin-top: 14px;
++  font-size: 0.9rem;
++}
++
++.sync-pagination a {
++  color: #dbe9ff;
++}
++
+ .settings-grid {
+   display: grid;
+   gap: 24px;
+ }
+ 
+ .config-form {
+   display: grid;
+   grid-template-columns: repeat(2, minmax(0, 1fr));
+   gap: 16px;
+   margin-top: 20px;
+diff --git a/apps/web/src/app/sync/[id]/page.tsx b/apps/web/src/app/sync/[id]/page.tsx
+index 1ca6b61..7d3af03 100644
+--- a/apps/web/src/app/sync/[id]/page.tsx
++++ b/apps/web/src/app/sync/[id]/page.tsx
+@@ -1,40 +1,37 @@
+ import Link from "next/link";
+ import { notFound, redirect } from "next/navigation";
+ import { z } from "zod";
+ 
+ import { getSyncRunDetail } from "@real2/db";
+ 
+ import { AppShell } from "../../../components/app-shell";
+ import { requireRole } from "../../../lib/auth/authorization";
+ import { requireUser } from "../../../lib/auth/require-user";
+ import { getDatabase } from "../../../lib/server/runtime";
++import { formatMoscowDateTime } from "../../../lib/sync-ui";
+ 
+ export const dynamic = "force-dynamic";
+ 
+-function formatDate(value: Date): string {
+-  return new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(value);
+-}
+-
+ export default async function SyncRunDetailPage({
+   params,
+ }: Readonly<{ params: Promise<{ id: string }> }>) {
+   let user;
+   try {
+     user = requireRole(await requireUser(), ["admin", "head"]);
+   } catch {
+     redirect("/");
+   }
+   const parsed = z.uuid().safeParse((await params).id);
+   if (!parsed.success) notFound();
+   const run = await getSyncRunDetail(getDatabase(), parsed.data);
+   if (!run) notFound();
+ 
+   return (
+     <AppShell user={user}>
+       <div className="page-heading"><div><p className="eyebrow">Синхронизация</p><h1>{run.kind}</h1><p className="muted">Trace ID: {run.traceId}</p></div><Link href="/sync">К истории</Link></div>
+-      <section className="panel"><h2>{run.status}</h2><dl className="integration-details"><div><dt>Начало</dt><dd>{formatDate(run.startedAt)}</dd></div><div><dt>Завершение</dt><dd>{run.finishedAt ? formatDate(run.finishedAt) : "выполняется"}</dd></div><div><dt>Страницы</dt><dd>{run.counts.pages}</dd></div><div><dt>Retries</dt><dd>{run.counts.retries}</dd></div></dl>{run.errorSummary ? <p className="form-error">{run.errorSummary}</p> : null}</section>
+-      <section className="panel sync-history"><h2>Этапы</h2><div className="config-table-wrap"><table className="config-table"><thead><tr><th>Поток</th><th>Страница</th><th>Объектов</th><th>Получено</th></tr></thead><tbody>{run.pages.map((page) => <tr key={`${page.stream}-${page.pageNumber}`}><td>{page.stream}</td><td>{page.pageNumber}</td><td>{page.itemCount}</td><td>{formatDate(page.receivedAt)}</td></tr>)}{run.pages.length === 0 ? <tr><td colSpan={4} className="muted">Страницы ещё не записаны.</td></tr> : null}</tbody></table></div></section>
++      <section className="panel"><h2>{run.status}</h2><dl className="integration-details"><div><dt>Начало</dt><dd>{formatMoscowDateTime(run.startedAt)}</dd></div><div><dt>Завершение</dt><dd>{formatMoscowDateTime(run.finishedAt)}</dd></div><div><dt>Страницы</dt><dd>{run.counts.pages}</dd></div><div><dt>Retries</dt><dd>{run.counts.retries}</dd></div></dl>{run.errorSummary ? <p className="form-error">{run.errorSummary}</p> : null}</section>
++      <section className="panel sync-history"><h2>Этапы</h2><div className="config-table-wrap"><table className="config-table"><thead><tr><th>Поток</th><th>Страница</th><th>Объектов</th><th>Получено</th></tr></thead><tbody>{run.pages.map((page) => <tr key={`${page.stream}-${page.pageNumber}`}><td>{page.stream}</td><td>{page.pageNumber}</td><td>{page.itemCount}</td><td>{formatMoscowDateTime(page.receivedAt)}</td></tr>)}{run.pages.length === 0 ? <tr><td colSpan={4} className="muted">Страницы ещё не записаны.</td></tr> : null}</tbody></table></div></section>
+       <section className="panel sync-history"><h2>HTTP audit</h2><div className="config-table-wrap"><table className="config-table"><thead><tr><th>Метод</th><th>Путь</th><th>Статус</th><th>Запросы</th><th>Время, мс</th><th>Макс. попытка</th></tr></thead><tbody>{run.audit.map((audit) => <tr key={`${audit.method}-${audit.normalizedPath}-${audit.responseStatus}-${audit.result}`}><td>{audit.method}</td><td>{audit.normalizedPath}</td><td>{audit.responseStatus ?? "—"}</td><td>{audit.requestCount}</td><td>{audit.totalDurationMs}</td><td>{audit.maxAttempt}</td></tr>)}{run.audit.length === 0 ? <tr><td colSpan={6} className="muted">Безопасных audit-записей нет.</td></tr> : null}</tbody></table></div></section>
+     </AppShell>
+   );
+ }
+diff --git a/apps/web/src/app/sync/page.tsx b/apps/web/src/app/sync/page.tsx
+index e2c67b7..5b396bd 100644
+--- a/apps/web/src/app/sync/page.tsx
++++ b/apps/web/src/app/sync/page.tsx
+@@ -1,85 +1,88 @@
+ import Link from "next/link";
+ import { redirect } from "next/navigation";
+ 
+ import { getLatestSyncRun, listSyncRuns } from "@real2/db";
+ 
+ import { AppShell } from "../../components/app-shell";
+ import { SyncTrigger } from "../../components/sync-trigger";
+ import { requireRole } from "../../lib/auth/authorization";
+ import { requireUser } from "../../lib/auth/require-user";
+ import { getDatabase } from "../../lib/server/runtime";
++import { formatMoscowDateTime, syncHistoryPagination } from "../../lib/sync-ui";
+ 
+ export const dynamic = "force-dynamic";
+ 
+-function formatDate(value: Date | null): string {
+-  if (!value) return "выполняется";
+-  return new Intl.DateTimeFormat("ru-RU", {
+-    dateStyle: "medium",
+-    timeStyle: "short",
+-  }).format(value);
+-}
+-
+ function duration(startedAt: Date, finishedAt: Date | null): string {
+   if (!finishedAt) return "выполняется";
+   return `${Math.max(0, Math.round((finishedAt.getTime() - startedAt.getTime()) / 1_000))} с`;
+ }
+ 
+-export default async function SyncRunsPage() {
++export default async function SyncRunsPage({
++  searchParams,
++}: Readonly<{ searchParams?: Promise<{ page?: string }> }>) {
+   let user;
+   try {
+     user = requireRole(await requireUser(), ["admin", "head"]);
+   } catch {
+     redirect("/");
+   }
+ 
++  const pageParam = Number((await searchParams)?.page ?? "1");
++  const page = Number.isSafeInteger(pageParam) && pageParam > 0 ? pageParam : 1;
+   const db = getDatabase();
+   const [latest, history] = await Promise.all([
+     getLatestSyncRun(db),
+-    listSyncRuns(db, { page: 1, pageSize: 25 }),
++    listSyncRuns(db, { page, pageSize: 25 }),
+   ]);
++  const pagination = syncHistoryPagination(history);
+   const recentRun = latest
+     ? Date.now() - latest.startedAt.getTime() < 60_000
+     : false;
+ 
+   return (
+     <AppShell user={user}>
+       <div className="page-heading">
+         <div>
+           <p className="eyebrow">Контроль синхронизации</p>
+           <h1>Запуски amoCRM</h1>
+           <p className="muted">Показываются только безопасные статусы, счётчики и агрегированный audit.</p>
+         </div>
+         {user.role === "admin" ? <SyncTrigger recentRun={recentRun} /> : null}
+       </div>
+       <section className="panel sync-summary">
+         <h2>Свежесть</h2>
+         {latest ? (
+           <dl className="integration-details">
+-            <div><dt>Последний запуск</dt><dd>{formatDate(latest.startedAt)}</dd></div>
++            <div><dt>Последний запуск</dt><dd>{formatMoscowDateTime(latest.startedAt)}</dd></div>
+             <div><dt>Статус</dt><dd>{latest.status}</dd></div>
+             <div><dt>Тип</dt><dd>{latest.kind}</dd></div>
+             <div><dt>Длительность</dt><dd>{duration(latest.startedAt, latest.finishedAt)}</dd></div>
+           </dl>
+         ) : <p className="muted">Запусков ещё не было.</p>}
+       </section>
+       <section className="panel sync-history">
+         <h2>История</h2>
+         <div className="config-table-wrap">
+           <table className="config-table">
+             <thead><tr><th>Начало</th><th>Тип</th><th>Статус</th><th>Страницы</th><th>Лиды</th><th>События</th><th>Retries</th></tr></thead>
+             <tbody>
+               {history.items.map((run) => (
+                 <tr key={run.id}>
+-                  <td><Link href={`/sync/${run.id}`}>{formatDate(run.startedAt)}</Link></td>
++                  <td><Link href={`/sync/${run.id}`}>{formatMoscowDateTime(run.startedAt)}</Link></td>
+                   <td>{run.kind}</td><td>{run.status}</td><td>{run.counts.pages}</td>
+                   <td>{run.counts.leads}</td><td>{run.counts.events}</td><td>{run.counts.retries}</td>
+                 </tr>
+               ))}
+               {history.items.length === 0 ? <tr><td colSpan={7} className="muted">Нет безопасной истории запусков.</td></tr> : null}
+             </tbody>
+           </table>
+         </div>
++        <nav className="sync-pagination" aria-label="Страницы истории синхронизации">
++          {pagination.previousHref ? <Link href={pagination.previousHref}>Назад</Link> : <span className="muted">Назад</span>}
++          <span>{pagination.currentPage} / {pagination.totalPages}</span>
++          {pagination.nextHref ? <Link href={pagination.nextHref}>Вперёд</Link> : <span className="muted">Вперёд</span>}
++        </nav>
+       </section>
+     </AppShell>
+   );
+ }
+diff --git a/apps/web/src/lib/sync-ui.test.ts b/apps/web/src/lib/sync-ui.test.ts
+new file mode 100644
+index 0000000..9d6d46c
+--- /dev/null
++++ b/apps/web/src/lib/sync-ui.test.ts
+@@ -0,0 +1,22 @@
++import { describe, expect, it } from "vitest";
++
++import { formatMoscowDateTime, syncHistoryPagination } from "./sync-ui";
++
++describe("sync UI helpers", () => {
++  it("formats synchronization dates in Europe/Moscow", () => {
++    expect(formatMoscowDateTime(new Date("2026-09-14T23:30:00.000Z"))).toContain("02:30");
++  });
++
++  it("builds bounded sync history pagination links", () => {
++    expect(syncHistoryPagination({ page: 2, pageSize: 25, total: 60 })).toEqual({
++      currentPage: 2,
++      totalPages: 3,
++      previousHref: "/sync?page=1",
++      nextHref: "/sync?page=3",
++    });
++    expect(syncHistoryPagination({ page: 1, pageSize: 25, total: 10 })).toMatchObject({
++      previousHref: null,
++      nextHref: null,
++    });
++  });
++});
+diff --git a/apps/web/src/lib/sync-ui.ts b/apps/web/src/lib/sync-ui.ts
+new file mode 100644
+index 0000000..733b83d
+--- /dev/null
++++ b/apps/web/src/lib/sync-ui.ts
+@@ -0,0 +1,30 @@
++export function formatMoscowDateTime(value: Date | null): string {
++  if (!value) return "выполняется";
++  return new Intl.DateTimeFormat("ru-RU", {
++    dateStyle: "medium",
++    timeStyle: "short",
++    timeZone: "Europe/Moscow",
++  }).format(value);
++}
++
++export type SyncHistoryPagination = Readonly<{
++  currentPage: number;
++  totalPages: number;
++  previousHref: string | null;
++  nextHref: string | null;
++}>;
++
++export function syncHistoryPagination(input: Readonly<{
++  page: number;
++  pageSize: number;
++  total: number;
++}>): SyncHistoryPagination {
++  const totalPages = Math.max(1, Math.ceil(input.total / input.pageSize));
++  const currentPage = Math.min(Math.max(1, input.page), totalPages);
++  return {
++    currentPage,
++    totalPages,
++    previousHref: currentPage > 1 ? `/sync?page=${currentPage - 1}` : null,
++    nextHref: currentPage < totalPages ? `/sync?page=${currentPage + 1}` : null,
++  };
++}
+diff --git a/apps/worker/src/jobs/amo-sync.test.ts b/apps/worker/src/jobs/amo-sync.test.ts
+index 007f24d..e977eb4 100644
+--- a/apps/worker/src/jobs/amo-sync.test.ts
++++ b/apps/worker/src/jobs/amo-sync.test.ts
+@@ -1,19 +1,26 @@
+ import { describe, expect, it, vi } from "vitest";
+ 
++import { AppError } from "@real2/domain";
++
+ import {
+   createAmoSyncRunner,
++  processSyncWorkQueue,
+   type AmoSyncDependencies,
+   type Clock,
+ } from "./amo-sync";
+ 
+ const fixedNow = new Date("2026-09-15T09:00:00.000Z");
++const testFence = {
++  backendPid: 1,
++  assertOwned: vi.fn(async () => undefined),
++};
+ 
+ function createClock(): Clock & { sleeps: number[] } {
+   const sleeps: number[] = [];
+   return {
+     sleeps,
+     now: () => fixedNow,
+     random: () => 0,
+     sleep: async (milliseconds) => {
+       sleeps.push(milliseconds);
+     },
+@@ -72,21 +79,21 @@ describe("amoCRM read-only sync", () => {
+         getActive: vi.fn(async () => ({
+           id: "connection-1",
+           accountId: 9001,
+           baseUrl: "https://555151.amocrm.ru",
+         })),
+       },
+       configs: {
+         getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })),
+       },
+       locks: {
+-        withSyncLock: vi.fn(async (_connectionId, action) => action()),
++        withSyncLock: vi.fn(async (_connectionId, action) => action(testFence)),
+       },
+       cursors: {
+         get: vi.fn(async () => ({
+           events: {
+             cursorTime: new Date("2026-09-15T08:30:00.000Z"),
+             cursorExternalId: "event-before",
+           },
+         })),
+       },
+       runs: {
+@@ -136,41 +143,47 @@ describe("amoCRM read-only sync", () => {
+         refresh: vi.fn(),
+       },
+       reconciliation: { previousFullLeadCount: vi.fn(async () => null) },
+     } as unknown as AmoSyncDependencies;
+ 
+     const result = await createAmoSyncRunner(dependencies)("incremental", clock);
+ 
+     expect(result).toMatchObject({ status: "partial", runId: "run-1" });
+     expect(clock.sleeps).toEqual([1_000, 3_000, 9_000, 27_000, 60_000]);
+     expect(finished).toHaveLength(1);
+-    expect(finished[0]).toMatchObject({ status: "partial" });
++    expect(finished[0]).toMatchObject({
++      status: "partial",
++      counts: { leadsRead: 2 },
++    });
++    expect(finished[0]).toMatchObject({
++      checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
++    });
+     expect(finished[0]).not.toHaveProperty("nextCursors");
+     expect(paths.filter((path) => path.includes("page=3"))).toHaveLength(6);
+   });
+ 
+   it("quarantines the exact malformed 200 payload and does not retry it", async () => {
+     const malformed = { id: "not-an-account-id", diagnostic: "synthetic" };
+     const quarantined: unknown[] = [];
+     const requestPage = vi.fn(async () => malformed);
+     const dependencies = {
+       envEnabled: true,
+       controls: { isSyncEnabled: vi.fn(async () => true) },
+       connections: {
+         getActive: vi.fn(async () => ({
+           id: "connection-1",
+           accountId: 9001,
+           baseUrl: "https://555151.amocrm.ru",
+         })),
+       },
+       configs: { getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })) },
+-      locks: { withSyncLock: vi.fn(async (_id, action) => action()) },
++      locks: { withSyncLock: vi.fn(async (_id, action) => action(testFence)) },
+       cursors: { get: vi.fn(async () => ({})) },
+       runs: {
+         start: vi.fn(async () => ({ id: "run-1", traceId: "trace-1" })),
+         finish: vi.fn(),
+       },
+       raw: {
+         appendPage: vi.fn(),
+         quarantinePage: vi.fn(async (input) => {
+           quarantined.push(input);
+         }),
+@@ -183,11 +196,212 @@ describe("amoCRM read-only sync", () => {
+       reconciliation: { previousFullLeadCount: vi.fn() },
+     } as unknown as AmoSyncDependencies;
+ 
+     await expect(
+       createAmoSyncRunner(dependencies)("incremental", createClock()),
+     ).resolves.toMatchObject({ status: "partial" });
+     expect(requestPage).toHaveBeenCalledOnce();
+     expect(quarantined).toHaveLength(1);
+     expect(quarantined[0]).toMatchObject({ payload: malformed });
+   });
++
++  it("propagates manual queue trace and requester attribution into the sync run", async () => {
++    const started: unknown[] = [];
++    const dependencies = {
++      envEnabled: true,
++      controls: { isSyncEnabled: vi.fn(async () => true) },
++      connections: {
++        getActive: vi.fn(async () => ({
++          id: "connection-1",
++          accountId: 9001,
++          baseUrl: "https://555151.amocrm.ru",
++        })),
++      },
++      configs: { getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })) },
++      locks: { withSyncLock: vi.fn(async (_id, action) => action(testFence)) },
++      cursors: { get: vi.fn(async () => ({})) },
++      runs: {
++        start: vi.fn(async (input) => {
++          started.push(input);
++          return { id: "run-1", traceId: input.traceId };
++        }),
++        finish: vi.fn(),
++      },
++      raw: { appendPage: vi.fn(), quarantinePage: vi.fn() },
++      transport: {
++        requestPage: vi.fn(async (request) => {
++          if (request.url.includes("/account")) return { id: 9001, subdomain: "555151" };
++          if (request.url.includes("/pipelines/77/statuses")) return { _embedded: { statuses: [] } };
++          if (request.url.includes("/pipelines")) return { _embedded: { pipelines: [] } };
++          if (request.url.includes("/users")) return { _embedded: { users: [] } };
++          if (request.url.includes("/events")) return { _embedded: { events: [] } };
++          return { _embedded: { leads: [] } };
++        }),
++      },
++      tokens: {
++        createProvider: vi.fn(() => ({ getAccessToken: vi.fn(async () => "test-token") })),
++        refresh: vi.fn(),
++      },
++      reconciliation: { previousFullLeadCount: vi.fn(async () => null) },
++    } as unknown as AmoSyncDependencies;
++
++    await expect(
++      createAmoSyncRunner(dependencies)("manual", createClock(), {
++        traceId: "manual-request-trace",
++        requestedBy: "10000000-0000-4000-8000-000000000010",
++      }),
++    ).resolves.toMatchObject({
++      status: "success",
++      traceId: "manual-request-trace",
++    });
++
++    expect(started[0]).toMatchObject({
++      traceId: "manual-request-trace",
++      createdBy: "10000000-0000-4000-8000-000000000010",
++    });
++  });
++
++  it("executes one claimed queue item and records a terminal queue state", async () => {
++    const completed: unknown[] = [];
++    const run = vi.fn(async () => ({
++      status: "success" as const,
++      runId: "run-1",
++      traceId: "queued-trace",
++    }));
++
++    await expect(processSyncWorkQueue({
++      now: () => fixedNow,
++      claim: vi.fn(async () => ({
++        id: "queue-1",
++        traceId: "queued-trace",
++        kind: "manual" as const,
++        requestedBy: "10000000-0000-4000-8000-000000000010",
++        leaseToken: "40000000-0000-4000-8000-000000000001",
++        attempt: 1,
++      })),
++      complete: vi.fn(async (input) => {
++        completed.push(input);
++      }),
++      run,
++    })).resolves.toBe(1);
++
++    expect(run).toHaveBeenCalledWith("manual", expect.anything(), {
++      traceId: "queued-trace",
++      requestedBy: "10000000-0000-4000-8000-000000000010",
++    });
++    expect(completed[0]).toMatchObject({
++      id: "queue-1",
++      leaseToken: "40000000-0000-4000-8000-000000000001",
++      status: "done",
++      syncRunId: "run-1",
++    });
++  });
++
++  it("cancels before append or finalization when the advisory fence is lost", async () => {
++    let checks = 0;
++    const lostFence = {
++      backendPid: 2,
++      assertOwned: vi.fn(async () => {
++        checks += 1;
++        if (checks > 1) throw new AppError("E_SYNC_FENCE_LOST", 409);
++      }),
++    };
++    const dependencies = {
++      envEnabled: true,
++      controls: { isSyncEnabled: vi.fn(async () => true) },
++      connections: {
++        getActive: vi.fn(async () => ({
++          id: "connection-1",
++          accountId: 9001,
++          baseUrl: "https://555151.amocrm.ru",
++        })),
++      },
++      configs: { getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })) },
++      locks: { withSyncLock: vi.fn(async (_id, action) => action(lostFence)) },
++      cursors: { get: vi.fn(async () => ({})) },
++      runs: {
++        start: vi.fn(async () => ({ id: "run-1", traceId: "trace-1" })),
++        finish: vi.fn(),
++      },
++      raw: { appendPage: vi.fn(), quarantinePage: vi.fn() },
++      transport: {
++        requestPage: vi.fn(async () => ({ id: 9001, subdomain: "555151" })),
++      },
++      tokens: {
++        createProvider: vi.fn(() => ({ getAccessToken: vi.fn(async () => "test-token") })),
++        refresh: vi.fn(),
++      },
++      reconciliation: { previousFullLeadCount: vi.fn(async () => null) },
++    } as unknown as AmoSyncDependencies;
++
++    await expect(
++      createAmoSyncRunner(dependencies)("incremental", createClock()),
++    ).rejects.toMatchObject({ code: "E_SYNC_FENCE_LOST" });
++
++    expect(dependencies.raw.appendPage).not.toHaveBeenCalled();
++    expect(dependencies.runs.finish).not.toHaveBeenCalled();
++  });
++
++  it("seals a count-drop run even when the critical alert sink fails", async () => {
++    const finished: unknown[] = [];
++    const leads = Array.from({ length: 90 }, (_, index) => ({
++      id: index + 1,
++      account_id: 9001,
++      created_at: 1,
++      updated_at: 1 + index,
++    }));
++    const dependencies = {
++      envEnabled: true,
++      controls: { isSyncEnabled: vi.fn(async () => true) },
++      connections: {
++        getActive: vi.fn(async () => ({
++          id: "connection-1",
++          accountId: 9001,
++          baseUrl: "https://555151.amocrm.ru",
++        })),
++      },
++      configs: { getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })) },
++      locks: { withSyncLock: vi.fn(async (_id, action) => action(testFence)) },
++      cursors: { get: vi.fn(async () => ({})) },
++      runs: {
++        start: vi.fn(async () => ({ id: "run-1", traceId: "trace-1" })),
++        finish: vi.fn(async (_runId, outcome) => {
++          finished.push(outcome);
++        }),
++      },
++      raw: { appendPage: vi.fn(), quarantinePage: vi.fn() },
++      transport: {
++        requestPage: vi.fn(async (request) => {
++          if (request.url.includes("/account")) return { id: 9001, subdomain: "555151" };
++          if (request.url.includes("/pipelines/77/statuses")) return { _embedded: { statuses: [] } };
++          if (request.url.includes("/pipelines")) return { _embedded: { pipelines: [] } };
++          if (request.url.includes("/users")) return { _embedded: { users: [] } };
++          if (request.url.includes("/events")) return { _embedded: { events: [] } };
++          return { _embedded: { leads } };
++        }),
++      },
++      tokens: {
++        createProvider: vi.fn(() => ({ getAccessToken: vi.fn(async () => "test-token") })),
++        refresh: vi.fn(),
++      },
++      reconciliation: { previousFullLeadCount: vi.fn(async () => 100) },
++      alerts: {
++        critical: vi.fn(async () => {
++          throw new Error("alert sink unavailable");
++        }),
++      },
++    } as unknown as AmoSyncDependencies;
++
++    await expect(
++      createAmoSyncRunner(dependencies)("nightly_reconciliation", createClock()),
++    ).resolves.toMatchObject({ status: "failed", runId: "run-1" });
++
++    expect(finished).toHaveLength(1);
++    expect(finished[0]).toMatchObject({
++      status: "failed",
++      errorCode: "E_DATA_QUALITY_BLOCK",
++      counts: { leadsRead: 90 },
++      checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
++    });
++    expect(JSON.stringify(finished[0])).toContain("critical alert delivery failed");
++  });
+ });
+diff --git a/apps/worker/src/jobs/amo-sync.ts b/apps/worker/src/jobs/amo-sync.ts
+index f9e597c..2b8bd10 100644
+--- a/apps/worker/src/jobs/amo-sync.ts
++++ b/apps/worker/src/jobs/amo-sync.ts
+@@ -12,25 +12,27 @@ import {
+   getSyncCursors,
+   getSystemControl,
+   quarantineRawPage,
+   startSyncRun,
+   withSyncAdvisoryLock,
+   type Database,
+ } from "@real2/db";
+ import type {
+   AmoApiAuditInput,
+   AppendRawPageInput,
++  ClaimedSyncWork,
+   RawAmoEventInput,
+   RawAmoObjectInput,
+   SyncCounts,
+   SyncCursorPosition,
+   SyncKind,
++  SyncLockFence,
+   SyncOutcome,
+   SyncStream,
+ } from "@real2/db";
+ import {
+   AppError,
+   parseServerEnv,
+   type AppErrorCode,
+   type ServerEnv,
+ } from "@real2/domain";
+ import {
+@@ -97,45 +99,55 @@ export type SyncRunResult =
+   | Readonly<{ status: "success" | "partial" | "failed"; runId: string; traceId: string }>
+   | Readonly<{ status: "locked"; code: "E_SYNC_LOCKED" }>;
+ 
+ export type SyncTransportRequest<T> = Readonly<{
+   url: string;
+   runId: string;
+   traceId: string;
+   attempt: number;
+   tokenProvider: AmoTokenProvider;
+   schema: z.ZodType<T>;
++  fence: SyncLockFence;
+   audit(input: AmoApiAuditInput): Promise<void>;
+ }>;
+ 
+ export type StartedSyncRun = Readonly<{ id: string; traceId: string }>;
+ 
++export type RunSyncOptions = Readonly<{
++  traceId?: string;
++  requestedBy?: string | null;
++}>;
++
+ export type AmoSyncDependencies = Readonly<{
+   envEnabled: boolean;
+   controls: Readonly<{ isSyncEnabled(): Promise<boolean> }>;
+   connections: Readonly<{ getActive(): Promise<ActiveSyncConnection | null> }>;
+   configs: Readonly<{
+     getActive(connectionId: string): Promise<ActiveSyncConfig | null>;
+   }>;
+   locks: Readonly<{
+-    withSyncLock<T>(connectionId: string, action: () => Promise<T>): Promise<T>;
++    withSyncLock<T>(
++      connectionId: string,
++      action: (fence: SyncLockFence) => Promise<T>,
++    ): Promise<T>;
+   }>;
+   cursors: Readonly<{
+     get(connectionId: string): Promise<SyncCursorSnapshot>;
+   }>;
+   runs: Readonly<{
+     start(input: {
+       kind: SyncKind;
+       connectionId: string;
+       configId: string;
+       traceId: string;
+       startedAt: Date;
++      createdBy?: string | null;
+     }): Promise<StartedSyncRun>;
+     finish(runId: string, outcome: SyncOutcome, finishedAt: Date): Promise<void>;
+   }>;
+   raw: Readonly<{
+     appendPage(input: AppendRawPageInput): Promise<void>;
+     quarantinePage(input: {
+       syncRunId: string;
+       stream: SyncStream;
+       pageNumber: number;
+       reasonCode: string;
+@@ -186,20 +198,21 @@ type SyncFailure = Error & {
+ 
+ type RunContext = {
+   connection: ActiveSyncConnection;
+   config: ActiveSyncConfig;
+   run: StartedSyncRun;
+   clock: Clock;
+   counts: MutableCounts;
+   tokenProvider: AmoTokenProvider;
+   pageHashes: string[];
+   distinctLeadIds: Set<number>;
++  fence: SyncLockFence;
+   nextCursors: SyncCursorSnapshot;
+   nextPageNumber: Record<SyncStream, number>;
+ };
+ 
+ function sha256(value: unknown): string {
+   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+ }
+ 
+ function asJsonValue(value: unknown): JSONValue {
+   return value as JSONValue;
+@@ -275,35 +288,38 @@ async function requestWithRetry<T>(
+   context: RunContext,
+   url: string,
+   schema: z.ZodType<T>,
+ ): Promise<unknown> {
+   let refreshed = false;
+   let retryIndex = 0;
+   let attempt = 1;
+ 
+   while (true) {
+     try {
++      await context.fence.assertOwned();
+       return await dependencies.transport.requestPage({
+         url,
+         runId: context.run.id,
+         traceId: context.run.traceId,
+         attempt,
+         tokenProvider: context.tokenProvider,
+         schema,
++        fence: context.fence,
+         audit: async (input) => dependencies.audit?.append(input),
+       });
+     } catch (error) {
+       const status = responseStatus(error);
+       const code = errorCode(error);
+       if (!refreshed && (status === 401 || code === "E_AMO_AUTH")) {
+         refreshed = true;
+         context.counts.retries += 1;
++        await context.fence.assertOwned();
+         await dependencies.tokens.refresh(
+           context.connection.id,
+           context.clock.now(),
+           { runId: context.run.id, traceId: context.run.traceId },
+         );
+         attempt += 1;
+         continue;
+       }
+ 
+       const retryable =
+@@ -327,20 +343,21 @@ async function appendValidatedPage(
+   dependencies: AmoSyncDependencies,
+   context: RunContext,
+   stream: SyncStream,
+   payload: unknown,
+   objects: readonly RawAmoObjectInput[],
+   events: readonly RawAmoEventInput[],
+ ): Promise<void> {
+   const payloadSha256 = sha256(payload);
+   context.pageHashes.push(payloadSha256);
+   const pageNumber = context.nextPageNumber[stream]++;
++  await context.fence.assertOwned();
+   await dependencies.raw.appendPage({
+     syncRunId: context.run.id,
+     stream,
+     pageNumber,
+     itemCount: objects.length + events.length,
+     payloadSha256,
+     objects,
+     events,
+     receivedAt: context.clock.now(),
+   });
+@@ -348,20 +365,21 @@ async function appendValidatedPage(
+ }
+ 
+ async function quarantineInvalidPage(
+   dependencies: AmoSyncDependencies,
+   context: RunContext,
+   stream: SyncStream,
+   payload: unknown,
+ ): Promise<never> {
+   const payloadSha256 = sha256(payload);
+   const pageNumber = context.nextPageNumber[stream]++;
++  await context.fence.assertOwned();
+   await dependencies.raw.quarantinePage({
+     syncRunId: context.run.id,
+     stream,
+     pageNumber,
+     reasonCode: "E_SCHEMA_INVALID",
+     payload: asJsonValue(payload),
+     payloadSha256,
+     receivedAt: context.clock.now(),
+   });
+   context.counts.pagesRead += 1;
+@@ -619,49 +637,54 @@ async function ingestLeads(
+       };
+     },
+   });
+ }
+ 
+ async function executeLockedSync(
+   dependencies: AmoSyncDependencies,
+   kind: SyncKind,
+   clock: Clock,
+   connection: ActiveSyncConnection,
++  fence: SyncLockFence,
++  options: RunSyncOptions,
+ ): Promise<SyncRunResult> {
+-  const traceId = dependencies.traceId?.() ?? randomUUID();
++  const traceId = options.traceId ?? dependencies.traceId?.() ?? randomUUID();
+   let run: StartedSyncRun | undefined;
++  let context: RunContext | undefined;
+   const counts: MutableCounts = {
+     pagesRead: 0,
+     leadsRead: 0,
+     eventsRead: 0,
+     usersRead: 0,
+     retries: 0,
+   };
+   const incremental = kind === "incremental";
+ 
+   try {
+     const config = await dependencies.configs.getActive(connection.id);
+     if (!config) throw new AppError("E_CONFIG_INCOMPLETE", 422);
+     run = await dependencies.runs.start({
+       kind,
+       connectionId: connection.id,
+       configId: config.id,
+       traceId,
+       startedAt: clock.now(),
++      createdBy: options.requestedBy ?? null,
+     });
+-    const context: RunContext = {
++    context = {
+       connection, config, run, clock, counts,
+       tokenProvider: dependencies.tokens.createProvider(connection.id, {
+         runId: run.id, traceId: run.traceId, clock,
+       }),
+       pageHashes: [],
+       distinctLeadIds: new Set<number>(),
++      fence,
+       nextCursors: await dependencies.cursors.get(connection.id),
+       nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
+     };
+     await ingestMetadata(dependencies, context);
+     await ingestUsers(dependencies, context);
+     await ingestEvents(dependencies, context, incremental);
+     await ingestLeads(dependencies, context, incremental);
+ 
+     if (!incremental) {
+       const previousCount = await dependencies.reconciliation.previousFullLeadCount(
+@@ -674,95 +697,177 @@ async function executeLockedSync(
+       ) {
+         throw fail(
+           "E_DATA_QUALITY_BLOCK",
+           "Full lead count dropped by more than five percent",
+           "failed",
+         );
+       }
+     }
+ 
+     counts.leadsRead = context.distinctLeadIds.size;
++    await fence.assertOwned();
+     await dependencies.runs.finish(
+       run.id,
+       {
+         status: "success",
+         nextCursors: context.nextCursors,
+         counts: countsSnapshot(counts),
+         checksum: sha256(context.pageHashes),
+       },
+       clock.now(),
+     );
+     return { status: "success", runId: run.id, traceId: run.traceId };
+   } catch (error) {
+     // Nothing durable exists until the run has started. After that point every
+     // setup, token, cursor, and ingest failure must seal the run.
+     if (!run) throw error;
++    if (errorCode(error) === "E_SYNC_FENCE_LOST") throw error;
++    await fence.assertOwned();
+     const forced = (error as SyncFailure).forceStatus;
+     const status = forced ?? (counts.pagesRead > 0 ? "partial" : "failed");
+     const code = errorCode(error);
++    if (context) {
++      counts.leadsRead = context.distinctLeadIds.size;
++    }
++    let safeError =
++      code === "E_DATA_QUALITY_BLOCK"
++        ? "Full lead count dropped by more than five percent"
++        : code === "E_AMO_AUTH"
++          ? "amoCRM authorization failed"
++          : code === "E_SYNC_PARTIAL"
++            ? "amoCRM returned an invalid page"
++            : "amoCRM synchronization failed";
+     if (code === "E_DATA_QUALITY_BLOCK") {
+-      await dependencies.alerts?.critical({
+-        runId: run.id,
+-        code,
+-        summary: "Full lead count dropped by more than five percent",
+-      });
++      try {
++        await fence.assertOwned();
++        await dependencies.alerts?.critical({
++          runId: run.id,
++          code,
++          summary: "Full lead count dropped by more than five percent",
++        });
++      } catch (alertError) {
++        if (errorCode(alertError) === "E_SYNC_FENCE_LOST") throw alertError;
++        safeError = `${safeError}; critical alert delivery failed`;
++      }
+     }
++    await fence.assertOwned();
+     await dependencies.runs.finish(
+       run.id,
+       {
+         status,
+-        safeError:
+-          code === "E_DATA_QUALITY_BLOCK"
+-            ? "Full lead count dropped by more than five percent"
+-            : code === "E_AMO_AUTH"
+-              ? "amoCRM authorization failed"
+-              : code === "E_SYNC_PARTIAL"
+-                ? "amoCRM returned an invalid page"
+-                : "amoCRM synchronization failed",
++        safeError,
+         errorCode: code,
+         counts: countsSnapshot(counts),
+-        checksum: null,
++        checksum:
++          context && context.pageHashes.length > 0
++            ? sha256(context.pageHashes)
++            : null,
+       },
+       clock.now(),
+     );
+     return { status, runId: run.id, traceId: run.traceId };
+   }
+ }
+ 
+ export function createAmoSyncRunner(dependencies: AmoSyncDependencies) {
+   return async function runSyncWithDependencies(
+     kind: SyncKind,
+     clock: Clock = systemClock,
++    options: RunSyncOptions = {},
+   ): Promise<SyncRunResult> {
+     if (!dependencies.envEnabled) return { kind: "disabled" };
+     if (!(await dependencies.controls.isSyncEnabled())) {
+       return { kind: "disabled" };
+     }
+ 
+     const connection = await dependencies.connections.getActive();
+     if (!connection || !Number.isSafeInteger(connection.accountId)) {
+       throw new AppError("E_AMO_AUTH", 502);
+     }
+ 
+     try {
+-      return await dependencies.locks.withSyncLock(connection.id, () =>
+-        executeLockedSync(dependencies, kind, clock, connection),
++      return await dependencies.locks.withSyncLock(connection.id, (fence) =>
++        executeLockedSync(dependencies, kind, clock, connection, fence, options),
+       );
+     } catch (error) {
+       if (errorCode(error) === "E_SYNC_LOCKED") {
+         return { status: "locked", code: "E_SYNC_LOCKED" };
+       }
+       throw error;
+     }
+   };
+ }
+ 
++export type SyncWorkQueueProcessor = Readonly<{
++  now(): Date;
++  claim(input: Readonly<{ now: Date; leaseMs: number }>): Promise<ClaimedSyncWork | null>;
++  complete(input: {
++    id: string;
++    leaseToken: string;
++    status: "done" | "failed";
++    completedAt: Date;
++    syncRunId?: string | null;
++    errorCode?: AppErrorCode | string | null;
++    errorSummary?: string | null;
++  }): Promise<void>;
++  run(kind: SyncKind, clock: Clock, options: RunSyncOptions): Promise<SyncRunResult>;
++}>;
++
++const QUEUE_LEASE_MS = 20 * 60_000;
++
++export async function processSyncWorkQueue(
++  processor: SyncWorkQueueProcessor,
++): Promise<number> {
++  const now = processor.now();
++  const work = await processor.claim({ now, leaseMs: QUEUE_LEASE_MS });
++  if (!work) return 0;
++
++  try {
++    const result = await processor.run(work.kind, systemClock, {
++      traceId: work.traceId,
++      requestedBy: work.requestedBy,
++    });
++    if ("runId" in result) {
++      await processor.complete({
++        id: work.id,
++        leaseToken: work.leaseToken,
++        status: "done",
++        completedAt: processor.now(),
++        syncRunId: result.runId,
++      });
++    } else {
++      await processor.complete({
++        id: work.id,
++        leaseToken: work.leaseToken,
++        status: "failed",
++        completedAt: processor.now(),
++        errorCode: "kind" in result ? "E_CONFIG_INCOMPLETE" : result.code,
++        errorSummary:
++          "kind" in result
++            ? "Synchronization is disabled"
++            : "Synchronization lock was already held",
++      });
++    }
++    return 1;
++  } catch (error) {
++    await processor.complete({
++      id: work.id,
++      leaseToken: work.leaseToken,
++      status: "failed",
++      completedAt: processor.now(),
++      errorCode: errorCode(error),
++      errorSummary: "Queued synchronization failed before creating a run",
++    });
++    return 1;
++  }
++}
++
+ function productionAuditSink(
+   db: Database,
+   runId: string,
+   attempt: number,
+ ) {
+   return {
+     async record(entry: {
+       method: string;
+       normalizedPath: string;
+       responseStatus?: number;
+@@ -879,21 +984,26 @@ export function createProductionAmoSyncDependencies(
+       quarantinePage: (input) => quarantineRawPage(db, input),
+     },
+     transport: {
+       requestPage: async (request) =>
+         amoFetch({
+           method: "GET",
+           url: request.url,
+           schema: z.unknown(),
+           traceId: request.traceId,
+           tokenProvider: request.tokenProvider,
+-          auditSink: productionAuditSink(db, request.runId, request.attempt),
++          auditSink: {
++            async record(entry) {
++              await request.fence.assertOwned();
++              await productionAuditSink(db, request.runId, request.attempt).record(entry);
++            },
++          },
+           redirect: "error",
+         }),
+     },
+     tokens: {
+       createProvider(connectionId, context) {
+         return createAmoTokenProvider(connectionId, {
+           ...productionTokenDependencies(db, env, context),
+           now: context.clock.now,
+         });
+       },
+@@ -924,24 +1034,29 @@ export function createProductionAmoSyncDependencies(
+ 
+ let defaultDependencies: AmoSyncDependencies | undefined;
+ 
+ export function configureAmoSync(dependencies: AmoSyncDependencies): void {
+   defaultDependencies = dependencies;
+ }
+ 
+ export async function runSync(
+   kind: SyncKind,
+   clock: Clock = systemClock,
++  options: RunSyncOptions = {},
+ ): Promise<SyncRunResult> {
+   if (defaultDependencies) {
+-    return createAmoSyncRunner(defaultDependencies)(kind, clock);
++    return createAmoSyncRunner(defaultDependencies)(kind, clock, options);
+   }
+   const env = parseServerEnv(process.env);
+-  const db = createServiceWorkerDbClient(env.DATABASE_URL);
++  const workerDatabaseUrl = process.env.WORKER_DATABASE_URL;
++  if (!workerDatabaseUrl) {
++    throw new AppError("E_CONFIG_INCOMPLETE", 500, "WORKER_DATABASE_URL is required");
++  }
++  const db = createServiceWorkerDbClient(workerDatabaseUrl);
+   try {
+     return await createAmoSyncRunner(
+       createProductionAmoSyncDependencies(db, env),
+-    )(kind, clock);
++    )(kind, clock, options);
+   } finally {
+     await closeDbClient(db);
+   }
+ }
+diff --git a/apps/worker/src/main.test.mts b/apps/worker/src/main.test.mts
+index ac3417b..20f7fec 100644
+--- a/apps/worker/src/main.test.mts
++++ b/apps/worker/src/main.test.mts
+@@ -1,94 +1,302 @@
+ import assert from "node:assert/strict";
+ import test from "node:test";
+ 
+-import { runWorkerCli, runWorkerOnce } from "./main.ts";
++import {
++  parseWorkerRuntimeEnv,
++  runWorkerCli,
++  runWorkerIteration,
++  runWorkerOnce,
++} from "./main.ts";
++
++const baseEnv = {
++  APP_URL: "http://localhost:3000",
++  DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
++  WORKER_DATABASE_URL: "postgresql://service_worker:worker-secret@db:5432/postgres",
++  RETENTION_DATABASE_URL: "postgresql://retention_worker:retention-secret@db:5432/postgres",
++  SUPABASE_URL: "http://supabase:54321",
++  SUPABASE_ANON_KEY: "local-anon-key",
++  SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
++  AMO_CLIENT_ID: "synthetic-client-id",
++  AMO_CLIENT_SECRET: "synthetic-client-secret",
++  AMO_REDIRECT_URI:
++    "https://dashboard.example.invalid/api/integrations/amo/callback",
++  TOKEN_ENCRYPTION_KEY:
++    "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
++  SYNC_ENABLED: "false",
++  SHEET_PUBLISH_ENABLED: "false",
++};
+ 
+ test("worker starts idle without contacting an external system", async () => {
+   const result = await runWorkerOnce();
+ 
+   assert.deepEqual(result, { status: "idle", networkRequests: 0 });
+ });
+ 
+ test("worker accepts enabled sync scheduling without a placeholder failure", async () => {
+   assert.deepEqual(await runWorkerOnce({
+     SYNC_ENABLED: true,
+     SHEET_PUBLISH_ENABLED: false,
+   }), { status: "ready", networkRequests: 0 });
+ });
+ 
+ test("worker CLI validates disabled switches and emits a safe one-shot result", async () => {
+   const lines: string[] = [];
+   const dependencies = {
++    now: () => new Date("2026-09-14T23:30:00.000Z"),
++    async sleep() {
++      return undefined;
++    },
+     createWorkerDbClient() {
+       return {};
+     },
++    createRetentionDbClient() {
++      return {};
++    },
+     async purgeExpiredOAuthStates() {
+       return 0;
+     },
++    async failStaleSyncRuns() {
++      return [];
++    },
++    async deleteProvenRawBefore() {
++      return {
++        objectsDeleted: 0,
++        eventsDeleted: 0,
++        quarantineDeleted: 0,
++        hashesPreserved: 0,
++        normalizedRowsVerified: 0,
++      };
++    },
++    async runRawRetention() {
++      return undefined;
++    },
++    async runSync() {
++      return undefined;
++    },
++    async processSyncQueue() {
++      return 0;
++    },
+     async closeDbClient() {
+       return undefined;
+     },
+   };
+ 
+   await runWorkerCli(
+-    {
+-      APP_URL: "http://localhost:3000",
+-      DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
+-      SUPABASE_URL: "http://supabase:54321",
+-      SUPABASE_ANON_KEY: "local-anon-key",
+-      SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
+-      AMO_CLIENT_ID: "synthetic-client-id",
+-      AMO_CLIENT_SECRET: "synthetic-client-secret",
+-      AMO_REDIRECT_URI:
+-        "https://dashboard.example.invalid/api/integrations/amo/callback",
+-      TOKEN_ENCRYPTION_KEY:
+-        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
+-      SYNC_ENABLED: "false",
+-      SHEET_PUBLISH_ENABLED: "false",
+-    },
++    baseEnv,
+     (line) => lines.push(line),
+     dependencies,
++    { maxIterations: 1 },
+   );
+ 
+   assert.deepEqual(lines.map((line) => JSON.parse(line)), [
+     { status: "idle", networkRequests: 0 },
+   ]);
+ });
+ 
+ test("worker CLI runs OAuth-state retention with its scoped database client", async () => {
+   const calls: string[] = [];
+ 
+   await runWorkerCli(
++    baseEnv,
++    () => undefined,
+     {
+-      APP_URL: "http://localhost:3000",
+-      DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
+-      SUPABASE_URL: "http://supabase:54321",
+-      SUPABASE_ANON_KEY: "local-anon-key",
+-      SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
+-      AMO_CLIENT_ID: "synthetic-client-id",
+-      AMO_CLIENT_SECRET: "synthetic-client-secret",
+-      AMO_REDIRECT_URI:
+-        "https://dashboard.example.invalid/api/integrations/amo/callback",
+-      TOKEN_ENCRYPTION_KEY:
+-        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
+-      SYNC_ENABLED: "false",
+-      SHEET_PUBLISH_ENABLED: "false",
++      now: () => new Date("2026-09-14T23:30:00.000Z"),
++      async sleep() {
++        return undefined;
++      },
++      createWorkerDbClient() {
++        calls.push("create-worker");
++        return { name: "worker" };
++      },
++      createRetentionDbClient() {
++        calls.push("create-retention");
++        return { name: "retention" };
++      },
++      async purgeExpiredOAuthStates(db) {
++        calls.push(`purge-${db.name}`);
++        return 1;
++      },
++      async failStaleSyncRuns(db) {
++        calls.push(`watchdog-${db.name}`);
++        return [];
++      },
++      async deleteProvenRawBefore(db) {
++        calls.push(`retention-delete-${db.name}`);
++        return {
++          objectsDeleted: 0,
++          eventsDeleted: 0,
++          quarantineDeleted: 0,
++          hashesPreserved: 0,
++          normalizedRowsVerified: 0,
++        };
++      },
++      async runRawRetention(repository) {
++        calls.push("retention-job");
++        await repository.deleteProvenBefore(new Date("2026-06-16T23:30:00.000Z"));
++      },
++      async runSync() {
++        return undefined;
++      },
++      async processSyncQueue() {
++        return 0;
++      },
++      async closeDbClient(db) {
++        calls.push(`close-${db.name}`);
++      },
+     },
+-    () => undefined,
++    { maxIterations: 1 },
++  );
++
++  assert.deepEqual(calls, [
++    "create-worker",
++    "create-retention",
++    "purge-worker",
++    "watchdog-worker",
++    "retention-job",
++    "retention-delete-retention",
++    "close-retention",
++    "close-worker",
++  ]);
++});
++
++test("worker runtime rejects postgres, admin, or shared worker credentials", () => {
++  assert.throws(
++    () => parseWorkerRuntimeEnv({ ...baseEnv, WORKER_DATABASE_URL: baseEnv.DATABASE_URL }),
++    /WORKER_DATABASE_URL/,
++  );
++  assert.throws(
++    () => parseWorkerRuntimeEnv({
++      ...baseEnv,
++      RETENTION_DATABASE_URL: baseEnv.WORKER_DATABASE_URL,
++    }),
++    /RETENTION_DATABASE_URL/,
++  );
++  assert.throws(
++    () => parseWorkerRuntimeEnv({
++      ...baseEnv,
++      RETENTION_DATABASE_URL:
++        "postgresql://postgres:postgres@db:5432/postgres",
++    }),
++    /RETENTION_DATABASE_URL/,
++  );
++});
++
++test("worker iteration runs watchdog and retention even when sync is disabled", async () => {
++  const calls: string[] = [];
++  const workerDb = { name: "worker" };
++  const retentionDb = { name: "retention" };
++  const state = { lastDispatchAt: null as Date | null };
++
++  await runWorkerIteration(
++    parseWorkerRuntimeEnv(baseEnv),
++    state,
+     {
++      now: () => new Date("2026-09-14T23:30:00.000Z"),
++      createWorkerDbClient(url) {
++        calls.push(`worker:${new URL(url).username}`);
++        return workerDb;
++      },
++      createRetentionDbClient(url) {
++        calls.push(`retention:${new URL(url).username}`);
++        return retentionDb;
++      },
++      async purgeExpiredOAuthStates(db) {
++        calls.push(`purge:${db.name}`);
++        return 0;
++      },
++      async failStaleSyncRuns(db) {
++        calls.push(`watchdog:${db.name}`);
++        return [];
++      },
++      async runRawRetention(repository) {
++        calls.push("retention-job");
++        await repository.deleteProvenBefore(new Date("2026-06-16T23:30:00.000Z"));
++      },
++      async deleteProvenRawBefore(db) {
++        calls.push(`retention-delete:${db.name}`);
++        return {
++          objectsDeleted: 0,
++          eventsDeleted: 0,
++          quarantineDeleted: 0,
++          hashesPreserved: 0,
++          normalizedRowsVerified: 0,
++        };
++      },
++      async runSync(kind) {
++        calls.push(`sync:${kind}`);
++      },
++      async processSyncQueue() {
++        calls.push("queue");
++        return 0;
++      },
++      async closeDbClient(db) {
++        calls.push(`close:${db.name}`);
++      },
++    },
++  );
++
++  assert.deepEqual(calls, [
++    "worker:service_worker",
++    "retention:retention_worker",
++    "purge:worker",
++    "watchdog:worker",
++    "retention-job",
++    "retention-delete:retention",
++    "close:retention",
++    "close:worker",
++  ]);
++  assert.equal(state.lastDispatchAt, null);
++});
++
++test("worker iteration dispatches five-minute sync, nightly Moscow sync, and queue work when enabled", async () => {
++  const calls: string[] = [];
++  const db = { name: "db" };
++  const state = { lastDispatchAt: null as Date | null };
++  const enabledEnv = parseWorkerRuntimeEnv({ ...baseEnv, SYNC_ENABLED: "true" });
++
++  await runWorkerIteration(
++    enabledEnv,
++    state,
++    {
++      now: () => new Date("2026-09-14T23:30:00.000Z"),
+       createWorkerDbClient() {
+-        calls.push("create");
+-        return {};
++        return db;
++      },
++      createRetentionDbClient() {
++        return db;
+       },
+       async purgeExpiredOAuthStates() {
+-        calls.push("purge");
++        return 0;
++      },
++      async failStaleSyncRuns() {
++        calls.push("watchdog");
++        return [];
++      },
++      async runRawRetention() {
++        calls.push("retention");
++      },
++      async deleteProvenRawBefore() {
++        throw new Error("runRawRetention was stubbed");
++      },
++      async runSync(kind) {
++        calls.push(`sync:${kind}`);
++      },
++      async processSyncQueue() {
++        calls.push("queue");
+         return 1;
+       },
+       async closeDbClient() {
+-        calls.push("close");
++        return undefined;
+       },
+     },
+   );
+ 
+-  assert.deepEqual(calls, ["create", "purge", "close"]);
++  assert.deepEqual(calls, [
++    "watchdog",
++    "retention",
++    "sync:incremental",
++    "sync:nightly_reconciliation",
++    "queue",
++  ]);
++  assert.deepEqual(state.lastDispatchAt, new Date("2026-09-14T23:30:00.000Z"));
+ });
+diff --git a/apps/worker/src/main.ts b/apps/worker/src/main.ts
+index 04785d9..cbe2b62 100644
+--- a/apps/worker/src/main.ts
++++ b/apps/worker/src/main.ts
+@@ -1,80 +1,262 @@
+ import {
+   closeDbClient,
++  createRetentionWorkerDbClient,
+   createServiceWorkerDbClient,
++  deleteProvenRawBefore,
+   failStaleSyncRuns,
+   purgeExpiredOAuthStates,
+   type Database,
++  type SyncKind,
+ } from "@real2/db";
+ import { parseServerEnv, type ServerEnv } from "@real2/domain";
+ import { pathToFileURL } from "node:url";
+ 
+ export type WorkerIdleResult = Readonly<{
+   status: "idle" | "ready";
+   networkRequests: 0;
+ }>;
+ 
+ export type WorkerNetworkSwitches = Readonly<
+   Pick<ServerEnv, "SYNC_ENABLED" | "SHEET_PUBLISH_ENABLED">
+ >;
+ 
++export type WorkerRuntimeEnv = ServerEnv &
++  Readonly<{
++    WORKER_DATABASE_URL: string;
++    RETENTION_DATABASE_URL: string;
++  }>;
++
++export type WorkerIterationState = {
++  lastDispatchAt: Date | null;
++};
++
+ const disabledNetworkSwitches: WorkerNetworkSwitches = {
+   SYNC_ENABLED: false,
+   SHEET_PUBLISH_ENABLED: false,
+ };
+ 
++const FIVE_MINUTES_MS = 5 * 60_000;
++const MOSCOW_OFFSET_MS = 3 * 60 * 60_000;
++const RAW_RETENTION_MS = 90 * 24 * 60 * 60_000;
++
++function fiveMinuteSlot(value: Date): number {
++  return Math.floor(value.getTime() / FIVE_MINUTES_MS);
++}
++
++function moscowParts(value: Date): { date: string; hour: number; minute: number } {
++  const shifted = new Date(value.getTime() + MOSCOW_OFFSET_MS);
++  return {
++    date: shifted.toISOString().slice(0, 10),
++    hour: shifted.getUTCHours(),
++    minute: shifted.getUTCMinutes(),
++  };
++}
++
++function dueWorkerSyncKinds(
++  now: Date,
++  lastDispatchAt: Date | null,
++): readonly Extract<SyncKind, "incremental" | "nightly_reconciliation">[] {
++  const due: Extract<SyncKind, "incremental" | "nightly_reconciliation">[] = [];
++  if (
++    now.getUTCMinutes() % 5 === 0 &&
++    (!lastDispatchAt || fiveMinuteSlot(lastDispatchAt) < fiveMinuteSlot(now))
++  ) {
++    due.push("incremental");
++  }
++
++  const moscowNow = moscowParts(now);
++  const moscowPrevious = lastDispatchAt ? moscowParts(lastDispatchAt) : null;
++  if (
++    moscowNow.hour === 2 &&
++    moscowNow.minute === 30 &&
++    (!moscowPrevious ||
++      moscowPrevious.date !== moscowNow.date ||
++      moscowPrevious.hour < 2 ||
++      (moscowPrevious.hour === 2 && moscowPrevious.minute < 30))
++  ) {
++    due.push("nightly_reconciliation");
++  }
++  return due;
++}
++
++function requiredRestrictedUrl(
++  input: Record<string, string | undefined>,
++  key: "WORKER_DATABASE_URL" | "RETENTION_DATABASE_URL",
++  expectedUsername: "service_worker" | "retention_worker",
++): string {
++  const value = input[key];
++  if (!value) throw new Error(`${key} is required`);
++  let parsed: URL;
++  try {
++    parsed = new URL(value);
++  } catch {
++    throw new Error(`${key} must be a PostgreSQL URL`);
++  }
++  if (parsed.username !== expectedUsername) {
++    throw new Error(`${key} must authenticate as ${expectedUsername}`);
++  }
++  return value;
++}
++
++export function parseWorkerRuntimeEnv(
++  input: Record<string, string | undefined>,
++): WorkerRuntimeEnv {
++  const server = parseServerEnv(input);
++  const workerUrl = requiredRestrictedUrl(
++    input,
++    "WORKER_DATABASE_URL",
++    "service_worker",
++  );
++  const retentionUrl = requiredRestrictedUrl(
++    input,
++    "RETENTION_DATABASE_URL",
++    "retention_worker",
++  );
++  if (new URL(workerUrl).username === new URL(retentionUrl).username || workerUrl === retentionUrl) {
++    throw new Error("RETENTION_DATABASE_URL must be distinct from WORKER_DATABASE_URL");
++  }
++  return {
++    ...server,
++    WORKER_DATABASE_URL: workerUrl,
++    RETENTION_DATABASE_URL: retentionUrl,
++  };
++}
++
+ export type WorkerCliDependencies = Readonly<{
++  now(): Date;
++  sleep(milliseconds: number): Promise<void>;
+   createWorkerDbClient(databaseUrl: string): Database;
++  createRetentionDbClient(databaseUrl: string): Database;
+   purgeExpiredOAuthStates(db: Database): Promise<number>;
++  failStaleSyncRuns(db: Database, cutoff: Date, finishedAt: Date): Promise<readonly string[]>;
++  deleteProvenRawBefore(db: Database, cutoff: Date): Promise<{
++    objectsDeleted: number;
++    eventsDeleted: number;
++    quarantineDeleted: number;
++    hashesPreserved: number;
++    normalizedRowsVerified: number;
++  }>;
++  runRawRetention(
++    repository: Readonly<{ deleteProvenBefore(cutoff: Date): Promise<{
++      objectsDeleted: number;
++      eventsDeleted: number;
++      quarantineDeleted: number;
++      hashesPreserved: number;
++      normalizedRowsVerified: number;
++    }> }>,
++    now: Date,
++  ): Promise<unknown>;
++  runSync(kind: SyncKind): Promise<void>;
++  processSyncQueue(db: Database): Promise<number>;
+   closeDbClient(db: Database): Promise<void>;
+ }>;
+ 
+ const workerCliDependencies: WorkerCliDependencies = {
++  now: () => new Date(),
++  sleep: (milliseconds) =>
++    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+   createWorkerDbClient: createServiceWorkerDbClient,
++  createRetentionDbClient: createRetentionWorkerDbClient,
+   purgeExpiredOAuthStates,
++  failStaleSyncRuns,
++  deleteProvenRawBefore,
++  async runRawRetention(repository, now) {
++    const cutoff = new Date(now.getTime() - RAW_RETENTION_MS);
++    const result = await repository.deleteProvenBefore(cutoff);
++    const deleted =
++      result.objectsDeleted + result.eventsDeleted + result.quarantineDeleted;
++    if (
++      deleted !== result.hashesPreserved ||
++      deleted !== result.normalizedRowsVerified
++    ) {
++      throw new Error("raw retention proof counts do not match");
++    }
++    return { ...result, deleted };
++  },
++  runSync: async (kind) => {
++    const { runSync } = await import("@real2/worker/amo-sync");
++    await runSync(kind);
++  },
++  processSyncQueue: async (db) => {
++    const { processSyncWorkQueue, runSync } = await import("@real2/worker/amo-sync");
++    const { claimNextSyncWork, completeSyncWork } = await import("@real2/db");
++    return processSyncWorkQueue({
++      now: () => new Date(),
++      claim: (input) => claimNextSyncWork(db, input),
++      complete: (input) => completeSyncWork(db, input),
++      run: runSync,
++    });
++  },
+   closeDbClient,
+ };
+ 
+ export async function runWorkerOnce(
+   switches: WorkerNetworkSwitches = disabledNetworkSwitches,
+ ): Promise<WorkerIdleResult> {
+   return { status: switches.SYNC_ENABLED ? "ready" : "idle", networkRequests: 0 };
+ }
+ 
++export async function runWorkerIteration(
++  env: WorkerRuntimeEnv,
++  state: WorkerIterationState,
++  dependencies: Partial<WorkerCliDependencies> = {},
++): Promise<WorkerIdleResult> {
++  const deps = { ...workerCliDependencies, ...dependencies };
++  const now = deps.now();
++  const workerDb = deps.createWorkerDbClient(env.WORKER_DATABASE_URL);
++  const retentionDb = deps.createRetentionDbClient(env.RETENTION_DATABASE_URL);
++
++  try {
++    await deps.purgeExpiredOAuthStates(workerDb);
++    await deps.failStaleSyncRuns(
++      workerDb,
++      new Date(now.getTime() - 20 * 60_000),
++      now,
++    );
++    await deps.runRawRetention({
++      deleteProvenBefore: (cutoff) =>
++        deps.deleteProvenRawBefore(retentionDb, cutoff),
++    }, now);
++
++    if (env.SYNC_ENABLED) {
++      const dispatched = dueWorkerSyncKinds(now, state.lastDispatchAt);
++      for (const kind of dispatched) await deps.runSync(kind);
++      if (dispatched.length > 0) state.lastDispatchAt = now;
++      await deps.processSyncQueue(workerDb);
++    }
++
++    return runWorkerOnce(env);
++  } finally {
++    await deps.closeDbClient(retentionDb);
++    await deps.closeDbClient(workerDb);
++  }
++}
++
+ export async function runWorkerCli(
+   input: Record<string, string | undefined>,
+   write: (line: string) => void = (line) => process.stdout.write(`${line}\n`),
+-  dependencies: WorkerCliDependencies = workerCliDependencies,
++  dependencies: Partial<WorkerCliDependencies> = {},
++  options: Readonly<{ maxIterations?: number; pollIntervalMs?: number }> = {},
+ ): Promise<void> {
+-  const env = parseServerEnv(input);
+-  const db = dependencies.createWorkerDbClient(env.DATABASE_URL);
++  const env = parseWorkerRuntimeEnv(input);
++  const state: WorkerIterationState = { lastDispatchAt: null };
++  const maxIterations = options.maxIterations ?? Number.POSITIVE_INFINITY;
++  const pollIntervalMs = options.pollIntervalMs ?? 30_000;
++  const deps = { ...workerCliDependencies, ...dependencies };
+ 
+-  try {
+-    await dependencies.purgeExpiredOAuthStates(db);
+-    // The one-shot entrypoint is cron-friendly. Scheduled sync calls retain
+-    // the double switch inside runSync; watchdog is DB-only and safe while
+-    // sync is disabled.
+-    if (env.SYNC_ENABLED) {
+-      await failStaleSyncRuns(db, new Date(Date.now() - 20 * 60_000), new Date());
+-      const now = new Date();
+-      if (now.getUTCMinutes() % 5 === 0) {
+-        // Resolve only in an enabled production worker. Node's repository-test
+-        // runner executes TypeScript source directly, while deployed workers
+-        // use the package's compiled guarded entrypoint.
+-        const { runSync } = await import("@real2/worker/amo-sync");
+-        await runSync("incremental");
+-      }
+-    }
+-    const result = await runWorkerOnce(env);
++  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
++    const result = await runWorkerIteration(env, state, deps);
+     write(JSON.stringify(result));
+-  } finally {
+-    await dependencies.closeDbClient(db);
++    if (iteration + 1 < maxIterations) {
++      await deps.sleep(pollIntervalMs);
++    }
+   }
+ }
+ 
+ if (
+   process.argv[1] &&
+   import.meta.url === pathToFileURL(process.argv[1]).href
+ ) {
+   runWorkerCli(process.env).catch(() => {
+     process.stderr.write("Worker failed safely\n");
+     process.exitCode = 1;
+diff --git a/docker-compose.yml b/docker-compose.yml
+index ca9ba08..e1f47ef 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,15 +1,17 @@
+ name: real2-sales-dashboard
+ 
+ x-runtime-environment: &runtime-environment
+   APP_URL: "${APP_URL:-http://localhost:3000}"
+   DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:54322/postgres"
++  WORKER_DATABASE_URL: "postgresql://service_worker:service-worker-test@host.docker.internal:54322/postgres"
++  RETENTION_DATABASE_URL: "postgresql://retention_worker:retention-worker-test@host.docker.internal:54322/postgres"
+   SUPABASE_URL: "http://host.docker.internal:54321"
+   SUPABASE_ANON_KEY: "${REAL2_SUPABASE_ANON_KEY:-local-anon-key}"
+   SUPABASE_SERVICE_ROLE_KEY: "${REAL2_SUPABASE_SERVICE_ROLE_KEY:-local-service-role-key}"
+   AMO_CLIENT_ID: "synthetic-client-id"
+   AMO_CLIENT_SECRET: "synthetic-client-secret-change-before-use"
+   AMO_REDIRECT_URI: "https://dashboard.example.invalid/api/integrations/amo/callback"
+   TOKEN_ENCRYPTION_KEY: "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE="
+   SYNC_ENABLED: "false"
+   SHEET_PUBLISH_ENABLED: "false"
+ 
+diff --git a/packages/db/src/client.ts b/packages/db/src/client.ts
+index 465608f..7beb3c2 100644
+--- a/packages/db/src/client.ts
++++ b/packages/db/src/client.ts
+@@ -1,41 +1,72 @@
+ import postgres, { type Options, type Sql } from "postgres";
+ 
++import { AppError } from "@real2/domain";
++
+ export type Database = Sql;
+ 
++function restrictedLogin(
++  databaseUrl: string,
++  expectedUsername: "service_worker" | "retention_worker",
++  label: string,
++): void {
++  let username: string;
++  try {
++    username = new URL(databaseUrl).username;
++  } catch {
++    throw new AppError("E_CONFIG_INCOMPLETE", 500, `${label} is not a valid PostgreSQL URL`);
++  }
++  if (username !== expectedUsername) {
++    throw new AppError(
++      "E_CONFIG_INCOMPLETE",
++      500,
++      `${label} must authenticate as ${expectedUsername}`,
++    );
++  }
++}
++
++function rejectSetRole(
++  options: Options<Record<string, never>>,
++  label: string,
++): void {
++  const role = (options.connection as { role?: unknown } | undefined)?.role;
++  if (role !== undefined) {
++    throw new AppError(
++      "E_CONFIG_INCOMPLETE",
++      500,
++      `${label} must not use SET ROLE escalation`,
++    );
++  }
++}
++
+ export function createDbClient(
+   databaseUrl: string,
+   options: Options<Record<string, never>> = {},
+ ): Database {
+   return postgres(databaseUrl, {
+     idle_timeout: 20,
+     max: 10,
+     ...options,
+   });
+ }
+ 
+ export function createServiceWorkerDbClient(
+   databaseUrl: string,
+   options: Options<Record<string, never>> = {},
+ ): Database {
+-  return createDbClient(databaseUrl, {
+-    ...options,
+-    connection: {
+-      ...options.connection,
+-      role: "service_worker",
+-    },
+-  });
++  restrictedLogin(databaseUrl, "service_worker", "WORKER_DATABASE_URL");
++  rejectSetRole(options, "WORKER_DATABASE_URL");
++  return createDbClient(databaseUrl, options);
+ }
+ 
+ export function createRetentionWorkerDbClient(
+   databaseUrl: string,
+   options: Options<Record<string, never>> = {},
+ ): Database {
+-  // The retention URL must authenticate as the dedicated login. Do not SET
+-  // ROLE from the ordinary worker connection: membership would let it bypass
+-  // the raw-evidence deletion boundary.
++  restrictedLogin(databaseUrl, "retention_worker", "RETENTION_DATABASE_URL");
++  rejectSetRole(options, "RETENTION_DATABASE_URL");
+   return createDbClient(databaseUrl, options);
+ }
+ 
+ export async function closeDbClient(db: Database): Promise<void> {
+   await db.end({ timeout: 5 });
+ }
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index eb7002c..ad4c775 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -61,26 +61,32 @@ export {
+   type AmoApiAuditInput,
+   type AppendRawPageInput,
+   type QuarantineRawPageInput,
+   type RawAmoEventInput,
+   type RawAmoObjectInput,
+   type RawChannelValue,
+   type RawEntityType,
+ } from "./raw-amo.js";
+ export {
+   deleteProvenRawBefore,
++  claimNextSyncWork,
++  completeSyncWork,
+   enqueueSyncWork,
+   failStaleSyncRuns,
+   getLatestSyncRun,
+   getPreviousFullLeadCount,
+   getSyncCursors,
+   getSyncRunDetail,
++  isSyncAdvisoryLockBusy,
+   listSyncRuns,
+   recordRawRetentionProofs,
+   withSyncAdvisoryLock,
++  type ClaimedSyncWork,
++  type CompleteSyncWorkInput,
+   type RawRetentionProofInput,
+   type RawRetentionResult,
+   type RawRetentionSourceTable,
+   type QueuedSyncWork,
+   type SafeSyncRunDetail,
+   type SafeSyncRunSummary,
++  type SyncLockFence,
+ } from "./sync-operations.js";
+diff --git a/packages/db/src/raw-amo.integration.test.ts b/packages/db/src/raw-amo.integration.test.ts
+index b4a3a84..60be151 100644
+--- a/packages/db/src/raw-amo.integration.test.ts
++++ b/packages/db/src/raw-amo.integration.test.ts
+@@ -1,33 +1,34 @@
+-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+ 
+ import {
+   closeDbClient,
+   createServiceWorkerDbClient,
+   type Database,
+ } from "./client";
+ import {
+   appendAmoApiAudit,
+   appendRawPage,
+   getRawChannelValues,
+   quarantineRawPage,
+ } from "./raw-amo";
+ import { finishSyncRun, startSyncRun } from "./sync-runs";
+ import {
+   createAdminDb,
+-  localDatabaseUrl,
++  ensureRestrictedTestLogins,
++  localServiceWorkerDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+ } from "../../../tests/helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+-const workerDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
++let workerDb: Database;
+ const receivedAt = new Date("2026-09-15T09:00:00.000Z");
+ const finishedAt = new Date("2026-09-15T09:01:00.000Z");
+ const hashA = "a".repeat(64);
+ const hashB = "b".repeat(64);
+ 
+ type Fixture = Readonly<{ connectionId: string; configId: string }>;
+ 
+ async function seedFixture(): Promise<Fixture> {
+   await resetAndSeedUsers(adminDb, [testUsers.admin, testUsers.head]);
+   const [connection] = await adminDb<{ id: string }[]>`
+@@ -102,20 +103,25 @@ async function startFixtureRun(
+ }
+ 
+ async function clearFixture(): Promise<void> {
+   await adminDb.unsafe(
+     "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
++beforeAll(async () => {
++  await ensureRestrictedTestLogins(adminDb);
++  workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
++});
++
+ beforeEach(async () => {
+   await clearFixture();
+ });
+ 
+ afterEach(async () => {
+   await clearFixture();
+ });
+ 
+ afterAll(async () => {
+   await closeDbClient(workerDb);
+@@ -542,21 +548,21 @@ describe("append-only raw amoCRM journal", () => {
+         durationMs: 1,
+         attempt: 1,
+         result: "success",
+       }),
+     ).rejects.toMatchObject({ code: "23514" });
+   });
+ 
+   it.each(["append", "finish"] as const)("serializes concurrent append/finalize when %s acquires the run lock first", async (firstOperation) => {
+     const fixture = await seedFixture();
+     const run = await startFixtureRun(workerDb, fixture, "trace-concurrent-seal");
+-    const concurrentDb = createServiceWorkerDbClient(localDatabaseUrl, { max: 1 });
++    const concurrentDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
+     const [connection] = await concurrentDb<{ pid: number }[]>`select pg_backend_pid() as pid`;
+     if (!connection) throw new Error("synthetic concurrent connection is missing");
+     const { pid } = connection;
+     let release!: () => void;
+     let ready!: () => void;
+     const held = new Promise<void>((resolve) => { release = resolve; });
+     const locked = new Promise<void>((resolve) => { ready = resolve; });
+     const finish = (db: Database) => finishSyncRun(db, run.id, {
+       status: "success",
+       counts: { pagesRead: 0, leadsRead: 0, eventsRead: 0, usersRead: 0, retries: 0 },
+diff --git a/packages/db/src/sync-operations.integration.test.ts b/packages/db/src/sync-operations.integration.test.ts
+index 69ae3bd..6467a44 100644
+--- a/packages/db/src/sync-operations.integration.test.ts
++++ b/packages/db/src/sync-operations.integration.test.ts
+@@ -1,37 +1,44 @@
+-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+ 
+ import {
+   closeDbClient,
+   createRetentionWorkerDbClient,
+   createServiceWorkerDbClient,
++  type Database,
+ } from "./client";
+ import { appendRawPage, quarantineRawPage } from "./raw-amo";
+ import {
++  claimNextSyncWork,
++  completeSyncWork,
+   deleteProvenRawBefore,
++  enqueueSyncWork,
+   failStaleSyncRuns,
+   getPreviousFullLeadCount,
+   getSyncCursors,
++  isSyncAdvisoryLockBusy,
+   withSyncAdvisoryLock,
+ } from "./sync-operations";
+ import { finishSyncRun, startSyncRun } from "./sync-runs";
+ import {
+   createAdminDb,
+-  localDatabaseUrl,
++  ensureRestrictedTestLogins,
++  localRetentionWorkerDatabaseUrl,
++  localServiceWorkerDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+ } from "../../../tests/helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+-const workerOne = createServiceWorkerDbClient(localDatabaseUrl, { max: 2 });
+-const workerTwo = createServiceWorkerDbClient(localDatabaseUrl, { max: 2 });
+-const retentionDb = createRetentionWorkerDbClient(localDatabaseUrl, { max: 1 });
++let workerOne: Database;
++let workerTwo: Database;
++let retentionDb: Database;
+ const oldAt = new Date("2026-01-01T00:00:00.000Z");
+ const now = new Date("2026-09-15T09:00:00.000Z");
+ 
+ type Fixture = Readonly<{ connectionId: string; configId: string }>;
+ 
+ async function seedFixture(): Promise<Fixture> {
+   await resetAndSeedUsers(adminDb, [testUsers.admin]);
+   const [connection] = await adminDb<{ id: string }[]>`
+     insert into public.amo_connections (
+       account_id, subdomain, base_url, access_token_ciphertext,
+@@ -57,20 +64,27 @@ async function seedFixture(): Promise<Fixture> {
+ }
+ 
+ async function clearFixtures(): Promise<void> {
+   await adminDb.unsafe(
+     "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
++beforeAll(async () => {
++  await ensureRestrictedTestLogins(adminDb);
++  workerOne = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 2 });
++  workerTwo = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 2 });
++  retentionDb = createRetentionWorkerDbClient(localRetentionWorkerDatabaseUrl, { max: 1 });
++});
++
+ beforeEach(clearFixtures);
+ afterEach(clearFixtures);
+ afterAll(async () => {
+   await Promise.all([
+     closeDbClient(retentionDb),
+     closeDbClient(workerTwo),
+     closeDbClient(workerOne),
+     closeDbClient(adminDb),
+   ]);
+ });
+@@ -96,20 +110,166 @@ describe("sync operational boundaries", () => {
+     await expect(
+       withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "second"),
+     ).rejects.toMatchObject({ code: "E_SYNC_LOCKED" });
+     release();
+     await expect(first).resolves.toBe("first");
+     await expect(
+       withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after"),
+     ).resolves.toBe("after");
+   });
+ 
++  it("preflights the same advisory lock without taking ownership away from the runner", async () => {
++    const fixture = await seedFixture();
++    let release!: () => void;
++    const held = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    let entered!: () => void;
++    const acquired = new Promise<void>((resolve) => {
++      entered = resolve;
++    });
++    const first = withSyncAdvisoryLock(workerOne, fixture.connectionId, async () => {
++      entered();
++      await held;
++    });
++    await acquired;
++
++    await expect(isSyncAdvisoryLockBusy(workerTwo, fixture.connectionId)).resolves.toBe(true);
++    release();
++    await first;
++    await expect(isSyncAdvisoryLockBusy(workerTwo, fixture.connectionId)).resolves.toBe(false);
++  });
++
++  it("releases the advisory lock after nested failures", async () => {
++    const fixture = await seedFixture();
++
++    await expect(
++      withSyncAdvisoryLock(workerOne, fixture.connectionId, async () => {
++        throw Object.assign(new Error("nested failure"), { code: "E_INTERNAL" });
++      }),
++    ).rejects.toMatchObject({ code: "E_INTERNAL" });
++    await expect(
++      withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after-throw"),
++    ).resolves.toBe("after-throw");
++  });
++
++  it("fences an actually terminated advisory-lock session before work continues", async () => {
++    const fixture = await seedFixture();
++    const victimDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
++    let allowFenceCheck!: () => void;
++    const terminated = new Promise<void>((resolve) => {
++      allowFenceCheck = resolve;
++    });
++    let publishBackendPid!: (pid: number) => void;
++    const backendPid = new Promise<number>((resolve) => {
++      publishBackendPid = resolve;
++    });
++
++    try {
++      const runner = withSyncAdvisoryLock(victimDb, fixture.connectionId, async (fence) => {
++        publishBackendPid(fence.backendPid);
++        await terminated;
++        await expect(fence.assertOwned()).rejects.toMatchObject({ code: "E_SYNC_FENCE_LOST" });
++        return "fenced";
++      });
++
++      const pid = await backendPid;
++      const [row] = await adminDb<{ terminated: boolean }[]>`
++        select pg_terminate_backend(${pid}) as terminated
++      `;
++      expect(row?.terminated).toBe(true);
++      allowFenceCheck();
++
++      await expect(runner).resolves.toBe("fenced");
++      await expect(isSyncAdvisoryLockBusy(workerTwo, fixture.connectionId)).resolves.toBe(false);
++      await expect(
++        withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after-terminate"),
++      ).resolves.toBe("after-terminate");
++    } finally {
++      await closeDbClient(victimDb);
++    }
++  }, 15_000);
++
++  it("claims queued sync work once with skip locked and recovers an expired lease", async () => {
++    await seedFixture();
++    const queued = await enqueueSyncWork(adminDb, {
++      traceId: "manual-trace-1",
++      kind: "manual",
++      requestedBy: testUsers.admin.id,
++    });
++    await enqueueSyncWork(adminDb, {
++      traceId: "manual-trace-2",
++      kind: "manual",
++      requestedBy: testUsers.admin.id,
++    });
++    const claimedAt = new Date("2026-09-15T09:00:00.000Z");
++    const [first, second] = await Promise.all([
++      claimNextSyncWork(workerOne, { now: claimedAt, leaseMs: 60_000 }),
++      claimNextSyncWork(workerTwo, { now: claimedAt, leaseMs: 60_000 }),
++    ]);
++
++    expect([first?.traceId, second?.traceId].sort()).toEqual([
++      "manual-trace-1",
++      "manual-trace-2",
++    ]);
++
++    const stillLeased = await claimNextSyncWork(workerTwo, {
++      now: new Date("2026-09-15T09:00:30.000Z"),
++      leaseMs: 60_000,
++    });
++    expect(stillLeased).toBeNull();
++
++    const recovered = await claimNextSyncWork(workerTwo, {
++      now: new Date("2026-09-15T09:01:01.000Z"),
++      leaseMs: 60_000,
++    });
++    expect(recovered).toMatchObject({
++      id: queued.id,
++      traceId: "manual-trace-1",
++      requestedBy: testUsers.admin.id,
++      attempt: 2,
++    });
++    expect(recovered?.leaseToken).not.toBe(first?.leaseToken);
++
++    await expect(
++      completeSyncWork(workerOne, {
++        id: queued.id,
++        leaseToken: first?.leaseToken ?? "00000000-0000-4000-8000-000000000000",
++        status: "done",
++        completedAt: new Date("2026-09-15T09:01:02.000Z"),
++        syncRunId: "30000000-0000-4000-8000-000000000001",
++      }),
++    ).rejects.toMatchObject({ code: "E_CONFLICT" });
++
++    await completeSyncWork(workerTwo, {
++      id: queued.id,
++      leaseToken: recovered?.leaseToken ?? "00000000-0000-4000-8000-000000000000",
++      status: "done",
++      completedAt: new Date("2026-09-15T09:01:03.000Z"),
++      syncRunId: "30000000-0000-4000-8000-000000000002",
++    });
++    for (const claim of [first, second]) {
++      if (!claim || claim.id === queued.id) continue;
++      await completeSyncWork(workerOne, {
++        id: claim.id,
++        leaseToken: claim.leaseToken,
++        status: "done",
++        completedAt: new Date("2026-09-15T09:01:04.000Z"),
++        syncRunId: "30000000-0000-4000-8000-000000000003",
++      });
++    }
++    await expect(claimNextSyncWork(workerOne, {
++      now: new Date("2026-09-15T09:02:04.000Z"),
++      leaseMs: 60_000,
++    })).resolves.toBeNull();
++  });
++
+   it("returns cursors and the previous successful full lead count", async () => {
+     const fixture = await seedFixture();
+     const run = await startSyncRun(workerOne, {
+       traceId: "full-count",
+       connectionId: fixture.connectionId,
+       configId: fixture.configId,
+       kind: "nightly_reconciliation",
+       startedAt: oldAt,
+     });
+     await finishSyncRun(workerOne, run.id, {
+diff --git a/packages/db/src/sync-operations.ts b/packages/db/src/sync-operations.ts
+index 65f0cad..4dd366c 100644
+--- a/packages/db/src/sync-operations.ts
++++ b/packages/db/src/sync-operations.ts
+@@ -1,11 +1,13 @@
+-import { AppError } from "@real2/domain";
++import { randomUUID } from "node:crypto";
++
++import { AppError, type AppErrorCode } from "@real2/domain";
+ 
+ import type { Database } from "./client.js";
+ import type {
+   SyncCursorPosition,
+   SyncKind,
+   SyncStatus,
+   SyncStream,
+ } from "./sync-runs.js";
+ 
+ export type SafeSyncRunSummary = Readonly<{
+@@ -17,20 +19,21 @@ export type SafeSyncRunSummary = Readonly<{
+   finishedAt: Date | null;
+   counts: Readonly<{
+     pages: number;
+     leads: number;
+     events: number;
+     users: number;
+     retries: number;
+   }>;
+   errorCode: string | null;
+   errorSummary: string | null;
++  createdBy: string | null;
+ }>;
+ 
+ export type SafeSyncRunDetail = SafeSyncRunSummary & Readonly<{
+   pages: readonly Readonly<{
+     stream: SyncStream;
+     pageNumber: number;
+     itemCount: number;
+     receivedAt: Date;
+   }>[];
+   audit: readonly Readonly<{
+@@ -51,39 +54,41 @@ type SafeSyncRunRow = {
+   status: SyncStatus;
+   started_at: Date;
+   finished_at: Date | null;
+   pages_read: number;
+   leads_read: number;
+   events_read: number;
+   users_read: number;
+   retries: number;
+   error_code: string | null;
+   error_summary: string | null;
++  created_by: string | null;
+ };
+ 
+ function mapSafeRun(row: SafeSyncRunRow): SafeSyncRunSummary {
+   return {
+     id: row.id,
+     traceId: row.trace_id,
+     kind: row.kind,
+     status: row.status,
+     startedAt: row.started_at,
+     finishedAt: row.finished_at,
+     counts: {
+       pages: row.pages_read,
+       leads: row.leads_read,
+       events: row.events_read,
+       users: row.users_read,
+       retries: row.retries,
+     },
+     errorCode: row.error_code,
+     errorSummary: row.error_summary,
++    createdBy: row.created_by,
+   };
+ }
+ 
+ export type RawRetentionSourceTable =
+   | "raw_amo_objects"
+   | "raw_amo_events"
+   | "raw_amo_quarantine";
+ 
+ export type RawRetentionProofInput = Readonly<{
+   sourceTable: RawRetentionSourceTable;
+@@ -97,53 +102,224 @@ export type RawRetentionProofInput = Readonly<{
+ export type RawRetentionResult = Readonly<{
+   objectsDeleted: number;
+   eventsDeleted: number;
+   quarantineDeleted: number;
+   hashesPreserved: number;
+   normalizedRowsVerified: number;
+ }>;
+ 
+ export type QueuedSyncWork = Readonly<{ id: string; traceId: string; kind: SyncKind }>;
+ 
++export type ClaimedSyncWork = QueuedSyncWork &
++  Readonly<{
++    requestedBy: string | null;
++    leaseToken: string;
++    attempt: number;
++  }>;
++
++export type CompleteSyncWorkInput = Readonly<{
++  id: string;
++  leaseToken: string;
++  status: "done" | "failed";
++  completedAt: Date;
++  syncRunId?: string | null;
++  errorCode?: AppErrorCode | string | null;
++  errorSummary?: string | null;
++}>;
++
++export type SyncLockFence = Readonly<{
++  backendPid: number;
++  assertOwned(): Promise<void>;
++}>;
++
+ export async function enqueueSyncWork(
+   db: Database,
+   input: Readonly<{ traceId: string; kind: SyncKind; requestedBy: string | null }>,
+ ): Promise<QueuedSyncWork> {
+   const [row] = await db<{ id: string; trace_id: string; kind: SyncKind }[]>`
+     insert into public.sync_work_queue (trace_id, kind, requested_by)
+     values (${input.traceId}, ${input.kind}, ${input.requestedBy})
+     returning id, trace_id, kind
+   `;
+   if (!row) throw new AppError("E_DB", 500);
+   return { id: row.id, traceId: row.trace_id, kind: row.kind };
+ }
+ 
++export async function claimNextSyncWork(
++  db: Database,
++  input: Readonly<{ now: Date; leaseMs: number; maxAttempts?: number }>,
++): Promise<ClaimedSyncWork | null> {
++  if (!Number.isSafeInteger(input.leaseMs) || input.leaseMs <= 0) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++  const maxAttempts = input.maxAttempts ?? 3;
++  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++  const leaseToken = randomUUID();
++  const leaseExpiresAt = new Date(input.now.getTime() + input.leaseMs);
++  return db.begin(async (transaction) => {
++    const [selected] = await transaction<{ id: string }[]>`
++      select id
++      from public.sync_work_queue
++      where status in ('queued', 'running')
++        and attempt_count < ${maxAttempts}
++        and (
++          status = 'queued'
++          or (status = 'running' and lease_expires_at <= ${input.now})
++        )
++      order by requested_at, id
++      for update skip locked
++      limit 1
++    `;
++    if (!selected) return null;
++    const [claimed] = await transaction<{
++      id: string;
++      trace_id: string;
++      kind: SyncKind;
++      requested_by: string | null;
++      lease_token: string;
++      attempt_count: number;
++    }[]>`
++      update public.sync_work_queue
++      set
++        status = 'running',
++        claimed_at = ${input.now},
++        completed_at = null,
++        lease_token = ${leaseToken},
++        lease_expires_at = ${leaseExpiresAt},
++        attempt_count = attempt_count + 1,
++        last_error_code = null,
++        last_error_summary = null
++      where id = ${selected.id}
++      returning id, trace_id, kind, requested_by, lease_token, attempt_count
++    `;
++    if (!claimed) throw new AppError("E_DB", 500);
++    return {
++      id: claimed.id,
++      traceId: claimed.trace_id,
++      kind: claimed.kind,
++      requestedBy: claimed.requested_by,
++      leaseToken: claimed.lease_token,
++      attempt: claimed.attempt_count,
++    };
++  });
++}
++
++export async function completeSyncWork(
++  db: Database,
++  input: CompleteSyncWorkInput,
++): Promise<void> {
++  if (input.errorSummary && input.errorSummary.length > 500) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++  const [row] = await db<{ id: string }[]>`
++    update public.sync_work_queue
++    set
++      status = ${input.status},
++      completed_at = ${input.completedAt},
++      sync_run_id = ${input.syncRunId ?? null},
++      last_error_code = ${input.errorCode ?? null},
++      last_error_summary = ${input.errorSummary ?? null}
++    where id = ${input.id}
++      and lease_token = ${input.leaseToken}
++      and status = 'running'
++    returning id
++  `;
++  if (!row) throw new AppError("E_CONFLICT", 409);
++}
++
+ function isSha256(value: string): boolean {
+   return /^[a-f0-9]{64}$/.test(value);
+ }
+ 
+ export async function withSyncAdvisoryLock<T>(
+   db: Database,
+   connectionId: string,
+-  action: () => Promise<T>,
++  action: (fence: SyncLockFence) => Promise<T>,
+ ): Promise<T> {
+   const reserved = await db.reserve();
+   let locked = false;
++  let backendPid: number | null = null;
++  let lockSessionLost = false;
+   try {
++    const [backend] = await reserved<{ pid: number }[]>`
++      select pg_backend_pid() as pid
++    `;
++    if (!backend) throw new AppError("E_DB", 500);
++    backendPid = backend.pid;
+     const [row] = await reserved<{ locked: boolean }[]>`
+       select pg_try_advisory_lock(
+         hashtextextended(${`${connectionId}:sync`}, 0)
+       ) as locked
+     `;
+     locked = row?.locked === true;
+     if (!locked) throw new AppError("E_SYNC_LOCKED", 409);
+-    return await action();
++    const fence: SyncLockFence = {
++      backendPid,
++      async assertOwned() {
++        let timeout: NodeJS.Timeout | undefined;
++        try {
++          const heartbeat = reserved<{ pid: number }[]>`
++            select pg_backend_pid() as pid
++          `;
++          const [current] = await Promise.race([
++            heartbeat,
++            new Promise<never>((_resolve, reject) => {
++              timeout = setTimeout(() => {
++                reject(new AppError("E_SYNC_FENCE_LOST", 409));
++              }, 1_000);
++            }),
++          ]);
++          if (!current || current.pid !== backendPid) {
++            throw new AppError("E_SYNC_FENCE_LOST", 409);
++          }
++        } catch (error) {
++          lockSessionLost = true;
++          if (error instanceof AppError) throw error;
++          throw new AppError("E_SYNC_FENCE_LOST", 409);
++        } finally {
++          if (timeout) clearTimeout(timeout);
++        }
++      },
++    };
++    return await action(fence);
++  } finally {
++    if (locked && !lockSessionLost) {
++      try {
++        await reserved`
++          select pg_advisory_unlock(
++            hashtextextended(${`${connectionId}:sync`}, 0)
++          )
++        `;
++      } catch {
++        // A terminated session has already released its advisory locks.
++      }
++    }
++    reserved.release();
++  }
++}
++
++export async function isSyncAdvisoryLockBusy(
++  db: Database,
++  connectionId: string,
++): Promise<boolean> {
++  const reserved = await db.reserve();
++  let locked = false;
++  try {
++    const [row] = await reserved<{ locked: boolean }[]>`
++      select pg_try_advisory_lock(
++        hashtextextended(${`${connectionId}:sync`}, 0)
++      ) as locked
++    `;
++    locked = row?.locked === true;
++    return !locked;
+   } finally {
+     if (locked) {
+       await reserved`
+         select pg_advisory_unlock(
+           hashtextextended(${`${connectionId}:sync`}, 0)
+         )
+       `;
+     }
+     reserved.release();
+   }
+@@ -270,21 +446,21 @@ export async function deleteProvenRawBefore(
+     eventsDeleted: row.events_deleted,
+     quarantineDeleted: row.quarantine_deleted,
+     hashesPreserved: row.hashes_preserved,
+     normalizedRowsVerified: row.normalized_rows_verified,
+   };
+ }
+ 
+ const safeRunColumns = `
+   id, trace_id, kind, status, started_at, finished_at,
+   pages_read, leads_read, events_read, users_read, retries,
+-  error_code, error_summary
++  error_code, error_summary, created_by
+ `;
+ 
+ export async function listSyncRuns(
+   db: Database,
+   input: Readonly<{ page: number; pageSize: number }>,
+ ): Promise<Readonly<{
+   items: readonly SafeSyncRunSummary[];
+   page: number;
+   pageSize: number;
+   total: number;
+diff --git a/packages/domain/src/errors.ts b/packages/domain/src/errors.ts
+index 9a59648..e37ff97 100644
+--- a/packages/domain/src/errors.ts
++++ b/packages/domain/src/errors.ts
+@@ -5,20 +5,21 @@ export type AppErrorCode =
+   | "E_VALIDATION"
+   | "E_NOT_FOUND"
+   | "E_CONFLICT"
+   | "E_CONFIG_INCOMPLETE"
+   | "E_AMO_AUTH"
+   | "E_AMO_RATE_LIMIT"
+   | "E_AMO_UPSTREAM"
+   | "E_AMO_METHOD_DENIED"
+   | "E_AMO_PATH_DENIED"
+   | "E_SYNC_LOCKED"
++  | "E_SYNC_FENCE_LOST"
+   | "E_SYNC_PARTIAL"
+   | "E_DATA_QUALITY_BLOCK"
+   | "E_SHEET_PROTECTED"
+   | "E_SHEET_LAYOUT_MISMATCH"
+   | "E_SHEET_UPSTREAM"
+   | "E_DB"
+   | "E_INTERNAL";
+ 
+ const defaultMessages: Record<AppErrorCode, string> = {
+   E_AUTH_REQUIRED: "Требуется вход",
+@@ -27,20 +28,21 @@ const defaultMessages: Record<AppErrorCode, string> = {
+   E_VALIDATION: "Проверьте параметры запроса",
+   E_NOT_FOUND: "Объект не найден",
+   E_CONFLICT: "Данные уже изменились. Обновите страницу",
+   E_CONFIG_INCOMPLETE: "Настройка не завершена",
+   E_AMO_AUTH: "Подключение к amoCRM требует внимания",
+   E_AMO_RATE_LIMIT: "amoCRM временно ограничила запросы",
+   E_AMO_UPSTREAM: "amoCRM временно недоступна",
+   E_AMO_METHOD_DENIED: "Метод amoCRM запрещён",
+   E_AMO_PATH_DENIED: "Адрес amoCRM запрещён",
+   E_SYNC_LOCKED: "Синхронизация уже выполняется",
++  E_SYNC_FENCE_LOST: "Синхронизация потеряла эксклюзивную блокировку",
+   E_SYNC_PARTIAL: "Синхронизация завершилась не полностью",
+   E_DATA_QUALITY_BLOCK: "Проверка качества данных не пройдена",
+   E_SHEET_PROTECTED: "Исходная таблица защищена от записи",
+   E_SHEET_LAYOUT_MISMATCH: "Структура таблицы изменилась",
+   E_SHEET_UPSTREAM: "Google Sheets временно недоступна",
+   E_DB: "Ошибка хранилища данных",
+   E_INTERNAL: "Внутренняя ошибка",
+ };
+ 
+ export class AppError extends Error {
+diff --git a/supabase/migrations/0008_sync_queue_worker.sql b/supabase/migrations/0008_sync_queue_worker.sql
+new file mode 100644
+index 0000000..66ecc61
+--- /dev/null
++++ b/supabase/migrations/0008_sync_queue_worker.sql
+@@ -0,0 +1,47 @@
++-- Task 6 fix round 2: durable queue ownership and restricted worker logins.
++-- Operators must assign passwords/secrets outside migrations; the roles are
++-- real logins so production workers do not connect as postgres and SET ROLE.
++alter role service_worker login noinherit bypassrls;
++alter role retention_worker login noinherit nobypassrls;
++
++alter table public.sync_work_queue
++  add column attempt_count integer not null default 0 check (attempt_count >= 0),
++  add column lease_token uuid,
++  add column lease_expires_at timestamptz,
++  add column last_error_code text check (
++    last_error_code is null or char_length(last_error_code) between 1 and 80
++  ),
++  add column last_error_summary text check (
++    last_error_summary is null or char_length(last_error_summary) <= 500
++  ),
++  add constraint sync_work_queue_lease_state_check check (
++    (status = 'queued'
++      and completed_at is null
++      and lease_token is null
++      and lease_expires_at is null)
++    or
++    (status = 'running'
++      and claimed_at is not null
++      and completed_at is null
++      and lease_token is not null
++      and lease_expires_at is not null)
++    or
++    (status in ('done', 'failed')
++      and completed_at is not null
++      and lease_token is not null)
++  );
++
++create index sync_work_queue_claim_idx
++on public.sync_work_queue (status, requested_at, id);
++
++grant update (
++  claimed_at,
++  completed_at,
++  status,
++  sync_run_id,
++  attempt_count,
++  lease_token,
++  lease_expires_at,
++  last_error_code,
++  last_error_summary
++) on public.sync_work_queue to service_worker;
+diff --git a/tests/helpers/local-db.ts b/tests/helpers/local-db.ts
+index 2fd6980..5a07d44 100644
+--- a/tests/helpers/local-db.ts
++++ b/tests/helpers/local-db.ts
+@@ -1,15 +1,21 @@
+ import postgres, { type Sql, type TransactionSql } from "postgres";
+ 
+ export const localDatabaseUrl =
+   process.env.TEST_DATABASE_URL ??
+   "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
++export const localServiceWorkerDatabaseUrl =
++  process.env.TEST_SERVICE_WORKER_DATABASE_URL ??
++  "postgresql://service_worker:service-worker-test@127.0.0.1:54322/postgres";
++export const localRetentionWorkerDatabaseUrl =
++  process.env.TEST_RETENTION_WORKER_DATABASE_URL ??
++  "postgresql://retention_worker:retention-worker-test@127.0.0.1:54322/postgres";
+ 
+ export type TestAppUser = Readonly<{
+   id: string;
+   authUserId: string;
+   email: string;
+   fullName: string;
+   role: "admin" | "head" | "manager";
+   amoUserId: number | null;
+   isActive: boolean;
+ }>;
+@@ -59,20 +65,25 @@ export const testUsers = {
+     role: "manager",
+     amoUserId: 103,
+     isActive: false,
+   },
+ } as const satisfies Record<string, TestAppUser>;
+ 
+ export function createAdminDb(): Sql {
+   return postgres(localDatabaseUrl, { max: 1 });
+ }
+ 
++export async function ensureRestrictedTestLogins(db: Sql): Promise<void> {
++  await db.unsafe("alter role service_worker login password 'service-worker-test'");
++  await db.unsafe("alter role retention_worker login password 'retention-worker-test'");
++}
++
+ export async function resetAndSeedUsers(
+   db: Sql,
+   users: readonly TestAppUser[],
+ ): Promise<void> {
+   await db`delete from app_users`;
+ 
+   for (const user of users) {
+     await db`
+       insert into auth.users (id, email)
+       values (${user.authUserId}, ${user.email})
+diff --git a/tests/repo/container-safety.test.mjs b/tests/repo/container-safety.test.mjs
+index a4ac5a4..a282a30 100644
+--- a/tests/repo/container-safety.test.mjs
++++ b/tests/repo/container-safety.test.mjs
+@@ -22,20 +22,28 @@ test("Compose keeps both external network switches literally disabled", async ()
+   assert.match(compose, /TOKEN_ENCRYPTION_KEY:\s*["']bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=["']/);
+   assert.doesNotMatch(compose, /(?:SYNC_ENABLED|SHEET_PUBLISH_ENABLED):[^\n]*\$\{/);
+   assert.doesNotMatch(compose, /123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks/);
+   assert.match(compose, /127\.0\.0\.1:\$\{WEB_PORT:-3000\}:3000/);
+   assert.match(compose, /restart:\s*["']no["']/);
+   assert.doesNotMatch(compose, /DATABASE_URL:[^\n]*\$\{/);
+   assert.match(
+     compose,
+     /DATABASE_URL:\s*["']postgresql:\/\/postgres:postgres@host\.docker\.internal:54322\/postgres["']/,
+   );
++  assert.match(
++    compose,
++    /WORKER_DATABASE_URL:\s*["']postgresql:\/\/service_worker:service-worker-test@host\.docker\.internal:54322\/postgres["']/,
++  );
++  assert.match(
++    compose,
++    /RETENTION_DATABASE_URL:\s*["']postgresql:\/\/retention_worker:retention-worker-test@host\.docker\.internal:54322\/postgres["']/,
++  );
+ });
+ 
+ test("container builds do not accept credentials as build arguments", async () => {
+   for (const path of ["Dockerfile.web", "Dockerfile.worker"]) {
+     const dockerfile = await read(path);
+ 
+     assert.doesNotMatch(
+       dockerfile,
+       /^ARG\s+.*(?:TOKEN|KEY|PASSWORD|SECRET|CREDENTIAL)/im,
+     );
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index c705116..6b8c4c6 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -1,36 +1,38 @@
+ import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+ 
+ import { closeDbClient, createServiceWorkerDbClient } from "@real2/db";
+ 
+ import {
+   createAdminDb,
+-  localDatabaseUrl,
++  ensureRestrictedTestLogins,
++  localServiceWorkerDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+   updateOwnNameAsManager,
+   visibleAppUserIds,
+   visibleControlKeys,
+ } from "../helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+ const allUsers = Object.values(testUsers);
+ 
+ async function clearDatabaseFixtures(): Promise<void> {
+   await adminDb.unsafe(
+     "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ beforeEach(async () => {
++  await ensureRestrictedTestLogins(adminDb);
+   await clearDatabaseFixtures();
+   await resetAndSeedUsers(adminDb, allUsers);
+   await adminDb`
+     insert into public.amo_connections (
+       account_id,
+       subdomain,
+       base_url,
+       access_token_ciphertext,
+       refresh_token_ciphertext,
+       token_expires_at,
+@@ -257,21 +259,21 @@ describe("pipeline configuration RLS", () => {
+           from public.amo_connections
+           limit 1
+         `;
+       }),
+     ).rejects.toMatchObject({ code: "42501" });
+   });
+ });
+ 
+ describe("worker database scope", () => {
+   it("connects as service_worker and cannot read application-user rows", async () => {
+-    const workerDb = createServiceWorkerDbClient(localDatabaseUrl);
++    const workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl);
+ 
+     try {
+       await expect(workerDb<{ current_user: string }[]>`
+         select current_user
+       `).resolves.toEqual([{ current_user: "service_worker" }]);
+       await expect(workerDb`select id from public.app_users`).rejects.toMatchObject({
+         code: "42501",
+       });
+     } finally {
+       await closeDbClient(workerDb);

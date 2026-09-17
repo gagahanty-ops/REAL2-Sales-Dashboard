@@ -1,0 +1,1314 @@
+# Review package: 45993c3d7f98b95d77f031740a9ff5724fe4265d..HEAD
+
+## Commits
+647544c fix: harden amoCRM OAuth admin read checks
+
+## Files changed
+ .../task-3-report.md                               |  72 ++++++++++++++
+ .../src/app/api/integrations/amo/callback/route.ts |  52 +++-------
+ .../api/integrations/amo/oauth.integration.test.ts | 109 ++++++++++++++++++---
+ .../src/app/api/integrations/amo/refresh/route.ts  |  67 ++++++++-----
+ .../src/app/api/integrations/amo/start/route.ts    |   7 +-
+ .../components/amo-integration-manager.test.tsx    |  27 +++++
+ .../web/src/components/amo-integration-manager.tsx |  25 +++--
+ apps/web/src/lib/amo/account.ts                    |  25 +++++
+ apps/web/src/lib/amo/admin.ts                      |  13 +--
+ apps/web/src/lib/amo/audit.ts                      |  24 +++++
+ apps/web/src/lib/amo/public-status.ts              |  13 +++
+ packages/db/src/amo-connections.ts                 |  22 ++++-
+ packages/integrations/src/amo/oauth.test.ts        |   1 +
+ supabase/migrations/0003_amo_read_check.sql        |   4 +
+ 14 files changed, 360 insertions(+), 101 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md
+index 1e9e42c..e4decf2 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-3-report.md
+@@ -94,10 +94,82 @@ passed
+   secret, code, ciphertext, and callback query material.
+ 
+ ## Concerns
+ 
+ - The OAuth authorization URL necessarily contains the one-time `state` query
+   value so that the external OAuth protocol can return it. It is never logged,
+   persisted in plaintext, reflected by the callback, or included in a local
+   redirect; no credential material is present in that URL.
+ - Production installation, live credentials, and owner confirmation of amoCRM
+   support remain deliberately out of scope and were not attempted.
++
++## Fix round 1
++
++### Review fixes
++
++- `start` now creates a state whose redirect target is explicitly
++  `/settings/integrations/amo`; an integration test consumes that exact state
++  through callback and verifies the resulting local redirect.
++- The unsupported assumption that account ID equals subdomain number was
++  removed. First install accepts any positive account ID returned from the
++  fixed-host/fixed-subdomain account GET; reconnect and refreshed read checks
++  compare that returned ID with the stored binding. Fixtures use account ID
++  `4242` with subdomain `555151` to prove the distinction.
++- Refresh now performs its guarded OAuth POST through the reviewed locked
++  refresh implementation, then performs guarded `GET /api/v4/account` with
++  the refreshed server-only token. It validates the host/subdomain and stored
++  account ID before marking `last_checked_at`.
++- Migration `0003_amo_read_check.sql` adds the safe check timestamp. Callback
++  sets it after its verified account GET; failed refreshed reads leave it
++  unchanged. The public status projection exposes only its ISO timestamp.
++- Callback and refresh now share `createAmoAdminAuditSink`, preserving the
++  same redacted audit mapping.
++- The client reloads the safe status projection after every refresh/disconnect
++  outcome and enables refresh/disconnect only for an `active` connection. The
++  browser-safe status type/helper is separate from the DB-backed server mapper.
++
++### RED / GREEN evidence
++
++The amended integration cases were run before the fixes and failed as expected:
++
++```text
++10 failed / 29 total
++first start callback: expected 303, received 409
++first install with account ID 4242/subdomain 555151: expected 303, received 409
++```
++
++After applying migration `0003` to the local synthetic Supabase database, the
++following commands completed successfully with the mandated Node/pnpm runtime:
++
++```text
++supabase db reset
++Applied migrations 0001, 0002, 0003
++
++node "$REAL2_PNPM" test:integration -- apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
++4 files passed; 30 integration tests passed
++
++node "$REAL2_PNPM" test:security
++2 files passed; 13 security tests passed
++
++node "$REAL2_PNPM" test
++11 unit files / 60 tests passed; 12 repository-worker tests passed
++
++node "$REAL2_PNPM" lint
++passed
++
++node "$REAL2_PNPM" typecheck
++passed
++
++node "$REAL2_PNPM" build
++passed; web routes and settings page compiled
++
++node "$REAL2_PNPM" check:secrets
++passed
++```
++
++Covering test files include
++`apps/web/src/app/api/integrations/amo/oauth.integration.test.ts` (actual
++start state, distinct account ID, refreshed account GET, wrong refreshed
++binding, and reauth status),
++`apps/web/src/components/amo-integration-manager.test.tsx` (disabled and
++reauth action availability), `packages/integrations/src/amo/oauth.test.ts`,
++and the existing RLS/log-redaction security tests.
+diff --git a/apps/web/src/app/api/integrations/amo/callback/route.ts b/apps/web/src/app/api/integrations/amo/callback/route.ts
+index 273086e..87a1bc5 100644
+--- a/apps/web/src/app/api/integrations/amo/callback/route.ts
++++ b/apps/web/src/app/api/integrations/amo/callback/route.ts
+@@ -3,73 +3,47 @@ import {
+   createAmoConnection,
+   getCurrentSafeAmoConnectionStatus,
+   withLockedAmoConnection,
+ } from "@real2/db";
+ import { AppError } from "@real2/domain";
+ import {
+   amoFetch,
+   decodeTokenEncryptionKey,
+   encryptToken,
+   exchangeAuthorizationCode,
+-  type AmoAuditEntry,
+-  type AmoAuditSink,
+ } from "@real2/integrations";
+ import { z } from "zod";
+ 
+ import { requireRole } from "../../../../../lib/auth/authorization";
+ import { requireUser } from "../../../../../lib/auth/require-user";
+ import { withRoute } from "../../../../../lib/http/route";
+-import { safeLogger } from "../../../../../lib/logging/logger";
+ import {
+   getDatabase,
+   getServerEnv,
+ } from "../../../../../lib/server/runtime";
++import {
++  AMO_BASE_URL,
++  amoAccountSchema,
++  assertAmoAccountBinding,
++} from "../../../../../lib/amo/account";
++import { createAmoAdminAuditSink } from "../../../../../lib/amo/audit";
+ 
+-const AMO_BASE_URL = "https://555151.amocrm.ru";
+-const AMO_ACCOUNT_ID = 555_151;
+-const AMO_SUBDOMAIN = "555151";
+ const SAFE_REDIRECTS = new Set([
+   "/settings/integrations",
+   "/settings/integrations/amo",
+ ]);
+ 
+ const callbackSchema = z.strictObject({
+   code: z.string().min(1).max(4_096),
+   state: z.string().min(1).max(512),
+ });
+ 
+-const accountSchema = z.object({
+-  id: z.number().int().positive(),
+-  subdomain: z.string().regex(/^[a-z0-9-]+$/),
+-});
+-
+-function auditSink(): AmoAuditSink {
+-  return {
+-    record(entry: AmoAuditEntry) {
+-      const completed = entry.result === "success";
+-      const log = completed ? safeLogger.info : safeLogger.error;
+-      log({
+-        message: completed ? "request completed" : "request failed",
+-        operation: "http_request",
+-        method: entry.method,
+-        normalized_path: entry.normalizedPath,
+-        ...(entry.responseStatus !== undefined
+-          ? { status: entry.responseStatus }
+-          : {}),
+-        duration_ms: entry.durationMs,
+-        trace_id: entry.traceId,
+-        result: entry.result,
+-      });
+-    },
+-  };
+-}
+-
+ function safeRedirect(redirectAfter: string, appUrl: string): Response {
+   if (!SAFE_REDIRECTS.has(redirectAfter)) {
+     throw new AppError("E_FORBIDDEN", 403);
+   }
+   return new Response(null, {
+     status: 303,
+     headers: { location: new URL(redirectAfter, appUrl).toString() },
+   });
+ }
+ 
+@@ -82,49 +56,43 @@ export const GET = withRoute(async (request, context) => {
+   });
+   const db = getDatabase();
+   const oauthState = await consumeOAuthState(db, input.state);
+ 
+   if (oauthState.createdBy !== admin.id) {
+     throw new AppError("E_FORBIDDEN", 403);
+   }
+ 
+   const env = getServerEnv();
+   const transport = {
+-    auditSink: auditSink(),
++    auditSink: createAmoAdminAuditSink(),
+     traceId: context.traceId,
+   };
+   const tokenPair = await exchangeAuthorizationCode(input.code, {
+     clientId: env.AMO_CLIENT_ID,
+     clientSecret: env.AMO_CLIENT_SECRET,
+     redirectUri: env.AMO_REDIRECT_URI,
+   }, transport);
+   const account = await amoFetch({
+     method: "GET",
+     url: `${AMO_BASE_URL}/api/v4/account`,
+-    schema: accountSchema,
++    schema: amoAccountSchema,
+     traceId: context.traceId,
+     tokenProvider: {
+       async getAccessToken() {
+         return tokenPair.accessToken;
+       },
+     },
+     auditSink: transport.auditSink,
+     redirect: "error",
+   });
+ 
+-  if (
+-    account.id !== AMO_ACCOUNT_ID ||
+-    account.subdomain !== AMO_SUBDOMAIN ||
+-    `${account.subdomain}.amocrm.ru` !== new URL(AMO_BASE_URL).hostname
+-  ) {
+-    throw new AppError("E_CONFLICT", 409);
+-  }
++  assertAmoAccountBinding(account);
+ 
+   const existing = await getCurrentSafeAmoConnectionStatus(db);
+   if (
+     existing &&
+     (existing.accountId !== account.id ||
+       existing.subdomain !== account.subdomain ||
+       existing.baseUrl !== AMO_BASE_URL)
+   ) {
+     throw new AppError("E_CONFLICT", 409);
+   }
+@@ -151,26 +119,28 @@ export const GET = withRoute(async (request, context) => {
+         connection.baseUrl !== AMO_BASE_URL
+       ) {
+         throw new AppError("E_CONFLICT", 409);
+       }
+       await actions.rotateTokens({
+         accessTokenCiphertext,
+         refreshTokenCiphertext,
+         tokenExpiresAt,
+         refreshedAt: now,
+       });
++      await actions.markCheckedAt(now);
+     });
+   } else {
+     await createAmoConnection(db, {
+       accountId: account.id,
+       subdomain: account.subdomain,
+       baseUrl: AMO_BASE_URL,
+       accessTokenCiphertext,
+       refreshTokenCiphertext,
+       tokenExpiresAt,
+       status: "active",
+       installedBy: admin.id,
++      lastCheckedAt: now,
+     });
+   }
+ 
+   return safeRedirect(oauthState.redirectAfter, env.APP_URL);
+ });
+diff --git a/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts b/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
+index 0c11941..ec28432 100644
+--- a/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
++++ b/apps/web/src/app/api/integrations/amo/oauth.integration.test.ts
+@@ -19,20 +19,21 @@ import { GET as callbackRoute } from "./callback/route";
+ import { POST as disconnectRoute } from "./disconnect/route";
+ import { POST as refreshRoute } from "./refresh/route";
+ import { POST as startRoute } from "./start/route";
+ import { GET as statusRoute } from "./status/route";
+ 
+ const syntheticTokenPair = {
+   accessToken: "synthetic-access-callback",
+   refreshToken: "synthetic-refresh-callback",
+   expiresInSeconds: 3_600,
+ } as const;
++const syntheticAccountId = 4_242;
+ 
+ const adminDb = createAdminDb();
+ 
+ const runtime = vi.hoisted(() => ({
+   db: undefined as unknown,
+   env: {
+     APP_URL: "https://dashboard.example.test",
+     DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+     SUPABASE_URL: "http://127.0.0.1:54321",
+     SUPABASE_ANON_KEY: "synthetic-anon-key",
+@@ -88,20 +89,25 @@ class AmoMock {
+         expires_in: tokenPair.expiresInSeconds,
+         access_token: tokenPair.accessToken,
+         refresh_token: tokenPair.refreshToken,
+       }),
+     );
+   }
+ 
+   queueAccount(account: { id: number; subdomain: string }): void {
+     this.responses.push(Response.json(account));
+   }
++
++  queueResponse(response: Response): void {
++    this.responses.push(response);
++  }
++
+ }
+ 
+ function callbackRequest(state: string, code: string): Request {
+   const url = new URL(
+     "/api/integrations/amo/callback",
+     "https://dashboard.example.test",
+   );
+   url.searchParams.set("state", state);
+   url.searchParams.set("code", code);
+   return new Request(url);
+@@ -134,125 +140,141 @@ afterEach(async () => {
+   await adminDb`delete from public.amo_connections`;
+   vi.unstubAllGlobals();
+ });
+ 
+ afterAll(async () => {
+   vi.unstubAllGlobals();
+   await adminDb.end();
+ });
+ 
+ describe("amoCRM OAuth administration", () => {
+-  it("creates an admin-bound one-time state and a safe authorization URL", async () => {
++  it("uses the start-created state to return to the implemented settings page", async () => {
+     const response = await startRoute(
+       sameOriginPost("/api/integrations/amo/start"),
+     );
+     const body = (await response.json()) as {
+       data: { authorizationUrl: string };
+     };
+     const authorizationUrl = new URL(body.data.authorizationUrl);
+ 
+     expect(response.status).toBe(200);
+     expect(authorizationUrl.origin).toBe("https://www.amocrm.ru");
+     expect(authorizationUrl.pathname).toBe("/oauth");
+     expect(authorizationUrl.searchParams.get("client_id")).toBe(
+       "synthetic-client-id",
+     );
+     expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+       runtime.env.AMO_REDIRECT_URI,
+     );
+     expect(authorizationUrl.searchParams.get("state")).toMatch(/^[\w-]{43}$/);
+     expect(authorizationUrl.searchParams.get("client_secret")).toBeNull();
+ 
++    const amoMock = new AmoMock();
++    amoMock.queueTokenPair(syntheticTokenPair);
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
++    vi.stubGlobal("fetch", amoMock.fetch);
++    const callback = await callbackRoute(
++      callbackRequest(authorizationUrl.searchParams.get("state")!, "synthetic-auth-code"),
++    );
++
++    expect(callback.status).toBe(303);
++    expect(callback.headers.get("location")).toBe(
++      "https://dashboard.example.test/settings/integrations/amo",
++    );
++
+     const [state] = await adminDb<{ created_by: string; consumed_at: Date | null }[]>`
+       select created_by, consumed_at from public.oauth_states
+     `;
+-    expect(state).toEqual({ created_by: testUsers.admin.id, consumed_at: null });
++    expect(state).toMatchObject({
++      created_by: testUsers.admin.id,
++      consumed_at: expect.any(Date),
++    });
+   });
+ 
+   it("rejects an OAuth result bound to a different account", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+     amoMock.queueAccount({ id: 999, subdomain: "another-account" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+ 
+     const response = await callbackRoute(
+       callbackRequest(state.value, "synthetic-auth-code"),
+     );
+ 
+     expect(response.status).toBe(409);
+     expect(await connectionCount()).toBe(0);
+   });
+ 
+-  it("rejects the unexpected numeric account ID before saving tokens", async () => {
++  it("accepts a verified account ID that differs from the fixed subdomain", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 999, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+ 
+     const response = await callbackRoute(
+       callbackRequest(state.value, "synthetic-auth-code"),
+     );
+ 
+-    expect(response.status).toBe(409);
+-    expect(await connectionCount()).toBe(0);
++    expect(response.status).toBe(303);
++    expect(await connectionCount()).toBe(1);
+   });
+ 
+   it("rejects reinstallation when the verified numeric account ID changes", async () => {
+     const firstState = await createOAuthState(adminDb, testUsers.admin.id);
+     const secondState = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     amoMock.queueTokenPair(syntheticTokenPair);
+     amoMock.queueAccount({ id: 999, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+ 
+     const first = await callbackRoute(
+       callbackRequest(firstState.value, "synthetic-first-code"),
+     );
+     const second = await callbackRoute(
+       callbackRequest(secondState.value, "synthetic-second-code"),
+     );
+ 
+     expect(first.status).toBe(303);
+     expect(second.status).toBe(409);
+     expect(await connectionCount()).toBe(1);
+   });
+ 
+   it("authenticates the active admin before consuming the one-time state", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+     session.user.role = "head";
+ 
+     const forbidden = await callbackRoute(
+       callbackRequest(state.value, "synthetic-auth-code"),
+     );
+     session.user.role = "admin";
+     const accepted = await callbackRoute(
+       callbackRequest(state.value, "synthetic-auth-code"),
+     );
+ 
+     expect(forbidden.status).toBe(403);
+     expect(accepted.status).toBe(303);
+     expect(amoMock.requests).toHaveLength(2);
+   });
+ 
+   it("consumes state once and never exchanges a replayed code", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+ 
+     const accepted = await callbackRoute(
+       callbackRequest(state.value, "synthetic-auth-code"),
+     );
+     const replayed = await callbackRoute(
+       callbackRequest(state.value, "synthetic-replayed-code"),
+     );
+ 
+     expect(accepted.status).toBe(303);
+@@ -262,21 +284,21 @@ describe("amoCRM OAuth administration", () => {
+ 
+   it("uses only the guarded OAuth POST and account GET and returns a safe redirect", async () => {
+     const state = await createOAuthState(
+       adminDb,
+       testUsers.admin.id,
+       new Date(),
+       "/settings/integrations/amo",
+     );
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+ 
+     const response = await callbackRoute(
+       callbackRequest(state.value, "synthetic-auth-code"),
+     );
+ 
+     expect(response.status).toBe(303);
+     expect(response.headers.get("location")).toBe(
+       "https://dashboard.example.test/settings/integrations/amo",
+@@ -306,82 +328,141 @@ describe("amoCRM OAuth administration", () => {
+     });
+     expect(externallyVisible).not.toMatch(
+       /synthetic-auth-code|synthetic-access|synthetic-refresh|synthetic-client-secret|state=/i,
+     );
+   });
+ 
+   it("returns only the approved connection status fields", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
+ 
+     const response = await statusRoute(
+       new Request("https://dashboard.example.test/api/integrations/amo/status"),
+     );
+     const body = (await response.json()) as {
+       data: Record<string, unknown>;
+     };
+ 
+     expect(response.status).toBe(200);
+     expect(Object.keys(body.data).sort()).toEqual([
+       "accountId",
+       "expiresAt",
+       "lastCheckedAt",
+       "status",
+       "subdomain",
+     ]);
+     expect(body.data).toMatchObject({
+-      accountId: 555_151,
++      accountId: syntheticAccountId,
+       subdomain: "555151",
+       status: "active",
+     });
+     expect(body.data.expiresAt).toEqual(expect.any(String));
+     expect(body.data.lastCheckedAt).toEqual(expect.any(String));
+     expect(JSON.stringify(body)).not.toMatch(
+       /access|refresh|ciphertext|client.secret|baseUrl|installedBy|synthetic/i,
+     );
+   });
+ 
+   it("refreshes only the current connection server-side", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     amoMock.queueTokenPair({
+       ...syntheticTokenPair,
+       accessToken: "synthetic-access-refreshed",
+       refreshToken: "synthetic-refresh-refreshed",
+     });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
+ 
+     const response = await refreshRoute(
+       sameOriginPost("/api/integrations/amo/refresh"),
+     );
+ 
+     expect(response.status).toBe(200);
+     expect(await response.json()).toMatchObject({ data: { refreshed: true } });
+     expect(amoMock.requests.map(({ url, init }) => [url, init.method])).toEqual([
+       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
+       ["https://555151.amocrm.ru/api/v4/account", "GET"],
+       ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
++      ["https://555151.amocrm.ru/api/v4/account", "GET"],
++    ]);
++  });
++
++  it("does not report a successful read check when the refreshed token sees another account", async () => {
++    const state = await createOAuthState(adminDb, testUsers.admin.id);
++    const amoMock = new AmoMock();
++    amoMock.queueTokenPair(syntheticTokenPair);
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
++    amoMock.queueTokenPair({
++      ...syntheticTokenPair,
++      accessToken: "synthetic-access-refreshed",
++      refreshToken: "synthetic-refresh-refreshed",
++    });
++    amoMock.queueAccount({ id: 999, subdomain: "555151" });
++    vi.stubGlobal("fetch", amoMock.fetch);
++    await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
++    const [before] = await adminDb<{ last_checked_at: Date }[]>`
++      select last_checked_at from public.amo_connections
++    `;
++
++    const response = await refreshRoute(
++      sameOriginPost("/api/integrations/amo/refresh"),
++    );
++
++    expect(response.status).toBe(409);
++    const [after] = await adminDb<{ last_checked_at: Date }[]>`
++      select last_checked_at from public.amo_connections
++    `;
++    expect(after?.last_checked_at).toEqual(before?.last_checked_at);
++    expect(amoMock.requests.map(({ url, init }) => [url, init.method])).toEqual([
++      ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
++      ["https://555151.amocrm.ru/api/v4/account", "GET"],
++      ["https://555151.amocrm.ru/oauth2/access_token", "POST"],
++      ["https://555151.amocrm.ru/api/v4/account", "GET"],
+     ]);
+   });
+ 
++  it("exposes reauth_required after a failed refresh for the client status reload", async () => {
++    const state = await createOAuthState(adminDb, testUsers.admin.id);
++    const amoMock = new AmoMock();
++    amoMock.queueTokenPair(syntheticTokenPair);
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
++    amoMock.queueResponse(new Response(null, { status: 500 }));
++    vi.stubGlobal("fetch", amoMock.fetch);
++    await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
++
++    const refresh = await refreshRoute(
++      sameOriginPost("/api/integrations/amo/refresh"),
++    );
++    const status = await statusRoute(
++      new Request("https://dashboard.example.test/api/integrations/amo/status"),
++    );
++
++    expect(refresh.status).toBe(502);
++    expect((await status.json() as { data: { status: string } }).data.status).toBe(
++      "reauth_required",
++    );
++    expect(amoMock.requests).toHaveLength(3);
++  });
++
+   it("disconnects locally without an amoCRM business request", async () => {
+     const state = await createOAuthState(adminDb, testUsers.admin.id);
+     const amoMock = new AmoMock();
+     amoMock.queueTokenPair(syntheticTokenPair);
+-    amoMock.queueAccount({ id: 555_151, subdomain: "555151" });
++    amoMock.queueAccount({ id: syntheticAccountId, subdomain: "555151" });
+     vi.stubGlobal("fetch", amoMock.fetch);
+     await callbackRoute(callbackRequest(state.value, "synthetic-auth-code"));
+ 
+     const response = await disconnectRoute(
+       sameOriginPost("/api/integrations/amo/disconnect"),
+     );
+     const status = await statusRoute(
+       new Request("https://dashboard.example.test/api/integrations/amo/status"),
+     );
+ 
+diff --git a/apps/web/src/app/api/integrations/amo/refresh/route.ts b/apps/web/src/app/api/integrations/amo/refresh/route.ts
+index 0871edb..3cf60dd 100644
+--- a/apps/web/src/app/api/integrations/amo/refresh/route.ts
++++ b/apps/web/src/app/api/integrations/amo/refresh/route.ts
+@@ -1,59 +1,74 @@
+-import { getCurrentSafeAmoConnectionStatus } from "@real2/db";
++import {
++  getCurrentSafeAmoConnectionStatus,
++  withLockedAmoConnection,
++} from "@real2/db";
+ import { AppError } from "@real2/domain";
+ import {
++  amoFetch,
+   decodeTokenEncryptionKey,
+   refreshConnection,
+-  type AmoAuditEntry,
+-  type AmoAuditSink,
+ } from "@real2/integrations";
+ 
+ import { requireRole } from "../../../../../lib/auth/authorization";
+ import { requireUser } from "../../../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../../../lib/http-security";
+ import { withRoute } from "../../../../../lib/http/route";
+-import { safeLogger } from "../../../../../lib/logging/logger";
+ import { getDatabase, getServerEnv } from "../../../../../lib/server/runtime";
+-
+-function auditSink(): AmoAuditSink {
+-  return {
+-    record(entry: AmoAuditEntry) {
+-      const log = entry.result === "success" ? safeLogger.info : safeLogger.error;
+-      log({
+-        message: entry.result === "success" ? "request completed" : "request failed",
+-        operation: "http_request",
+-        method: entry.method,
+-        normalized_path: entry.normalizedPath,
+-        ...(entry.responseStatus !== undefined
+-          ? { status: entry.responseStatus }
+-          : {}),
+-        duration_ms: entry.durationMs,
+-        trace_id: entry.traceId,
+-        result: entry.result,
+-      });
+-    },
+-  };
+-}
++import {
++  AMO_BASE_URL,
++  amoAccountSchema,
++  assertAmoAccountBinding,
++} from "../../../../../lib/amo/account";
++import { createAmoAdminAuditSink } from "../../../../../lib/amo/audit";
+ 
+ export const POST = withRoute(async (request, context) => {
+   requireRole(await requireUser(), ["admin"]);
+   requireSameOrigin(request);
+   const db = getDatabase();
+   const connection = await getCurrentSafeAmoConnectionStatus(db);
+   if (!connection) {
+     throw new AppError("E_NOT_FOUND", 404);
+   }
+ 
+   const env = getServerEnv();
+-  await refreshConnection(connection.id, {
++  const auditSink = createAmoAdminAuditSink();
++  const accessToken = await refreshConnection(connection.id, {
+     db,
+     encryptionKey: decodeTokenEncryptionKey(env.TOKEN_ENCRYPTION_KEY),
+     oauthConfig: {
+       clientId: env.AMO_CLIENT_ID,
+       clientSecret: env.AMO_CLIENT_SECRET,
+       redirectUri: env.AMO_REDIRECT_URI,
+     },
+-    transport: { auditSink: auditSink(), traceId: context.traceId },
++    transport: { auditSink, traceId: context.traceId },
++  });
++  const account = await amoFetch({
++    method: "GET",
++    url: `${AMO_BASE_URL}/api/v4/account`,
++    schema: amoAccountSchema,
++    traceId: context.traceId,
++    tokenProvider: {
++      async getAccessToken() {
++        return accessToken;
++      },
++    },
++    auditSink,
++    redirect: "error",
++  });
++  assertAmoAccountBinding(account, connection.accountId);
++
++  const checkedAt = new Date();
++  await withLockedAmoConnection(db, connection.id, async (locked, actions) => {
++    if (
++      locked.status !== "active" ||
++      locked.accountId !== account.id ||
++      locked.subdomain !== account.subdomain ||
++      locked.baseUrl !== AMO_BASE_URL
++    ) {
++      throw new AppError("E_CONFLICT", 409);
++    }
++    await actions.markCheckedAt(checkedAt);
+   });
+ 
+   return { refreshed: true };
+ });
+diff --git a/apps/web/src/app/api/integrations/amo/start/route.ts b/apps/web/src/app/api/integrations/amo/start/route.ts
+index 500a87a..791f952 100644
+--- a/apps/web/src/app/api/integrations/amo/start/route.ts
++++ b/apps/web/src/app/api/integrations/amo/start/route.ts
+@@ -5,18 +5,23 @@ import { requireUser } from "../../../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../../../lib/http-security";
+ import { withRoute } from "../../../../../lib/http/route";
+ import { getDatabase, getServerEnv } from "../../../../../lib/server/runtime";
+ 
+ const AMO_AUTHORIZE_URL = "https://www.amocrm.ru/oauth";
+ 
+ export const POST = withRoute(async (request) => {
+   const admin = requireRole(await requireUser(), ["admin"]);
+   requireSameOrigin(request);
+   const env = getServerEnv();
+-  const state = await createOAuthState(getDatabase(), admin.id);
++  const state = await createOAuthState(
++    getDatabase(),
++    admin.id,
++    new Date(),
++    "/settings/integrations/amo",
++  );
+   const authorizationUrl = new URL(AMO_AUTHORIZE_URL);
+   authorizationUrl.searchParams.set("client_id", env.AMO_CLIENT_ID);
+   authorizationUrl.searchParams.set("redirect_uri", env.AMO_REDIRECT_URI);
+   authorizationUrl.searchParams.set("state", state.value);
+ 
+   return { authorizationUrl: authorizationUrl.toString() };
+ });
+diff --git a/apps/web/src/components/amo-integration-manager.test.tsx b/apps/web/src/components/amo-integration-manager.test.tsx
+new file mode 100644
+index 0000000..2127ef4
+--- /dev/null
++++ b/apps/web/src/components/amo-integration-manager.test.tsx
+@@ -0,0 +1,27 @@
++import { renderToStaticMarkup } from "react-dom/server";
++import React from "react";
++import { describe, expect, it } from "vitest";
++
++import { AmoIntegrationManager } from "./amo-integration-manager";
++
++const baseStatus = {
++  accountId: 4_242,
++  subdomain: "555151",
++  expiresAt: "2026-09-14T12:00:00.000Z",
++  lastCheckedAt: "2026-09-14T12:00:00.000Z",
++} as const;
++
++describe("AmoIntegrationManager", () => {
++  it.each(["disabled", "reauth_required"] as const)(
++    "disables refresh and disconnect for %s connections",
++    (status) => {
++      const html = renderToStaticMarkup(
++        <AmoIntegrationManager initialStatus={{ ...baseStatus, status }} />,
++      );
++
++      expect(html.match(/disabled=""/g)).toHaveLength(2);
++      expect(html).toContain("Проверить чтение");
++      expect(html).toContain("Отключить");
++    },
++  );
++});
+diff --git a/apps/web/src/components/amo-integration-manager.tsx b/apps/web/src/components/amo-integration-manager.tsx
+index 7bd1260..2fb65c2 100644
+--- a/apps/web/src/components/amo-integration-manager.tsx
++++ b/apps/web/src/components/amo-integration-manager.tsx
+@@ -1,15 +1,18 @@
+ "use client";
+ 
+-import { useState } from "react";
++import React, { useState } from "react";
+ 
+-import type { PublicAmoConnectionStatus } from "../lib/amo/admin";
++import {
++  isAmoConnectionActive,
++  type PublicAmoConnectionStatus,
++} from "../lib/amo/public-status";
+ 
+ type ApiBody = {
+   data?: { authorizationUrl?: string };
+   error?: { message?: string };
+ };
+ 
+ function formatDate(value: string): string {
+   return new Intl.DateTimeFormat("ru-RU", {
+     dateStyle: "medium",
+     timeStyle: "short",
+@@ -57,29 +60,33 @@ export function AmoIntegrationManager({
+     setMessage(null);
+     try {
+       const response = await fetch(`/api/integrations/amo/${action}`, {
+         method: "POST",
+       });
+       const body = await readApi(response);
+       if (!response.ok) {
+         setError(body.error?.message ?? "Не удалось обновить подключение");
+         return;
+       }
+-      const statusResponse = await fetch("/api/integrations/amo/status");
+-      const statusBody = (await readApi(statusResponse)) as ApiBody & {
+-        data?: PublicAmoConnectionStatus | null;
+-      };
+-      if (statusResponse.ok) setStatus(statusBody.data ?? null);
+       setMessage(successMessage);
+     } catch {
+       setError("Сервис временно недоступен. Повторите попытку");
+     } finally {
++      try {
++        const statusResponse = await fetch("/api/integrations/amo/status");
++        const statusBody = (await readApi(statusResponse)) as ApiBody & {
++          data?: PublicAmoConnectionStatus | null;
++        };
++        if (statusResponse.ok) setStatus(statusBody.data ?? null);
++      } catch {
++        // Keep the last safe projection when a status reload is unavailable.
++      }
+       setPending(null);
+     }
+   }
+ 
+   return (
+     <section className="panel amo-integration" aria-labelledby="amo-title">
+       <div className="integration-heading">
+         <div>
+           <h2 id="amo-title">amoCRM</h2>
+           <p className="muted">Подключение ограничено аккаунтом 555151.amocrm.ru.</p>
+@@ -97,22 +104,22 @@ export function AmoIntegrationManager({
+           <div><dt>Последняя проверка</dt><dd>{formatDate(status.lastCheckedAt)}</dd></div>
+         </dl>
+       ) : (
+         <p className="muted">Интеграция пока не подключена.</p>
+       )}
+ 
+       <div className="card-actions">
+         <button className="button" disabled={pending !== null} onClick={startConnection} type="button">
+           {pending === "start" ? "Открываем…" : status ? "Переподключить" : "Подключить"}
+         </button>
+-        <button className="button button-secondary" disabled={!status || pending !== null} onClick={() => updateConnection("refresh", "Токен обновлён на сервере")} type="button">
++        <button className="button button-secondary" disabled={!isAmoConnectionActive(status) || pending !== null} onClick={() => updateConnection("refresh", "Проверка чтения завершена")} type="button">
+           {pending === "refresh" ? "Проверяем…" : "Проверить чтение"}
+         </button>
+-        <button className="button button-danger" disabled={!status || pending !== null} onClick={() => updateConnection("disconnect", "Интеграция отключена. Последний снимок сохранён")} type="button">
++        <button className="button button-danger" disabled={!isAmoConnectionActive(status) || pending !== null} onClick={() => updateConnection("disconnect", "Интеграция отключена. Последний снимок сохранён")} type="button">
+           {pending === "disconnect" ? "Отключаем…" : "Отключить"}
+         </button>
+       </div>
+       {error ? <p aria-live="polite" className="form-error" role="alert">{error}</p> : null}
+       {message ? <p aria-live="polite" className="form-success">{message}</p> : null}
+     </section>
+   );
+ }
+diff --git a/apps/web/src/lib/amo/account.ts b/apps/web/src/lib/amo/account.ts
+new file mode 100644
+index 0000000..8f33432
+--- /dev/null
++++ b/apps/web/src/lib/amo/account.ts
+@@ -0,0 +1,25 @@
++import { AppError } from "@real2/domain";
++import { z } from "zod";
++
++export const AMO_BASE_URL = "https://555151.amocrm.ru";
++export const AMO_SUBDOMAIN = "555151";
++
++export const amoAccountSchema = z.object({
++  id: z.number().int().positive(),
++  subdomain: z.string().regex(/^[a-z0-9-]+$/),
++});
++
++export type AmoAccount = z.infer<typeof amoAccountSchema>;
++
++export function assertAmoAccountBinding(
++  account: AmoAccount,
++  expectedAccountId?: number,
++): void {
++  if (
++    account.subdomain !== AMO_SUBDOMAIN ||
++    `${account.subdomain}.amocrm.ru` !== new URL(AMO_BASE_URL).hostname ||
++    (expectedAccountId !== undefined && account.id !== expectedAccountId)
++  ) {
++    throw new AppError("E_CONFLICT", 409);
++  }
++}
+diff --git a/apps/web/src/lib/amo/admin.ts b/apps/web/src/lib/amo/admin.ts
+index 74547d9..fa3e1f5 100644
+--- a/apps/web/src/lib/amo/admin.ts
++++ b/apps/web/src/lib/amo/admin.ts
+@@ -1,34 +1,31 @@
+ import {
+   getCurrentSafeAmoConnectionStatus,
+   type Database,
+   type SafeAmoConnectionStatus,
+ } from "@real2/db";
+ 
+-export type PublicAmoConnectionStatus = Readonly<{
+-  accountId: number;
+-  subdomain: string;
+-  status: SafeAmoConnectionStatus["status"];
+-  expiresAt: string;
+-  lastCheckedAt: string;
+-}>;
++import type { PublicAmoConnectionStatus } from "./public-status";
++
++export type { PublicAmoConnectionStatus } from "./public-status";
+ 
+ export function toPublicAmoConnectionStatus(
+   connection: SafeAmoConnectionStatus,
+ ): PublicAmoConnectionStatus {
+   return {
+     accountId: connection.accountId,
+     subdomain: connection.subdomain,
+     status: connection.status,
+     expiresAt: connection.tokenExpiresAt.toISOString(),
+     lastCheckedAt: (
+-      connection.refreshedAt ?? connection.installedAt
++      connection.lastCheckedAt ?? connection.installedAt
+     ).toISOString(),
+   };
+ }
+ 
++
+ export async function getCurrentPublicAmoConnectionStatus(
+   db: Database,
+ ): Promise<PublicAmoConnectionStatus | null> {
+   const connection = await getCurrentSafeAmoConnectionStatus(db);
+   return connection ? toPublicAmoConnectionStatus(connection) : null;
+ }
+diff --git a/apps/web/src/lib/amo/audit.ts b/apps/web/src/lib/amo/audit.ts
+new file mode 100644
+index 0000000..bdd2990
+--- /dev/null
++++ b/apps/web/src/lib/amo/audit.ts
+@@ -0,0 +1,24 @@
++import { type AmoAuditEntry, type AmoAuditSink } from "@real2/integrations";
++
++import { safeLogger } from "../logging/logger";
++
++export function createAmoAdminAuditSink(): AmoAuditSink {
++  return {
++    record(entry: AmoAuditEntry) {
++      const completed = entry.result === "success";
++      const log = completed ? safeLogger.info : safeLogger.error;
++      log({
++        message: completed ? "request completed" : "request failed",
++        operation: "http_request",
++        method: entry.method,
++        normalized_path: entry.normalizedPath,
++        ...(entry.responseStatus !== undefined
++          ? { status: entry.responseStatus }
++          : {}),
++        duration_ms: entry.durationMs,
++        trace_id: entry.traceId,
++        result: entry.result,
++      });
++    },
++  };
++}
+diff --git a/apps/web/src/lib/amo/public-status.ts b/apps/web/src/lib/amo/public-status.ts
+new file mode 100644
+index 0000000..4d6ce77
+--- /dev/null
++++ b/apps/web/src/lib/amo/public-status.ts
+@@ -0,0 +1,13 @@
++export type PublicAmoConnectionStatus = Readonly<{
++  accountId: number;
++  subdomain: string;
++  status: "pending" | "active" | "reauth_required" | "disabled";
++  expiresAt: string;
++  lastCheckedAt: string;
++}>;
++
++export function isAmoConnectionActive(
++  connection: PublicAmoConnectionStatus | null,
++): boolean {
++  return connection?.status === "active";
++}
+diff --git a/packages/db/src/amo-connections.ts b/packages/db/src/amo-connections.ts
+index 41fa403..540852d 100644
+--- a/packages/db/src/amo-connections.ts
++++ b/packages/db/src/amo-connections.ts
+@@ -26,76 +26,80 @@ export type CreatedOAuthState = OAuthState & Readonly<{ value: string }>;
+ export type SafeAmoConnectionStatus = Readonly<{
+   id: string;
+   accountId: number;
+   subdomain: string;
+   baseUrl: string;
+   tokenExpiresAt: Date;
+   status: AmoConnectionStatusValue;
+   installedBy: string;
+   installedAt: Date;
+   refreshedAt: Date | null;
++  lastCheckedAt: Date | null;
+   disabledAt: Date | null;
+   updatedAt: Date;
+ }>;
+ 
+ export type AmoConnectionCredentials = SafeAmoConnectionStatus &
+   Readonly<{
+     accessTokenCiphertext: Buffer;
+     refreshTokenCiphertext: Buffer;
+   }>;
+ 
+ export type CreateAmoConnectionInput = Readonly<{
+   accountId: number;
+   subdomain: string;
+   baseUrl: string;
+   accessTokenCiphertext: Uint8Array;
+   refreshTokenCiphertext: Uint8Array;
+   tokenExpiresAt: Date;
+   status: AmoConnectionStatusValue;
+   installedBy: string;
++  lastCheckedAt: Date;
+ }>;
+ 
+ type OAuthStateRow = {
+   created_by: string;
+   redirect_after: string;
+   expires_at: Date;
+ };
+ 
+ type AmoConnectionRow = {
+   id: string;
+   account_id: string;
+   subdomain: string;
+   base_url: string;
+   access_token_ciphertext: Uint8Array;
+   refresh_token_ciphertext: Uint8Array;
+   token_expires_at: Date;
+   status: AmoConnectionStatusValue;
+   installed_by: string;
+   installed_at: Date;
+   refreshed_at: Date | null;
++  last_checked_at: Date | null;
+   disabled_at: Date | null;
+   updated_at: Date;
+ };
+ 
+ type SafeAmoConnectionRow = Omit<
+   AmoConnectionRow,
+   "access_token_ciphertext" | "refresh_token_ciphertext"
+ >;
+ 
+ export type LockedAmoConnectionActions = Readonly<{
+   rotateTokens(input: {
+     accessTokenCiphertext: Uint8Array;
+     refreshTokenCiphertext: Uint8Array;
+     tokenExpiresAt: Date;
+     refreshedAt: Date;
+   }): Promise<void>;
+   markReauthRequired(at: Date): Promise<void>;
++  markCheckedAt(checkedAt: Date): Promise<void>;
+ }>;
+ 
+ function stateHash(value: string): string {
+   return createHash("sha256").update(value, "utf8").digest("hex");
+ }
+ 
+ function safeAccountId(value: string): number {
+   const parsed = Number(value);
+   if (!Number.isSafeInteger(parsed)) {
+     throw new AppError("E_DB", 500);
+@@ -109,54 +113,57 @@ function mapConnection(row: AmoConnectionRow): AmoConnectionCredentials {
+     accountId: safeAccountId(row.account_id),
+     subdomain: row.subdomain,
+     baseUrl: row.base_url,
+     accessTokenCiphertext: Buffer.from(row.access_token_ciphertext),
+     refreshTokenCiphertext: Buffer.from(row.refresh_token_ciphertext),
+     tokenExpiresAt: row.token_expires_at,
+     status: row.status,
+     installedBy: row.installed_by,
+     installedAt: row.installed_at,
+     refreshedAt: row.refreshed_at,
++    lastCheckedAt: row.last_checked_at,
+     disabledAt: row.disabled_at,
+     updatedAt: row.updated_at,
+   };
+ }
+ 
+ function safeProjection(
+   connection: AmoConnectionCredentials,
+ ): SafeAmoConnectionStatus {
+   return {
+     id: connection.id,
+     accountId: connection.accountId,
+     subdomain: connection.subdomain,
+     baseUrl: connection.baseUrl,
+     tokenExpiresAt: connection.tokenExpiresAt,
+     status: connection.status,
+     installedBy: connection.installedBy,
+     installedAt: connection.installedAt,
+     refreshedAt: connection.refreshedAt,
++    lastCheckedAt: connection.lastCheckedAt,
+     disabledAt: connection.disabledAt,
+     updatedAt: connection.updatedAt,
+   };
+ }
+ 
+ function mapSafeConnection(row: SafeAmoConnectionRow): SafeAmoConnectionStatus {
+   return {
+     id: row.id,
+     accountId: safeAccountId(row.account_id),
+     subdomain: row.subdomain,
+     baseUrl: row.base_url,
+     tokenExpiresAt: row.token_expires_at,
+     status: row.status,
+     installedBy: row.installed_by,
+     installedAt: row.installed_at,
+     refreshedAt: row.refreshed_at,
++    lastCheckedAt: row.last_checked_at,
+     disabledAt: row.disabled_at,
+     updatedAt: row.updated_at,
+   };
+ }
+ 
+ async function findConnection(
+   db: Database | TransactionSql,
+   connectionId: string,
+   lock = false,
+ ): Promise<AmoConnectionCredentials | null> {
+@@ -166,20 +173,21 @@ async function findConnection(
+       account_id,
+       subdomain,
+       base_url,
+       access_token_ciphertext,
+       refresh_token_ciphertext,
+       token_expires_at,
+       status,
+       installed_by,
+       installed_at,
+       refreshed_at,
++      last_checked_at,
+       disabled_at,
+       updated_at
+     from public.amo_connections
+     where id = $1
+     limit 1${lock ? " for update" : ""}`,
+     [connectionId],
+   );
+   const row = rows[0];
+   return row ? mapConnection(row) : null;
+ }
+@@ -256,30 +264,32 @@ export async function createAmoConnection(
+ ): Promise<SafeAmoConnectionStatus> {
+   const [row] = await db<AmoConnectionRow[]>`
+     insert into public.amo_connections (
+       account_id,
+       subdomain,
+       base_url,
+       access_token_ciphertext,
+       refresh_token_ciphertext,
+       token_expires_at,
+       status,
+-      installed_by
++      installed_by,
++      last_checked_at
+     ) values (
+       ${input.accountId},
+       ${input.subdomain},
+       ${input.baseUrl},
+       ${Buffer.from(input.accessTokenCiphertext)},
+       ${Buffer.from(input.refreshTokenCiphertext)},
+       ${input.tokenExpiresAt},
+       ${input.status},
+-      ${input.installedBy}
++      ${input.installedBy},
++      ${input.lastCheckedAt}
+     )
+     returning *
+   `;
+ 
+   if (!row) {
+     throw new AppError("E_DB", 500);
+   }
+   return safeProjection(mapConnection(row));
+ }
+ 
+@@ -308,20 +318,21 @@ export async function getCurrentSafeAmoConnectionStatus(
+     select
+       id,
+       account_id,
+       subdomain,
+       base_url,
+       token_expires_at,
+       status,
+       installed_by,
+       installed_at,
+       refreshed_at,
++      last_checked_at,
+       disabled_at,
+       updated_at
+     from public.amo_connections
+     where base_url = 'https://555151.amocrm.ru'
+     order by updated_at desc, id
+     limit 1
+   `;
+   return row ? mapSafeConnection(row) : null;
+ }
+ 
+@@ -371,20 +382,27 @@ export async function withLockedAmoConnection<T>(
+           where id = ${connectionId}
+         `;
+       },
+       async markReauthRequired(at) {
+         await transaction`
+           update public.amo_connections
+           set status = 'reauth_required', updated_at = ${at}
+           where id = ${connectionId}
+         `;
+       },
++      async markCheckedAt(checkedAt) {
++        await transaction`
++          update public.amo_connections
++          set last_checked_at = ${checkedAt}, updated_at = ${checkedAt}
++          where id = ${connectionId}
++        `;
++      },
+     };
+ 
+     return { value: await callback(connection, actions) };
+   });
+   return result.value;
+ }
+ 
+ export async function disableAmoConnection(
+   db: Database,
+   connectionId: string,
+diff --git a/packages/integrations/src/amo/oauth.test.ts b/packages/integrations/src/amo/oauth.test.ts
+index af836b7..0838210 100644
+--- a/packages/integrations/src/amo/oauth.test.ts
++++ b/packages/integrations/src/amo/oauth.test.ts
+@@ -80,20 +80,21 @@ async function insertConnection(overrides: {
+   return createAmoConnection(adminDb, {
+     accountId: overrides.accountId ?? 555_151,
+     subdomain: overrides.subdomain ?? "555151",
+     baseUrl: "https://555151.amocrm.ru",
+     accessTokenCiphertext: encryptToken("synthetic-access-old", encryptionKey),
+     refreshTokenCiphertext: encryptToken("synthetic-refresh-old", encryptionKey),
+     tokenExpiresAt:
+       overrides.tokenExpiresAt ?? new Date(now.getTime() + 5 * 60_000),
+     status: "active",
+     installedBy: testUsers.admin.id,
++    lastCheckedAt: now,
+   });
+ }
+ 
+ beforeEach(async () => {
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+   await resetAndSeedUsers(adminDb, [
+     testUsers.admin,
+     testUsers.head,
+     testUsers.managerOne,
+diff --git a/supabase/migrations/0003_amo_read_check.sql b/supabase/migrations/0003_amo_read_check.sql
+new file mode 100644
+index 0000000..ceccf1a
+--- /dev/null
++++ b/supabase/migrations/0003_amo_read_check.sql
+@@ -0,0 +1,4 @@
++alter table public.amo_connections
++  add column last_checked_at timestamptz;
++
++grant select (last_checked_at) on public.amo_connections to authenticated;

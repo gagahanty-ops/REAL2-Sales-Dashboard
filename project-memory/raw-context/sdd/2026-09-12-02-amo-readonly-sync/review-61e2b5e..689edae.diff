@@ -1,0 +1,414 @@
+# Review package: 61e2b5eb22acaef1af06fd3fe546a1f34da9a063..HEAD
+
+## Commits
+689edae fix: confirm pipeline name reversions
+
+## Files changed
+ .../task-4-report.md                               |  81 +++++++++++++
+ .../src/app/api/config/config.integration.test.ts  | 133 +++++++++++++++++++++
+ packages/domain/src/amo/config.test.ts             |  41 +++++++
+ packages/domain/src/amo/config.ts                  |  36 +++---
+ 4 files changed, 273 insertions(+), 18 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md
+index 595a1c9..6ca9d24 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md
+@@ -183,10 +183,91 @@ Relevant output:
+ - The stale-state comparison occurs after the transaction advisory lock and after locking every configuration row for the connection. A `Promise.all` route regression produced `[200, 409]` and exactly one version, demonstrating that a shared fresh checksum is insufficient without the one-use active-state binding.
+ - Name drift is allowed only when the relevant pipeline/status ID belongs to the active confirmed selection. A different or initially unconfirmed ID with a non-required name remains `E_CONFIG_INCOMPLETE`. Confirmation is checked after a fresh discovery/checksum comparison and before any write.
+ - Edited channel rules remain server-authoritative: Zod constrains exact match types/channels, domain validation enforces catalog defaults/duplicates/priorities/source order, SQL independently enforces unique keys/priorities, and the transaction inserts an immutable new version.
+ - The current configuration UUID is intentionally exposed only as a safe optimistic-concurrency token; connection IDs, actor IDs, credentials, ciphertext, and private validation details remain excluded.
+ - Activation still inserts only a queued recalculation request and does not touch the current snapshot. Both external switches remain false.
+ 
+ ### Concerns / follow-up boundary
+ 
+ - Encountered channel values and counts remain truthfully empty. `/api/config/channel-values` still returns no fabricated aggregate because the immutable raw table is not available until Task 5.
+ - No production ID, live amoCRM credential, real network call, Google API, or protected original Sheet was used. All amended integration evidence is synthetic and local.
++
++## Fix round 2
++
++### Summary
++
++- Corrected same-ID name-drift validation to compare every subsequent live name with the currently active stored name before considering the canonical initial name.
++- Canonical Russian names remain mandatory when there is no previously confirmed binding for the selected ID.
++- A confirmed renamed pipeline/status returning to its canonical name now emits the same three warning codes as the forward rename and requires `confirmNameChanges: true` before activation.
++- The reversal activation remains checksum-fresh and bound to the expected active configuration ID, and creates a third immutable version only after confirmation.
++
++### Covering tests
++
++- `packages/domain/src/amo/config.test.ts` — `warns when previously confirmed renamed IDs return to the canonical names` covers the stored-name comparison for pipeline, application status, and won status.
++- `apps/web/src/app/api/config/config.integration.test.ts` — `requires confirmation when renamed IDs return to their canonical names` exercises original version → confirmed renamed version → canonical reversal through the real validate/activate routes and local PostgreSQL transaction. It proves validate warns, unconfirmed activation returns 422, confirmed activation succeeds as version 3, history remains immutable, and only version 3 is active.
++
++### RED evidence
++
++With only the two reversal regressions added:
++
++```text
++node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts --project unit --silent
++node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration --silent
++```
++
++- Domain: 1 failed / 12 passed. The reversal returned `requiresNameConfirmation: false` and `warnings: []` instead of all three name-change warnings.
++- Config integration: 1 failed / 13 passed with the same missing reversal warnings at the validate route boundary.
++
++### GREEN evidence and exact commands
++
++Every package-manager invocation used:
++
++```text
++export PATH=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/node/bin:$PATH
++REAL2_PNPM=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/pnpm/bin/pnpm.cjs
++```
++
++Focused GREEN:
++
++```text
++node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts --project unit --silent
++node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration --silent
++```
++
++- Domain: 13/13 passed.
++- Config integration: 14/14 passed.
++
++Fresh completion verification:
++
++```text
++node "$REAL2_PNPM" exec supabase db reset
++node "$REAL2_PNPM" test
++node "$REAL2_PNPM" exec vitest run --project integration --silent
++node "$REAL2_PNPM" exec vitest run --project security --silent
++node "$REAL2_PNPM" lint
++node "$REAL2_PNPM" typecheck
++node "$REAL2_PNPM" build
++node "$REAL2_PNPM" check:secrets
++git diff --check
++```
++
++Relevant output:
++
++- Node `v22.23.2`; local Supabase reset reapplied migrations `0001` through `0004` successfully.
++- Repository/worker checks: 12/12 passed; Vitest unit: 76/76 passed across 13 files.
++- Full integration: 44/44 passed across 5 files.
++- Security: 15/15 passed across RLS and log-redaction suites.
++- Lint and typecheck passed for all six workspace packages plus scripts.
++- All packages and the Next.js production application built successfully; static generation completed 17/17 and all config/settings/quality routes were present.
++- Tracked-secret scan and whitespace check exited 0.
++
++### Self-review
++
++- For an existing binding, the branch order is now ID match → stored-name comparison. This catches renamed → canonical, renamed → another rename, and canonical → renamed equally.
++- Canonical-name validation is reached only when the live entity has no matching active binding, preserving the guarded initial setup and explicit selection of a different API-confirmed ID.
++- Route inputs already project the active stored pipeline/status names into validation; the new route regression proves those names survive the database/public boundary and control both validation and activation confirmation.
++- No transaction, checksum, active-state lock, channel-rule, RLS, or external-network behavior changed in this round.
++
++### Concerns / follow-up boundary
++
++- Encountered channel counts remain deferred to Task 5 as previously documented; this round does not alter that truthful empty state.
++- Verification used only synthetic fixtures and the local database. No live amoCRM request or credential was used.
+diff --git a/apps/web/src/app/api/config/config.integration.test.ts b/apps/web/src/app/api/config/config.integration.test.ts
+index 8ab1ce4..37c1075 100644
+--- a/apps/web/src/app/api/config/config.integration.test.ts
++++ b/apps/web/src/app/api/config/config.integration.test.ts
+@@ -481,20 +481,153 @@ describe("pipeline configuration routes", () => {
+       {
+         version: 2,
+         pipeline_name: "РЕАЛ ДВА — новое имя",
+         application_status_name: "Завершение — новое имя",
+         won_status_name: "Продажа — новое имя",
+         is_active: true,
+       },
+     ]);
+   });
+ 
++  it("requires confirmation when renamed IDs return to their canonical names", async () => {
++    const originalAmo = new AmoDiscoveryMock();
++    vi.stubGlobal("fetch", originalAmo.fetch);
++    const initialValidationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const initialValidation = (await initialValidationResponse.json()) as {
++      data: { metadataChecksum: string };
++    };
++    const initialActivationResponse = await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        candidate,
++        channelRules: INITIAL_CHANNEL_RULES,
++        metadataChecksum: initialValidation.data.metadataChecksum,
++        expectedActiveConfigId: null,
++      }),
++    );
++    const initialActivation = (await initialActivationResponse.json()) as {
++      data: { configId: string };
++    };
++
++    const renamedAmo = new AmoDiscoveryMock({
++      pipelines: [{ id: candidate.pipelineId, name: "РЕАЛ ДВА — новое имя" }],
++      statuses: [
++        { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
++        { id: candidate.wonStatusId, name: "Продажа — новое имя" },
++      ],
++    });
++    vi.stubGlobal("fetch", renamedAmo.fetch);
++    const renamedValidationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const renamedValidation = (await renamedValidationResponse.json()) as {
++      data: { metadataChecksum: string };
++    };
++    const renamedActivationResponse = await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        candidate,
++        channelRules: INITIAL_CHANNEL_RULES,
++        metadataChecksum: renamedValidation.data.metadataChecksum,
++        expectedActiveConfigId: initialActivation.data.configId,
++        confirmNameChanges: true,
++      }),
++    );
++    const renamedActivation = (await renamedActivationResponse.json()) as {
++      data: { configId: string };
++    };
++
++    const revertedAmo = new AmoDiscoveryMock();
++    vi.stubGlobal("fetch", revertedAmo.fetch);
++    const revertedValidationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const revertedValidation = (await revertedValidationResponse.json()) as {
++      data: {
++        valid: boolean;
++        metadataChecksum: string;
++        requiresNameConfirmation: boolean;
++        warnings: string[];
++      };
++    };
++
++    expect(revertedValidationResponse.status).toBe(200);
++    expect(revertedValidation.data).toMatchObject({
++      valid: true,
++      requiresNameConfirmation: true,
++      warnings: [
++        "pipeline_name_changed",
++        "application_status_name_changed",
++        "won_status_name_changed",
++      ],
++    });
++
++    const reversalBody = {
++      candidate,
++      channelRules: INITIAL_CHANNEL_RULES,
++      metadataChecksum: revertedValidation.data.metadataChecksum,
++      expectedActiveConfigId: renamedActivation.data.configId,
++    };
++    const unconfirmed = await activateRoute(
++      sameOriginPost("/api/config/activate", reversalBody),
++    );
++    expect(unconfirmed.status).toBe(422);
++
++    const confirmed = await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        ...reversalBody,
++        confirmNameChanges: true,
++      }),
++    );
++    const confirmedBody = (await confirmed.json()) as {
++      data: { version: number };
++    };
++    expect(confirmed.status).toBe(200);
++    expect(confirmedBody.data.version).toBe(3);
++    await expect(
++      adminDb<{
++        version: number;
++        pipeline_name: string;
++        application_status_name: string;
++        won_status_name: string;
++        is_active: boolean;
++      }[]>`
++        select version, pipeline_name, application_status_name,
++          won_status_name, is_active
++        from public.pipeline_configs
++        order by version
++      `,
++    ).resolves.toEqual([
++      {
++        version: 1,
++        pipeline_name: "РЕАЛ ДВА",
++        application_status_name: "Завершение (самовывоз или доставка)",
++        won_status_name: "Успешно реализовано",
++        is_active: false,
++      },
++      {
++        version: 2,
++        pipeline_name: "РЕАЛ ДВА — новое имя",
++        application_status_name: "Завершение — новое имя",
++        won_status_name: "Продажа — новое имя",
++        is_active: false,
++      },
++      {
++        version: 3,
++        pipeline_name: "РЕАЛ ДВА",
++        application_status_name: "Завершение (самовывоз или доставка)",
++        won_status_name: "Успешно реализовано",
++        is_active: true,
++      },
++    ]);
++  });
++
+   it("activates editable exact source-field, tag, and integration mappings", async () => {
+     const amo = new AmoDiscoveryMock();
+     vi.stubGlobal("fetch", amo.fetch);
+     const validationResponse = await validateRoute(
+       sameOriginPost("/api/config/validate", candidate),
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { metadataChecksum: string };
+     };
+     const editableRules = [
+diff --git a/packages/domain/src/amo/config.test.ts b/packages/domain/src/amo/config.test.ts
+index b15609a..efdb70e 100644
+--- a/packages/domain/src/amo/config.test.ts
++++ b/packages/domain/src/amo/config.test.ts
+@@ -152,20 +152,61 @@ describe("validatePipelineConfig", () => {
+         "won_status_name_changed",
+       ],
+       resolved: {
+         pipelineName: "РЕАЛ ДВА — новое имя",
+         applicationStatusName: "Завершение — новое имя",
+         wonStatusName: "Продажа — новое имя",
+       },
+     });
+   });
+ 
++  it("warns when previously confirmed renamed IDs return to the canonical names", () => {
++    const canonical = validatePipelineConfig(candidate, fixtureDiscovery());
++    if (!canonical.valid) throw new Error("fixture must validate");
++    const renamed = validatePipelineConfig(
++      candidate,
++      fixtureDiscovery({
++        pipelines: [
++          {
++            id: candidate.pipelineId,
++            name: "РЕАЛ ДВА — новое имя",
++            statuses: [
++              { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
++              { id: candidate.wonStatusId, name: "Продажа — новое имя" },
++            ],
++          },
++        ],
++      }),
++      { activeConfig: canonical.resolved },
++    );
++    if (!renamed.valid) throw new Error("same-ID rename must validate with warnings");
++
++    expect(
++      validatePipelineConfig(candidate, fixtureDiscovery(), {
++        activeConfig: renamed.resolved,
++      }),
++    ).toMatchObject({
++      valid: true,
++      requiresNameConfirmation: true,
++      warnings: [
++        "pipeline_name_changed",
++        "application_status_name_changed",
++        "won_status_name_changed",
++      ],
++      resolved: {
++        pipelineName: "РЕАЛ ДВА",
++        applicationStatusName: "Завершение (самовывоз или доставка)",
++        wonStatusName: "Успешно реализовано",
++      },
++    });
++  });
++
+   it.each([
+     [
+       "pipeline",
+       fixtureDiscovery({
+         pipelines: [
+           ...fixtureDiscovery().pipelines,
+           { id: 10_243_278, name: "Conflicting duplicate", statuses: [] },
+         ],
+       }),
+     ],
+diff --git a/packages/domain/src/amo/config.ts b/packages/domain/src/amo/config.ts
+index 5a8e156..50c3dc6 100644
+--- a/packages/domain/src/amo/config.ts
++++ b/packages/domain/src/amo/config.ts
+@@ -219,58 +219,58 @@ export function validatePipelineConfig(
+   const metadataChecksum = checksumAmoConfigDiscovery(parsedDiscovery);
+   const reasons: string[] = [];
+   const warnings: PipelineConfigWarning[] = [];
+   const activeConfig = context.activeConfig ?? null;
+   const pipeline = parsedDiscovery.pipelines.find(
+     (item) => item.id === parsedCandidate.pipelineId,
+   );
+ 
+   if (!pipeline) {
+     reasons.push("pipeline_not_confirmed");
+-  } else if (pipeline.name !== EXPECTED_PIPELINE_NAME) {
+-    if (activeConfig?.pipelineId !== pipeline.id) {
+-      reasons.push("pipeline_not_confirmed");
+-    } else if (activeConfig.pipelineName !== pipeline.name) {
++  } else if (activeConfig?.pipelineId === pipeline.id) {
++    if (activeConfig.pipelineName !== pipeline.name) {
+       warnings.push("pipeline_name_changed");
+     }
++  } else if (pipeline.name !== EXPECTED_PIPELINE_NAME) {
++    reasons.push("pipeline_not_confirmed");
+   }
+ 
+   const applicationStatus = pipeline?.statuses.find(
+     (item) => item.id === parsedCandidate.applicationStatusId,
+   );
+   if (!applicationStatus) {
+     reasons.push("application_status_not_confirmed");
+-  } else if (applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME) {
+-    if (
+-      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
+-      activeConfig.applicationStatusId !== applicationStatus.id
+-    ) {
+-      reasons.push("application_status_not_confirmed");
+-    } else if (activeConfig.applicationStatusName !== applicationStatus.name) {
++  } else if (
++    activeConfig?.pipelineId === parsedCandidate.pipelineId &&
++    activeConfig.applicationStatusId === applicationStatus.id
++  ) {
++    if (activeConfig.applicationStatusName !== applicationStatus.name) {
+       warnings.push("application_status_name_changed");
+     }
++  } else if (applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME) {
++    reasons.push("application_status_not_confirmed");
+   }
+ 
+   const wonStatus = pipeline?.statuses.find(
+     (item) => item.id === parsedCandidate.wonStatusId,
+   );
+   if (!wonStatus) {
+     reasons.push("won_status_not_confirmed");
+-  } else if (wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
+-    if (
+-      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
+-      activeConfig.wonStatusId !== wonStatus.id
+-    ) {
+-      reasons.push("won_status_not_confirmed");
+-    } else if (activeConfig.wonStatusName !== wonStatus.name) {
++  } else if (
++    activeConfig?.pipelineId === parsedCandidate.pipelineId &&
++    activeConfig.wonStatusId === wonStatus.id
++  ) {
++    if (activeConfig.wonStatusName !== wonStatus.name) {
+       warnings.push("won_status_name_changed");
+     }
++  } else if (wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
++    reasons.push("won_status_not_confirmed");
+   }
+ 
+   if (parsedCandidate.applicationStatusId === parsedCandidate.wonStatusId) {
+     reasons.push("application_and_won_must_differ");
+   }
+ 
+   const requestedFieldId = parsedCandidate.channelFieldId ?? null;
+   const channelField = requestedFieldId
+     ? parsedDiscovery.leadCustomFields.find((item) => item.id === requestedFieldId)
+     : null;

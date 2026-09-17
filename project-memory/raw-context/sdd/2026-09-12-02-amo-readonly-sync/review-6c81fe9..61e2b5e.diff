@@ -1,0 +1,2250 @@
+# Review package: 6c81fe95dcacde993b9c30ee10bcca26cd4cad4a..HEAD
+
+## Commits
+61e2b5e fix: harden pipeline configuration activation
+
+## Files changed
+ .../task-4-report.md                               | 101 ++++++
+ apps/web/src/app/api/config/activate/route.ts      |  28 +-
+ .../src/app/api/config/config.integration.test.ts  | 240 ++++++++++++-
+ apps/web/src/app/api/config/validate/route.ts      |  26 +-
+ apps/web/src/app/globals.css                       |  21 ++
+ apps/web/src/app/quality/config/page.tsx           |  19 +-
+ apps/web/src/app/settings/channels/page.tsx        |  60 ++--
+ .../src/components/channel-rules-manager.test.tsx  | 100 ++++++
+ apps/web/src/components/channel-rules-manager.tsx  | 383 +++++++++++++++++++++
+ .../web/src/components/pipeline-config-manager.tsx |  94 ++++-
+ apps/web/src/lib/amo/config-discovery.ts           |  11 +-
+ apps/web/src/lib/amo/config-public.ts              |   2 +
+ packages/db/src/amo-config.ts                      |  13 +-
+ packages/domain/src/amo/config.test.ts             |  79 +++++
+ packages/domain/src/amo/config.ts                  | 106 +++++-
+ 15 files changed, 1198 insertions(+), 85 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md
+index e58f22c..595a1c9 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md
+@@ -82,10 +82,111 @@ pnpm lint
+ pnpm typecheck
+ pnpm build
+ pnpm check:secrets
+ ```
+ 
+ ## Concerns / follow-up boundary
+ 
+ - `GET /api/config/channel-values` truthfully returns an empty list until Task 4+ raw/sync storage exists; the channel screen communicates this empty state. It does not fabricate counts from catalog defaults.
+ - A live `/quality/config` comparison requires an active server-side amoCRM connection. If metadata is unavailable, the screen falls back to the stored safe projection and explicitly reports the live check as unavailable.
+ - No production ID has been activated. First activation remains blocked until the named pipeline/statuses and optional source field are confirmed by the guarded API discovery flow.
++
++## Fix round 1
++
++### Summary
++
++- Bound every activation request to `expectedActiveConfigId` and compare that value with the active row while holding the connection advisory lock and configuration row locks. Concurrent or stale requests that validated the same checksum can no longer both create versions; the loser receives `E_CONFLICT` / HTTP 409.
++- Added an ID-preserving metadata rename path. Initial setup still requires `РЕАЛ ДВА`, `Завершение (самовывоз или доставка)`, and `Успешно реализовано`. After those IDs have been confirmed, a changed live name produces explicit warning codes and `requiresNameConfirmation`; activation stores the new names only when the admin submits `confirmNameChanges: true`.
++- Replaced the static channel-rule table with an admin editor for exact source-field, tag, and integration-source rules. It edits priority, exact value, and normalized channel; rejects empty values, duplicate exact keys, duplicate priorities, and source-order inversions before submission; revalidates live metadata; and activates a new immutable version with the edited payload.
++- Preserved customized rules when a later pipeline version is activated from the pipeline screen instead of resetting to catalog defaults. Both settings screens update their expected active ID after success.
++- Rejected duplicate pipeline IDs, duplicate status IDs within a pipeline, and duplicate lead-custom-field IDs at the aggregate discovery schema boundary, including identical and conflicting duplicates. Guarded discovery now parses the aggregate before returning it, eliminating response-order-dependent `.find()` behavior.
++- Updated the read-only quality page to evaluate live metadata against the active confirmed names, so a pending rename is displayed as drift while an already-confirmed renamed version no longer remains permanently invalid.
++
++### Files changed
++
++- `packages/domain/src/amo/config.ts`
++- `packages/domain/src/amo/config.test.ts`
++- `packages/db/src/amo-config.ts`
++- `apps/web/src/lib/amo/config-discovery.ts`
++- `apps/web/src/lib/amo/config-public.ts`
++- `apps/web/src/app/api/config/validate/route.ts`
++- `apps/web/src/app/api/config/activate/route.ts`
++- `apps/web/src/app/api/config/config.integration.test.ts`
++- `apps/web/src/components/pipeline-config-manager.tsx`
++- `apps/web/src/components/channel-rules-manager.tsx`
++- `apps/web/src/components/channel-rules-manager.test.tsx`
++- `apps/web/src/app/settings/channels/page.tsx`
++- `apps/web/src/app/quality/config/page.tsx`
++- `apps/web/src/app/globals.css`
++- `.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-4-report.md`
++
++### Covering tests
++
++- `packages/domain/src/amo/config.test.ts`: initial-name enforcement, same-ID rename warnings, resolved renamed names, and duplicate pipeline/status/custom-field rejection.
++- `apps/web/src/app/api/config/config.integration.test.ts`: aggregate duplicate-discovery rejection; concurrent same-checksum activation with exactly one 200 and one 409; validate/activate rename warning and explicit confirmation; immutable storage of renamed names; activation of edited exact source-field/tag/integration rules; rollback and stale-checksum behavior.
++- `apps/web/src/components/channel-rules-manager.test.tsx`: editable controls for all three exact evidence sources, expected-active-ID payload binding, and duplicate/priority/order client validation.
++- `tests/security/rls.security.test.ts` and `tests/security/log-redaction.security.test.ts`: unchanged RLS/default-deny and safe-log guarantees after the new public config ID and activation contract.
++
++### RED evidence
++
++1. `node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts --project unit` — 4 failed / 8 passed: same-ID rename stayed invalid and duplicate pipeline/status/custom-field IDs were accepted.
++2. `node "$REAL2_PNPM" exec vitest run apps/web/src/components/channel-rules-manager.test.tsx --project unit` — suite failed because the editable channel-rule component and payload helpers did not exist.
++3. `node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration` — 9 failed / 4 passed before production wiring: duplicate discovery returned 200, activation did not accept the state binding, rename validation stayed invalid, and the editable three-source payload could not activate.
++4. The first affected lint run reported one unused editor destructuring binding; it was removed before final verification.
++
++### GREEN evidence and exact commands
++
++Every package-manager invocation used:
++
++```text
++export PATH=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/node/bin:$PATH
++REAL2_PNPM=/Users/arlandorizzi/.npm/_npx/d8d805b81e5239f8/node_modules/pnpm/bin/pnpm.cjs
++```
++
++Fresh database and focused regressions:
++
++```text
++node "$REAL2_PNPM" exec supabase db reset
++node "$REAL2_PNPM" exec vitest run packages/domain/src/amo/config.test.ts apps/web/src/components/channel-rules-manager.test.tsx --project unit --silent
++node "$REAL2_PNPM" exec vitest run apps/web/src/app/api/config/config.integration.test.ts --project integration --silent
++```
++
++Relevant output:
++
++- Node `v22.23.2`; Supabase reset successfully reapplied migrations `0001` through `0004` on the local PostgreSQL 17 stack.
++- Focused unit: 2 files passed, 15 tests passed.
++- Focused config integration: 1 file passed, 13 tests passed.
++
++Full affected verification:
++
++```text
++node "$REAL2_PNPM" test
++node "$REAL2_PNPM" exec vitest run --project integration --silent
++node "$REAL2_PNPM" exec vitest run --project security --silent
++node "$REAL2_PNPM" lint
++node "$REAL2_PNPM" typecheck
++node "$REAL2_PNPM" build
++node "$REAL2_PNPM" check:secrets
++git diff --check
++```
++
++Relevant output:
++
++- Repository/worker checks: 12/12 passed; Vitest unit: 75/75 passed across 13 files.
++- Full integration: 43/43 passed across 5 files.
++- Security: 15/15 passed across RLS and log-redaction suites.
++- All six workspace package lint and typecheck tasks passed; scripts typecheck passed.
++- All packages and the Next.js production application built successfully; all 17 pages were generated and the config/settings/quality routes were present.
++- Tracked-secret scan and whitespace check exited 0.
++
++### Self-review
++
++- The stale-state comparison occurs after the transaction advisory lock and after locking every configuration row for the connection. A `Promise.all` route regression produced `[200, 409]` and exactly one version, demonstrating that a shared fresh checksum is insufficient without the one-use active-state binding.
++- Name drift is allowed only when the relevant pipeline/status ID belongs to the active confirmed selection. A different or initially unconfirmed ID with a non-required name remains `E_CONFIG_INCOMPLETE`. Confirmation is checked after a fresh discovery/checksum comparison and before any write.
++- Edited channel rules remain server-authoritative: Zod constrains exact match types/channels, domain validation enforces catalog defaults/duplicates/priorities/source order, SQL independently enforces unique keys/priorities, and the transaction inserts an immutable new version.
++- The current configuration UUID is intentionally exposed only as a safe optimistic-concurrency token; connection IDs, actor IDs, credentials, ciphertext, and private validation details remain excluded.
++- Activation still inserts only a queued recalculation request and does not touch the current snapshot. Both external switches remain false.
++
++### Concerns / follow-up boundary
++
++- Encountered channel values and counts remain truthfully empty. `/api/config/channel-values` still returns no fabricated aggregate because the immutable raw table is not available until Task 5.
++- No production ID, live amoCRM credential, real network call, Google API, or protected original Sheet was used. All amended integration evidence is synthetic and local.
+diff --git a/apps/web/src/app/api/config/activate/route.ts b/apps/web/src/app/api/config/activate/route.ts
+index cd508b1..2be8b42 100644
+--- a/apps/web/src/app/api/config/activate/route.ts
++++ b/apps/web/src/app/api/config/activate/route.ts
+@@ -1,52 +1,72 @@
+ import {
+   channelRuleCandidateSchema,
+   pipelineConfigCandidateSchema,
+   validatePipelineConfig,
+   AppError,
+ } from "@real2/domain";
+ import {
+   activatePipelineConfig,
++  getActivePipelineConfig,
+   getCurrentSafeAmoConnectionStatus,
+ } from "@real2/db";
+ import { z } from "zod";
+ 
+ import { requireRole } from "../../../../lib/auth/authorization";
+ import { requireUser } from "../../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../../lib/http-security";
+ import { readJson, withRoute } from "../../../../lib/http/route";
+ import { getDatabase, getServerEnv } from "../../../../lib/server/runtime";
+ import { discoverAmoConfigMetadata } from "../../../../lib/amo/config-discovery";
+ import { toPublicPipelineConfig } from "../../../../lib/amo/config-public";
+ 
+ const activationSchema = z.strictObject({
+   candidate: pipelineConfigCandidateSchema,
+   channelRules: z.array(channelRuleCandidateSchema).min(1),
+   metadataChecksum: z.string().regex(/^[a-f0-9]{64}$/),
++  expectedActiveConfigId: z.string().uuid().nullable(),
++  confirmNameChanges: z.boolean().optional().default(false),
+ });
+ 
+ export const POST = withRoute(async (request, context) => {
+   requireSameOrigin(request);
+   const admin = requireRole(await requireUser(), ["admin"]);
+   const input = activationSchema.parse(await readJson(request));
+   const db = getDatabase();
+   const discovery = await discoverAmoConfigMetadata(db, getServerEnv(), context.traceId);
+-  const validation = validatePipelineConfig(input.candidate, discovery);
++  const connection = await getCurrentSafeAmoConnectionStatus(db);
++  if (!connection || connection.status !== "active") {
++    throw new AppError("E_CONFIG_INCOMPLETE", 422);
++  }
++  const activeConfig = await getActivePipelineConfig(db, connection.id);
++  const validation = validatePipelineConfig(input.candidate, discovery, {
++    activeConfig: activeConfig
++      ? {
++          pipelineId: activeConfig.pipelineId,
++          pipelineName: activeConfig.pipelineName,
++          applicationStatusId: activeConfig.applicationStatusId,
++          applicationStatusName: activeConfig.applicationStatusName,
++          wonStatusId: activeConfig.wonStatusId,
++          wonStatusName: activeConfig.wonStatusName,
++          channelFieldId: activeConfig.sourceFieldId,
++          channelFieldName: null,
++        }
++      : null,
++  });
+   if (!validation.valid) throw new AppError("E_CONFIG_INCOMPLETE", 422);
+   if (validation.metadataChecksum !== input.metadataChecksum) {
+     throw new AppError("E_CONFLICT", 409);
+   }
+-
+-  const connection = await getCurrentSafeAmoConnectionStatus(db);
+-  if (!connection || connection.status !== "active") {
++  if (validation.requiresNameConfirmation && !input.confirmNameChanges) {
+     throw new AppError("E_CONFIG_INCOMPLETE", 422);
+   }
+ 
+   const config = await activatePipelineConfig(db, {
+     amoConnectionId: connection.id,
++    expectedActiveConfigId: input.expectedActiveConfigId,
+     candidate: validation.resolved,
+     channelRules: input.channelRules,
+     metadataChecksum: validation.metadataChecksum,
+     actorId: admin.id,
+   });
+   return { ...toPublicPipelineConfig(config), recalculationQueued: true };
+ });
+diff --git a/apps/web/src/app/api/config/config.integration.test.ts b/apps/web/src/app/api/config/config.integration.test.ts
+index 45a2bce..8ab1ce4 100644
+--- a/apps/web/src/app/api/config/config.integration.test.ts
++++ b/apps/web/src/app/api/config/config.integration.test.ts
+@@ -59,42 +59,58 @@ vi.mock("../../../lib/server/runtime", () => ({
+ const candidate = {
+   pipelineId: 10_243_278,
+   applicationStatusId: 11,
+   wonStatusId: 99,
+   channelFieldId: 77,
+ };
+ 
+ class AmoDiscoveryMock {
+   readonly requests: Array<{ url: string; init: RequestInit }> = [];
+ 
++  constructor(
++    private readonly metadata: Readonly<{
++      pipelines?: readonly Readonly<{ id: number; name: string }>[];
++      statuses?: readonly Readonly<{ id: number; name: string }>[];
++      customFields?: readonly Readonly<{ id: number; name: string }>[];
++    }> = {},
++  ) {}
++
+   readonly fetch = vi.fn(async (input: string | URL, init: RequestInit) => {
+     this.requests.push({ url: String(input), init });
+     const url = new URL(String(input));
+ 
+     if (url.pathname === "/api/v4/leads/pipelines") {
+       return Response.json({
+-        _embedded: { pipelines: [{ id: 10_243_278, name: "РЕАЛ ДВА" }] },
++        _embedded: {
++          pipelines: this.metadata.pipelines ?? [
++            { id: 10_243_278, name: "РЕАЛ ДВА" },
++          ],
++        },
+       });
+     }
+     if (url.pathname === "/api/v4/leads/pipelines/10243278/statuses") {
+       return Response.json({
+         _embedded: {
+-          statuses: [
++          statuses: this.metadata.statuses ?? [
+             { id: 11, name: "Завершение (самовывоз или доставка)" },
+             { id: 99, name: "Успешно реализовано" },
+           ],
+         },
+       });
+     }
+     if (url.pathname === "/api/v4/leads/custom_fields") {
+       return Response.json({
+-        _embedded: { custom_fields: [{ id: 77, name: "Источник сделки" }] },
++        _embedded: {
++          custom_fields: this.metadata.customFields ?? [
++            { id: 77, name: "Источник сделки" },
++          ],
++        },
+       });
+     }
+     if (url.pathname === "/api/v4/users") {
+       return Response.json({
+         _embedded: { users: [{ id: 501, name: "Synthetic User" }] },
+       });
+     }
+     throw new Error(`Unexpected synthetic amoCRM path: ${url.pathname}`);
+   });
+ }
+@@ -262,20 +278,36 @@ describe("pipeline configuration routes", () => {
+         ["/api/v4/leads/custom_fields", "GET"],
+         ["/api/v4/users", "GET"],
+       ]),
+     );
+     expect(amo.requests).toHaveLength(4);
+     expect(JSON.stringify(body)).not.toMatch(
+       /synthetic-config-token|synthetic-config-refresh|ciphertext|authorization/i,
+     );
+   });
+ 
++  it("rejects duplicate discovery IDs before exposing order-dependent metadata", async () => {
++    const amo = new AmoDiscoveryMock({
++      pipelines: [
++        { id: 10_243_278, name: "РЕАЛ ДВА" },
++        { id: 10_243_278, name: "Conflicting duplicate" },
++      ],
++    });
++    vi.stubGlobal("fetch", amo.fetch);
++
++    const response = await discoveryRoute(
++      new Request("https://dashboard.example.test/api/config/discovery"),
++    );
++
++    expect(response.status).toBe(422);
++  });
++
+   it("requires API-confirmed IDs and names before accepting a candidate", async () => {
+     const amo = new AmoDiscoveryMock();
+     vi.stubGlobal("fetch", amo.fetch);
+ 
+     const response = await validateRoute(
+       sameOriginPost("/api/config/validate", {
+         ...candidate,
+         applicationStatusId: 404,
+       }),
+     );
+@@ -298,62 +330,254 @@ describe("pipeline configuration routes", () => {
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { valid: boolean; metadataChecksum: string };
+     };
+ 
+     const activationResponse = await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
+       }),
+     );
+     const activation = (await activationResponse.json()) as {
+       data: { version: number; recalculationQueued: boolean };
+     };
+ 
+     expect(activationResponse.status).toBe(200);
+     expect(activation.data).toMatchObject({ version: 1, recalculationQueued: true });
+     await expect(
+       adminDb<{ version: number; is_active: boolean }[]>`
+         select version, is_active from public.pipeline_configs order by version
+       `,
+     ).resolves.toEqual([{ version: 1, is_active: true }]);
+     await expect(
+       adminDb<{ status: string }[]>`
+         select status from public.config_recalculation_requests
+       `,
+     ).resolves.toEqual([{ status: "queued" }]);
+   });
+ 
++  it("lets only one concurrent activation consume the same expected active state", async () => {
++    const amo = new AmoDiscoveryMock();
++    vi.stubGlobal("fetch", amo.fetch);
++    const validationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const validation = (await validationResponse.json()) as {
++      data: { metadataChecksum: string };
++    };
++    const requestBody = {
++      candidate,
++      channelRules: INITIAL_CHANNEL_RULES,
++      metadataChecksum: validation.data.metadataChecksum,
++      expectedActiveConfigId: null,
++    };
++
++    const responses = await Promise.all([
++      activateRoute(sameOriginPost("/api/config/activate", requestBody)),
++      activateRoute(sameOriginPost("/api/config/activate", requestBody)),
++    ]);
++
++    expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
++    await expect(
++      adminDb<{ version: number; is_active: boolean }[]>`
++        select version, is_active from public.pipeline_configs order by version
++      `,
++    ).resolves.toEqual([{ version: 1, is_active: true }]);
++  });
++
++  it("warns on same-ID renames and requires explicit confirmation before storing them", async () => {
++    const originalAmo = new AmoDiscoveryMock();
++    vi.stubGlobal("fetch", originalAmo.fetch);
++    const initialValidationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const initialValidation = (await initialValidationResponse.json()) as {
++      data: { metadataChecksum: string };
++    };
++    const initialActivation = await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        candidate,
++        channelRules: INITIAL_CHANNEL_RULES,
++        metadataChecksum: initialValidation.data.metadataChecksum,
++        expectedActiveConfigId: null,
++      }),
++    );
++    const initial = (await initialActivation.json()) as {
++      data: { configId: string };
++    };
++
++    const renamedAmo = new AmoDiscoveryMock({
++      pipelines: [{ id: candidate.pipelineId, name: "РЕАЛ ДВА — новое имя" }],
++      statuses: [
++        { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
++        { id: candidate.wonStatusId, name: "Продажа — новое имя" },
++      ],
++    });
++    vi.stubGlobal("fetch", renamedAmo.fetch);
++    const renamedValidationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const renamedValidation = (await renamedValidationResponse.json()) as {
++      data: {
++        valid: boolean;
++        metadataChecksum: string;
++        requiresNameConfirmation: boolean;
++        warnings: string[];
++      };
++    };
++
++    expect(renamedValidationResponse.status).toBe(200);
++    expect(renamedValidation.data).toMatchObject({
++      valid: true,
++      requiresNameConfirmation: true,
++      warnings: [
++        "pipeline_name_changed",
++        "application_status_name_changed",
++        "won_status_name_changed",
++      ],
++    });
++
++    const activationBody = {
++      candidate,
++      channelRules: INITIAL_CHANNEL_RULES,
++      metadataChecksum: renamedValidation.data.metadataChecksum,
++      expectedActiveConfigId: initial.data.configId,
++    };
++    const unconfirmed = await activateRoute(
++      sameOriginPost("/api/config/activate", activationBody),
++    );
++    expect(unconfirmed.status).toBe(422);
++
++    const confirmed = await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        ...activationBody,
++        confirmNameChanges: true,
++      }),
++    );
++    expect(confirmed.status).toBe(200);
++    await expect(
++      adminDb<{
++        version: number;
++        pipeline_name: string;
++        application_status_name: string;
++        won_status_name: string;
++        is_active: boolean;
++      }[]>`
++        select version, pipeline_name, application_status_name,
++          won_status_name, is_active
++        from public.pipeline_configs
++        order by version
++      `,
++    ).resolves.toEqual([
++      {
++        version: 1,
++        pipeline_name: "РЕАЛ ДВА",
++        application_status_name: "Завершение (самовывоз или доставка)",
++        won_status_name: "Успешно реализовано",
++        is_active: false,
++      },
++      {
++        version: 2,
++        pipeline_name: "РЕАЛ ДВА — новое имя",
++        application_status_name: "Завершение — новое имя",
++        won_status_name: "Продажа — новое имя",
++        is_active: true,
++      },
++    ]);
++  });
++
++  it("activates editable exact source-field, tag, and integration mappings", async () => {
++    const amo = new AmoDiscoveryMock();
++    vi.stubGlobal("fetch", amo.fetch);
++    const validationResponse = await validateRoute(
++      sameOriginPost("/api/config/validate", candidate),
++    );
++    const validation = (await validationResponse.json()) as {
++      data: { metadataChecksum: string };
++    };
++    const editableRules = [
++      ...INITIAL_CHANNEL_RULES,
++      {
++        priority: INITIAL_CHANNEL_RULES.length + 1,
++        matchType: "source_field_exact" as const,
++        matchValue: "Synthetic source",
++        normalizedChannel: "unknown" as const,
++      },
++      {
++        priority: INITIAL_CHANNEL_RULES.length + 2,
++        matchType: "tag_exact" as const,
++        matchValue: "Synthetic tag",
++        normalizedChannel: "telegram" as const,
++      },
++      {
++        priority: INITIAL_CHANNEL_RULES.length + 3,
++        matchType: "integration_source_exact" as const,
++        matchValue: "Synthetic integration",
++        normalizedChannel: "whatsapp" as const,
++      },
++    ];
++
++    const response = await activateRoute(
++      sameOriginPost("/api/config/activate", {
++        candidate,
++        channelRules: editableRules,
++        metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
++      }),
++    );
++
++    expect(response.status).toBe(200);
++    await expect(
++      adminDb<{ match_type: string; match_value: string }[]>`
++        select match_type, match_value
++        from public.channel_rules
++        where match_value like 'Synthetic %'
++        order by priority
++      `,
++    ).resolves.toEqual([
++      { match_type: "source_field_exact", match_value: "Synthetic source" },
++      { match_type: "tag_exact", match_value: "Synthetic tag" },
++      {
++        match_type: "integration_source_exact",
++        match_value: "Synthetic integration",
++      },
++    ]);
++  });
++
+   it("leaves the prior active version intact when activation has a stale checksum", async () => {
+     const amo = new AmoDiscoveryMock();
+     vi.stubGlobal("fetch", amo.fetch);
+     const validationResponse = await validateRoute(
+       sameOriginPost("/api/config/validate", candidate),
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { metadataChecksum: string };
+     };
+-    await activateRoute(
++    const firstActivation = await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
+       }),
+     );
++    const first = (await firstActivation.json()) as { data: { configId: string } };
+ 
+     const rejected = await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: "0".repeat(64),
++        expectedActiveConfigId: first.data.configId,
+       }),
+     );
+ 
+     expect(rejected.status).toBe(409);
+     await expect(
+       adminDb<{ version: number; is_active: boolean }[]>`
+         select version, is_active from public.pipeline_configs order by version
+       `,
+     ).resolves.toEqual([{ version: 1, is_active: true }]);
+   });
+@@ -372,20 +596,21 @@ describe("pipeline configuration routes", () => {
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { metadataChecksum: string };
+     };
+ 
+     const activation = await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate: noSourceFieldCandidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
+       }),
+     );
+ 
+     expect(activation.status).toBe(200);
+     await expect(
+       adminDb<{ is_active: boolean }[]>`
+         select is_active
+         from public.channel_rules
+         order by priority
+       `,
+@@ -396,34 +621,37 @@ describe("pipeline configuration routes", () => {
+ 
+   it("rolls back deactivation when a database write fails inside activation", async () => {
+     const amo = new AmoDiscoveryMock();
+     vi.stubGlobal("fetch", amo.fetch);
+     const validationResponse = await validateRoute(
+       sameOriginPost("/api/config/validate", candidate),
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { metadataChecksum: string };
+     };
+-    await activateRoute(
++    const firstActivation = await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
+       }),
+     );
++    const first = (await firstActivation.json()) as { data: { configId: string } };
+ 
+     session.user.id = "10000000-0000-4000-8000-000000000099";
+     const rejected = await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: first.data.configId,
+       }),
+     );
+ 
+     expect(rejected.status).toBe(409);
+     await expect(
+       adminDb<{ version: number; is_active: boolean }[]>`
+         select version, is_active from public.pipeline_configs order by version
+       `,
+     ).resolves.toEqual([{ version: 1, is_active: true }]);
+   });
+@@ -435,20 +663,21 @@ describe("pipeline configuration routes", () => {
+       sameOriginPost("/api/config/validate", candidate),
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { metadataChecksum: string };
+     };
+     await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
+       }),
+     );
+ 
+     await expect(
+       adminDb`
+         update public.pipeline_configs
+         set pipeline_name = 'Tampered Pipeline'
+         where version = 1
+       `,
+     ).rejects.toMatchObject({ code: "P0001" });
+@@ -467,20 +696,21 @@ describe("pipeline configuration routes", () => {
+       sameOriginPost("/api/config/validate", candidate),
+     );
+     const validation = (await validationResponse.json()) as {
+       data: { metadataChecksum: string };
+     };
+     await activateRoute(
+       sameOriginPost("/api/config/activate", {
+         candidate,
+         channelRules: INITIAL_CHANNEL_RULES,
+         metadataChecksum: validation.data.metadataChecksum,
++        expectedActiveConfigId: null,
+       }),
+     );
+     session.user.role = "head";
+ 
+     const current = await currentRoute(
+       new Request("https://dashboard.example.test/api/config/current"),
+     );
+     const discovery = await discoveryRoute(
+       new Request("https://dashboard.example.test/api/config/discovery"),
+     );
+diff --git a/apps/web/src/app/api/config/validate/route.ts b/apps/web/src/app/api/config/validate/route.ts
+index 920b40c..4af285a 100644
+--- a/apps/web/src/app/api/config/validate/route.ts
++++ b/apps/web/src/app/api/config/validate/route.ts
+@@ -1,23 +1,45 @@
++import {
++  getActivePipelineConfig,
++  getCurrentSafeAmoConnectionStatus,
++} from "@real2/db";
+ import {
+   pipelineConfigCandidateSchema,
+   validatePipelineConfig,
+ } from "@real2/domain";
+ 
+ import { requireRole } from "../../../../lib/auth/authorization";
+ import { requireUser } from "../../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../../lib/http-security";
+ import { readJson, withRoute } from "../../../../lib/http/route";
+ import { getDatabase, getServerEnv } from "../../../../lib/server/runtime";
+ import { discoverAmoConfigMetadata } from "../../../../lib/amo/config-discovery";
+ 
+ export const POST = withRoute(async (request, context) => {
+   requireSameOrigin(request);
+   requireRole(await requireUser(), ["admin"]);
+   const candidate = pipelineConfigCandidateSchema.parse(await readJson(request));
++  const db = getDatabase();
+   const discovery = await discoverAmoConfigMetadata(
+-    getDatabase(),
++    db,
+     getServerEnv(),
+     context.traceId,
+   );
+-  return validatePipelineConfig(candidate, discovery);
++  const connection = await getCurrentSafeAmoConnectionStatus(db);
++  const activeConfig = connection
++    ? await getActivePipelineConfig(db, connection.id)
++    : null;
++  return validatePipelineConfig(candidate, discovery, {
++    activeConfig: activeConfig
++      ? {
++          pipelineId: activeConfig.pipelineId,
++          pipelineName: activeConfig.pipelineName,
++          applicationStatusId: activeConfig.applicationStatusId,
++          applicationStatusName: activeConfig.applicationStatusName,
++          wonStatusId: activeConfig.wonStatusId,
++          wonStatusName: activeConfig.wonStatusName,
++          channelFieldId: activeConfig.sourceFieldId,
++          channelFieldName: null,
++        }
++      : null,
++  });
+ });
+diff --git a/apps/web/src/app/globals.css b/apps/web/src/app/globals.css
+index c54ed8f..71962dc 100644
+--- a/apps/web/src/app/globals.css
++++ b/apps/web/src/app/globals.css
+@@ -352,20 +352,41 @@ p {
+   border-bottom: 1px solid var(--border);
+   text-align: left;
+   vertical-align: top;
+ }
+ 
+ .config-table th {
+   color: var(--muted);
+   font-size: 0.82rem;
+ }
+ 
++.channel-rules-table input,
++.channel-rules-table select {
++  min-width: 120px;
++}
++
++.channel-rules-table input[type="text"] {
++  min-width: 240px;
++}
++
++.button-compact {
++  padding: 8px 10px;
++}
++
++.confirmation-field {
++  display: flex;
++  align-items: flex-start;
++  gap: 10px;
++  margin-top: 18px;
++  color: #ffe2a8;
++}
++
+ .quality-list {
+   display: grid;
+   grid-template-columns: repeat(2, minmax(0, 1fr));
+   gap: 12px;
+   margin: 0;
+ }
+ 
+ .quality-list div {
+   padding: 12px;
+   border: 1px solid var(--border);
+diff --git a/apps/web/src/app/quality/config/page.tsx b/apps/web/src/app/quality/config/page.tsx
+index 1314b67..81387e5 100644
+--- a/apps/web/src/app/quality/config/page.tsx
++++ b/apps/web/src/app/quality/config/page.tsx
+@@ -32,28 +32,41 @@ export default async function ConfigQualityPage() {
+     try {
+       const discovery = await discoverAmoConfigMetadata(db, getServerEnv(), ulid());
+       liveValidation = validatePipelineConfig(
+         {
+           pipelineId: config.pipelineId,
+           applicationStatusId: config.applicationStatusId,
+           wonStatusId: config.wonStatusId,
+           channelFieldId: config.sourceFieldId,
+         },
+         discovery,
++        {
++          activeConfig: {
++            pipelineId: config.pipelineId,
++            pipelineName: config.pipelineName,
++            applicationStatusId: config.applicationStatusId,
++            applicationStatusName: config.applicationStatusName,
++            wonStatusId: config.wonStatusId,
++            wonStatusName: config.wonStatusName,
++            channelFieldId: config.sourceFieldId,
++            channelFieldName: null,
++          },
++        },
+       );
+     } catch {
+       // The page remains a safe stored projection when live metadata is unavailable.
+     }
+   }
+   const liveReasons = liveValidation && !liveValidation.valid
+     ? liveValidation.reasons
+     : [];
++  const liveWarnings = liveValidation?.valid ? liveValidation.warnings : [];
+ 
+   return (
+     <AppShell user={user}>
+       <div className="page-heading">
+         <div>
+           <p className="eyebrow">Качество данных</p>
+           <h1>Конфигурация amoCRM</h1>
+           <p className="muted">Read-only контроль подтверждённых ID, имён и checksum.</p>
+         </div>
+         {config ? <span className="status-chip">версия {config.version}</span> : null}
+@@ -81,22 +94,22 @@ export default async function ConfigQualityPage() {
+               </div>
+               <span className={`status-chip${liveValidation?.valid && liveValidation.metadataChecksum === config.metadataChecksum ? "" : " inactive"}`}>
+                 {!liveValidation
+                   ? "недоступно"
+                   : liveValidation.valid && liveValidation.metadataChecksum === config.metadataChecksum
+                     ? "без изменений"
+                     : "обнаружен drift"}
+               </span>
+             </div>
+             <dl className="quality-list">
+-              <div><dt>Воронка</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("pipeline_not_confirmed")) : "не проверено"}</dd></div>
+-              <div><dt>Этап заявки</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("application_status_not_confirmed")) : "не проверено"}</dd></div>
+-              <div><dt>Успешный статус</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("won_status_not_confirmed")) : "не проверено"}</dd></div>
++              <div><dt>Воронка</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("pipeline_not_confirmed") && !liveWarnings.includes("pipeline_name_changed")) : "не проверено"}</dd></div>
++              <div><dt>Этап заявки</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("application_status_not_confirmed") && !liveWarnings.includes("application_status_name_changed")) : "не проверено"}</dd></div>
++              <div><dt>Успешный статус</dt><dd>{liveValidation ? validationLabel(!liveReasons.includes("won_status_not_confirmed") && !liveWarnings.includes("won_status_name_changed")) : "не проверено"}</dd></div>
+               <div><dt>Поле источника</dt><dd>{config.sourceFieldId === null ? "не используется" : liveValidation ? validationLabel(!liveReasons.includes("channel_field_not_confirmed")) : "не проверено"}</dd></div>
+               <div className="checksum-row"><dt>Checksum</dt><dd><code>{config.metadataChecksum}</code></dd></div>
+             </dl>
+           </section>
+         </div>
+       )}
+     </AppShell>
+   );
+ }
+diff --git a/apps/web/src/app/settings/channels/page.tsx b/apps/web/src/app/settings/channels/page.tsx
+index a89b4ab..5a33ac9 100644
+--- a/apps/web/src/app/settings/channels/page.tsx
++++ b/apps/web/src/app/settings/channels/page.tsx
+@@ -1,32 +1,22 @@
+ import { redirect } from "next/navigation";
+ 
+ import { getActivePipelineConfig, getCurrentSafeAmoConnectionStatus } from "@real2/db";
+ 
+ import { AppShell } from "../../../components/app-shell";
++import { ChannelRulesManager } from "../../../components/channel-rules-manager";
+ import { requireRole } from "../../../lib/auth/authorization";
+ import { requireUser } from "../../../lib/auth/require-user";
+ import { getDatabase } from "../../../lib/server/runtime";
+ 
+ export const dynamic = "force-dynamic";
+ 
+-const channelLabels: Record<string, string> = {
+-  phone_uis: "Телефон / UIS",
+-  whatsapp: "WhatsApp",
+-  avito: "Avito",
+-  instagram: "Instagram",
+-  site: "Сайт",
+-  telegram: "Telegram",
+-  max: "MAX",
+-  unknown: "Неизвестно",
+-};
+-
+ export default async function ChannelSettingsPage() {
+   let user;
+   try {
+     user = requireRole(await requireUser(), ["admin"]);
+   } catch {
+     redirect("/");
+   }
+ 
+   const db = getDatabase();
+   const connection = await getCurrentSafeAmoConnectionStatus(db);
+@@ -37,45 +27,45 @@ export default async function ChannelSettingsPage() {
+       <div className="page-heading">
+         <div>
+           <p className="eyebrow">Настройки</p>
+           <h1>Каналы</h1>
+           <p className="muted">
+             Только точные соответствия. Неподтверждённые и конфликтующие значения остаются unknown.
+           </p>
+         </div>
+         {config ? <span className="status-chip">версия {config.version}</span> : null}
+       </div>
+-      <section className="panel">
+-        <h2>Активные правила</h2>
+-        {!config ? (
++      {!config ? (
++        <section className="panel">
++          <h2>Активные правила</h2>
+           <p className="muted">Сначала активируйте конфигурацию воронки.</p>
+-        ) : (
+-          <div className="config-table-wrap">
+-            <table className="config-table">
+-              <thead>
+-                <tr><th>Приоритет</th><th>Источник</th><th>Точное значение</th><th>Канал</th><th>Состояние</th></tr>
+-              </thead>
+-              <tbody>
+-                {config.channelRules.map((rule) => (
+-                  <tr key={`${rule.matchType}:${rule.matchValue}`}>
+-                    <td>{rule.priority}</td>
+-                    <td>{rule.matchType}</td>
+-                    <td>{rule.matchValue}</td>
+-                    <td>{channelLabels[rule.normalizedChannel] ?? rule.normalizedChannel}</td>
+-                    <td><span className={`status-chip${rule.isActive ? "" : " inactive"}`}>{rule.isActive ? "mapped" : "inactive"}</span></td>
+-                  </tr>
+-                ))}
+-              </tbody>
+-            </table>
+-          </div>
+-        )}
+-      </section>
++        </section>
++      ) : (
++        <ChannelRulesManager
++          initialConfig={{
++            configId: config.id,
++            version: config.version,
++            candidate: {
++              pipelineId: config.pipelineId,
++              applicationStatusId: config.applicationStatusId,
++              wonStatusId: config.wonStatusId,
++              channelFieldId: config.sourceFieldId,
++            },
++            channelRules: config.channelRules.map((rule) => ({
++              priority: rule.priority,
++              matchType: rule.matchType,
++              matchValue: rule.matchValue,
++              normalizedChannel: rule.normalizedChannel,
++            })),
++          }}
++        />
++      )}
+       <section className="panel">
+         <h2>Встреченные значения</h2>
+         <p className="muted">
+           После первой теневой синхронизации здесь появятся raw-значение,
+           количество сделок и состояние mapped, unknown или conflict. Пока
+           значения не обнаружены; свободный текст не угадывается.
+         </p>
+       </section>
+     </AppShell>
+   );
+diff --git a/apps/web/src/components/channel-rules-manager.test.tsx b/apps/web/src/components/channel-rules-manager.test.tsx
+new file mode 100644
+index 0000000..f5abf36
+--- /dev/null
++++ b/apps/web/src/components/channel-rules-manager.test.tsx
+@@ -0,0 +1,100 @@
++import { renderToStaticMarkup } from "react-dom/server";
++import React from "react";
++import { describe, expect, it } from "vitest";
++
++import {
++  buildChannelActivationPayload,
++  ChannelRulesManager,
++  validateChannelRuleEdits,
++  type ChannelRuleEdit,
++} from "./channel-rules-manager";
++
++const candidate = {
++  pipelineId: 10_243_278,
++  applicationStatusId: 11,
++  wonStatusId: 99,
++  channelFieldId: 77,
++};
++
++const rules: readonly ChannelRuleEdit[] = [
++  {
++    priority: 1,
++    matchType: "source_field_exact",
++    matchValue: "Звонок",
++    normalizedChannel: "phone_uis",
++  },
++  {
++    priority: 2,
++    matchType: "tag_exact",
++    matchValue: "Synthetic tag",
++    normalizedChannel: "telegram",
++  },
++  {
++    priority: 3,
++    matchType: "integration_source_exact",
++    matchValue: "Synthetic integration",
++    normalizedChannel: "whatsapp",
++  },
++];
++
++describe("ChannelRulesManager", () => {
++  it("renders editable exact mapping controls for all supported evidence sources", () => {
++    const html = renderToStaticMarkup(
++      <ChannelRulesManager
++        initialConfig={{
++          configId: "10000000-0000-4000-8000-000000000001",
++          version: 4,
++          candidate,
++          channelRules: rules,
++        }}
++      />,
++    );
++
++    expect(html).toContain("source_field_exact");
++    expect(html).toContain("tag_exact");
++    expect(html).toContain("integration_source_exact");
++    expect(html).toContain("Synthetic tag");
++    expect(html).toContain("Добавить правило");
++    expect(html).toContain("Проверить и активировать");
++  });
++
++  it("builds an activation payload from edited rules and binds it to the expected active config", () => {
++    expect(
++      buildChannelActivationPayload({
++        configId: "10000000-0000-4000-8000-000000000001",
++        candidate,
++        channelRules: rules,
++        metadataChecksum: "a".repeat(64),
++        confirmNameChanges: true,
++      }),
++    ).toEqual({
++      candidate,
++      channelRules: rules,
++      metadataChecksum: "a".repeat(64),
++      expectedActiveConfigId: "10000000-0000-4000-8000-000000000001",
++      confirmNameChanges: true,
++    });
++  });
++
++  it("rejects duplicate exact keys, duplicate priorities, and cross-source priority inversions", () => {
++    expect(
++      validateChannelRuleEdits([
++        ...rules,
++        { ...rules[0]!, priority: 4, normalizedChannel: "unknown" },
++      ]),
++    ).toMatch(/значение/i);
++    expect(
++      validateChannelRuleEdits([
++        ...rules,
++        { ...rules[0]!, matchValue: "Other" },
++      ]),
++    ).toMatch(/приоритет/i);
++    expect(
++      validateChannelRuleEdits([
++        { ...rules[0]!, priority: 2 },
++        { ...rules[1]!, priority: 1 },
++        rules[2]!,
++      ]),
++    ).toMatch(/порядок/i);
++  });
++});
+diff --git a/apps/web/src/components/channel-rules-manager.tsx b/apps/web/src/components/channel-rules-manager.tsx
+new file mode 100644
+index 0000000..c1e31de
+--- /dev/null
++++ b/apps/web/src/components/channel-rules-manager.tsx
+@@ -0,0 +1,383 @@
++"use client";
++
++import React, { useState } from "react";
++
++export type ChannelRuleEdit = Readonly<{
++  priority: number;
++  matchType: "source_field_exact" | "tag_exact" | "integration_source_exact";
++  matchValue: string;
++  normalizedChannel:
++    | "phone_uis"
++    | "whatsapp"
++    | "avito"
++    | "instagram"
++    | "site"
++    | "telegram"
++    | "max"
++    | "unknown";
++}>;
++
++type Candidate = Readonly<{
++  pipelineId: number;
++  applicationStatusId: number;
++  wonStatusId: number;
++  channelFieldId: number | null;
++}>;
++
++type InitialConfig = Readonly<{
++  configId: string;
++  version: number;
++  candidate: Candidate;
++  channelRules: readonly ChannelRuleEdit[];
++}>;
++
++type Validation = Readonly<{
++  valid: boolean;
++  metadataChecksum: string;
++  reasons?: readonly string[];
++  warnings?: readonly string[];
++  requiresNameConfirmation?: boolean;
++}>;
++
++type ApiBody<T> = Readonly<{
++  data?: T;
++  error?: Readonly<{ message?: string }>;
++}>;
++
++type EditableRow = ChannelRuleEdit & Readonly<{ rowId: string }>;
++
++const matchTypes: readonly ChannelRuleEdit["matchType"][] = [
++  "source_field_exact",
++  "tag_exact",
++  "integration_source_exact",
++];
++
++const channels: readonly ChannelRuleEdit["normalizedChannel"][] = [
++  "phone_uis",
++  "whatsapp",
++  "avito",
++  "instagram",
++  "site",
++  "telegram",
++  "max",
++  "unknown",
++];
++
++const sourceOrder: Record<ChannelRuleEdit["matchType"], number> = {
++  source_field_exact: 0,
++  tag_exact: 1,
++  integration_source_exact: 2,
++};
++
++async function readApi<T>(response: Response): Promise<ApiBody<T>> {
++  return (await response.json().catch(() => ({}))) as ApiBody<T>;
++}
++
++export function validateChannelRuleEdits(
++  rules: readonly ChannelRuleEdit[],
++): string | null {
++  if (rules.length === 0) return "Добавьте хотя бы одно точное правило";
++  if (
++    rules.some(
++      (rule) =>
++        !Number.isInteger(rule.priority) ||
++        rule.priority < 1 ||
++        rule.priority > 1_000,
++    )
++  ) {
++    return "Приоритет должен быть целым числом от 1 до 1000";
++  }
++  if (rules.some((rule) => rule.matchValue.trim().length === 0)) {
++    return "Точное значение не может быть пустым";
++  }
++
++  const priorities = rules.map((rule) => rule.priority);
++  if (new Set(priorities).size !== priorities.length) {
++    return "Каждому правилу нужен уникальный приоритет";
++  }
++  const exactKeys = rules.map(
++    (rule) => `${rule.matchType}\u0000${rule.matchValue}`,
++  );
++  if (new Set(exactKeys).size !== exactKeys.length) {
++    return "Тип источника и точное значение не должны повторяться";
++  }
++
++  const orderedSources = [...rules]
++    .sort((left, right) => left.priority - right.priority)
++    .map((rule) => sourceOrder[rule.matchType]);
++  if (
++    orderedSources.some(
++      (order, index) => index > 0 && order < orderedSources[index - 1]!,
++    )
++  ) {
++    return "Порядок должен быть: поле источника, затем теги, затем интеграции";
++  }
++  return null;
++}
++
++export function buildChannelActivationPayload(input: Readonly<{
++  configId: string;
++  candidate: Candidate;
++  channelRules: readonly ChannelRuleEdit[];
++  metadataChecksum: string;
++  confirmNameChanges: boolean;
++}>) {
++  return {
++    candidate: input.candidate,
++    channelRules: input.channelRules,
++    metadataChecksum: input.metadataChecksum,
++    expectedActiveConfigId: input.configId,
++    confirmNameChanges: input.confirmNameChanges,
++  };
++}
++
++export function ChannelRulesManager({
++  initialConfig,
++}: Readonly<{ initialConfig: InitialConfig }>) {
++  const [rows, setRows] = useState<readonly EditableRow[]>(
++    initialConfig.channelRules.map((rule, index) => ({
++      ...rule,
++      rowId: `initial-${index}`,
++    })),
++  );
++  const [activeConfigId, setActiveConfigId] = useState(initialConfig.configId);
++  const [version, setVersion] = useState(initialConfig.version);
++  const [validation, setValidation] = useState<Validation | null>(null);
++  const [confirmNameChanges, setConfirmNameChanges] = useState(false);
++  const [pending, setPending] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [message, setMessage] = useState<string | null>(null);
++
++  const rules = rows.map((row) => ({
++    priority: row.priority,
++    matchType: row.matchType,
++    matchValue: row.matchValue,
++    normalizedChannel: row.normalizedChannel,
++  }));
++
++  function invalidateValidation() {
++    setValidation(null);
++    setConfirmNameChanges(false);
++    setMessage(null);
++  }
++
++  function updateRow(rowId: string, change: Partial<ChannelRuleEdit>) {
++    setRows((current) =>
++      current.map((row) => (row.rowId === rowId ? { ...row, ...change } : row)),
++    );
++    invalidateValidation();
++  }
++
++  function addRule() {
++    const nextPriority = Math.max(0, ...rows.map((row) => row.priority)) + 1;
++    setRows((current) => [
++      ...current,
++      {
++        rowId: `new-${Date.now()}-${current.length}`,
++        priority: nextPriority,
++        matchType: "source_field_exact",
++        matchValue: "",
++        normalizedChannel: "unknown",
++      },
++    ]);
++    invalidateValidation();
++  }
++
++  function removeRule(rowId: string) {
++    setRows((current) => current.filter((row) => row.rowId !== rowId));
++    invalidateValidation();
++  }
++
++  async function validateAndActivate() {
++    const editError = validateChannelRuleEdits(rules);
++    if (editError) {
++      setError(editError);
++      return;
++    }
++    setPending(true);
++    setError(null);
++    setMessage(null);
++    try {
++      const validationResponse = await fetch("/api/config/validate", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify(initialConfig.candidate),
++      });
++      const validationBody = await readApi<Validation>(validationResponse);
++      if (!validationResponse.ok || !validationBody.data) {
++        setError(validationBody.error?.message ?? "Проверка конфигурации не выполнена");
++        return;
++      }
++      setValidation(validationBody.data);
++      if (!validationBody.data.valid) {
++        setError("Активная воронка больше не подтверждается live-метаданными amoCRM");
++        return;
++      }
++      if (
++        validationBody.data.requiresNameConfirmation &&
++        !confirmNameChanges
++      ) {
++        setMessage("Имена изменились при прежних ID. Подтвердите изменения и повторите активацию.");
++        return;
++      }
++
++      const activationResponse = await fetch("/api/config/activate", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify(
++          buildChannelActivationPayload({
++            configId: activeConfigId,
++            candidate: initialConfig.candidate,
++            channelRules: rules,
++            metadataChecksum: validationBody.data.metadataChecksum,
++            confirmNameChanges,
++          }),
++        ),
++      });
++      const activationBody = await readApi<{
++        configId: string;
++        version: number;
++      }>(activationResponse);
++      if (!activationResponse.ok || !activationBody.data) {
++        setError(
++          activationResponse.status === 409
++            ? "Конфигурация уже изменилась. Обновите страницу и повторите проверку."
++            : activationBody.error?.message ?? "Правила не активированы",
++        );
++        return;
++      }
++      setActiveConfigId(activationBody.data.configId);
++      setVersion(activationBody.data.version);
++      setValidation(null);
++      setConfirmNameChanges(false);
++      setMessage(
++        `Версия ${activationBody.data.version} активирована. Пересчёт поставлен в очередь; текущий снимок не изменён.`,
++      );
++    } catch {
++      setError("Сервис временно недоступен. Повторите попытку");
++    } finally {
++      setPending(false);
++    }
++  }
++
++  return (
++    <section className="panel" aria-labelledby="channel-rules-title">
++      <div className="integration-heading">
++        <div>
++          <h2 id="channel-rules-title">Точные правила · версия {version}</h2>
++          <p className="muted">
++            Значение сравнивается целиком. Подстроки и свободный текст не угадываются;
++            конфликт остаётся unknown.
++          </p>
++        </div>
++        <button className="button button-secondary" onClick={addRule} type="button">
++          Добавить правило
++        </button>
++      </div>
++      <div className="config-table-wrap">
++        <table className="config-table channel-rules-table">
++          <thead>
++            <tr>
++              <th>Приоритет</th>
++              <th>Источник доказательства</th>
++              <th>Точное значение</th>
++              <th>Канал</th>
++              <th aria-label="Действия" />
++            </tr>
++          </thead>
++          <tbody>
++            {rows.map((rule) => (
++              <tr key={rule.rowId}>
++                <td>
++                  <input
++                    aria-label={`Приоритет ${rule.matchValue || "нового правила"}`}
++                    min={1}
++                    max={1_000}
++                    onChange={(event) =>
++                      updateRow(rule.rowId, { priority: Number(event.target.value) })
++                    }
++                    type="number"
++                    value={rule.priority}
++                  />
++                </td>
++                <td>
++                  <select
++                    aria-label={`Источник ${rule.matchValue || "нового правила"}`}
++                    onChange={(event) =>
++                      updateRow(rule.rowId, {
++                        matchType: event.target.value as ChannelRuleEdit["matchType"],
++                      })
++                    }
++                    value={rule.matchType}
++                  >
++                    {matchTypes.map((matchType) => (
++                      <option key={matchType} value={matchType}>{matchType}</option>
++                    ))}
++                  </select>
++                </td>
++                <td>
++                  <input
++                    aria-label="Точное значение"
++                    maxLength={500}
++                    onChange={(event) =>
++                      updateRow(rule.rowId, { matchValue: event.target.value })
++                    }
++                    type="text"
++                    value={rule.matchValue}
++                  />
++                </td>
++                <td>
++                  <select
++                    aria-label={`Канал ${rule.matchValue || "нового правила"}`}
++                    onChange={(event) =>
++                      updateRow(rule.rowId, {
++                        normalizedChannel:
++                          event.target.value as ChannelRuleEdit["normalizedChannel"],
++                      })
++                    }
++                    value={rule.normalizedChannel}
++                  >
++                    {channels.map((channel) => (
++                      <option key={channel} value={channel}>{channel}</option>
++                    ))}
++                  </select>
++                </td>
++                <td>
++                  <button
++                    className="button button-danger button-compact"
++                    onClick={() => removeRule(rule.rowId)}
++                    type="button"
++                  >
++                    Удалить
++                  </button>
++                </td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </div>
++      {validation?.requiresNameConfirmation ? (
++        <label className="confirmation-field">
++          <input
++            checked={confirmNameChanges}
++            onChange={(event) => setConfirmNameChanges(event.target.checked)}
++            type="checkbox"
++          />
++          Подтверждаю новые имена при сохранённых ID воронки и этапов
++        </label>
++      ) : null}
++      <div className="card-actions config-actions">
++        <button
++          className="button"
++          disabled={pending}
++          onClick={validateAndActivate}
++          type="button"
++        >
++          {pending ? "Проверяем…" : "Проверить и активировать"}
++        </button>
++      </div>
++      {error ? <p className="form-error" role="alert">{error}</p> : null}
++      {message ? <p className="form-success" aria-live="polite">{message}</p> : null}
++    </section>
++  );
++}
+diff --git a/apps/web/src/components/pipeline-config-manager.tsx b/apps/web/src/components/pipeline-config-manager.tsx
+index 18778d6..4a41822 100644
+--- a/apps/web/src/components/pipeline-config-manager.tsx
++++ b/apps/web/src/components/pipeline-config-manager.tsx
+@@ -1,13 +1,13 @@
+ "use client";
+ 
+-import { useEffect, useMemo, useState } from "react";
++import React, { useEffect, useMemo, useState } from "react";
+ 
+ type Discovery = Readonly<{
+   pipelines: readonly Readonly<{
+     id: number;
+     name: string;
+     statuses: readonly Readonly<{ id: number; name: string }>[];
+   }>[];
+   leadCustomFields: readonly Readonly<{ id: number; name: string }>[];
+ }>;
+ 
+@@ -30,136 +30,172 @@ type Candidate = Readonly<{
+   pipelineId: number;
+   applicationStatusId: number;
+   wonStatusId: number;
+   channelFieldId: number | null;
+ }>;
+ 
+ type Validation = Readonly<{
+   valid: boolean;
+   metadataChecksum: string;
+   reasons?: readonly string[];
++  warnings?: readonly string[];
++  requiresNameConfirmation?: boolean;
++}>;
++
++type CurrentConfig = Readonly<{
++  configId: string;
++  pipelineId: number;
++  applicationStatusId: number;
++  wonStatusId: number;
++  sourceFieldId: number | null;
++  channelRules: readonly ChannelRule[];
+ }>;
+ 
+ type ApiBody<T> = {
+   data?: T;
+   error?: { message?: string };
+ };
+ 
+ const expectedApplicationName = "Завершение (самовывоз или доставка)";
+ const expectedWonName = "Успешно реализовано";
+ 
+ async function readApi<T>(response: Response): Promise<ApiBody<T>> {
+   return (await response.json().catch(() => ({}))) as ApiBody<T>;
+ }
+ 
+ export function PipelineConfigManager({
+   initialChannelRules,
+ }: Readonly<{ initialChannelRules: readonly ChannelRule[] }>) {
+   const [discovery, setDiscovery] = useState<Discovery | null>(null);
+   const [candidate, setCandidate] = useState<Candidate | null>(null);
++  const [expectedActiveConfigId, setExpectedActiveConfigId] = useState<string | null>(null);
++  const [channelRules, setChannelRules] = useState(initialChannelRules);
+   const [validation, setValidation] = useState<Validation | null>(null);
++  const [confirmNameChanges, setConfirmNameChanges] = useState(false);
+   const [pending, setPending] = useState<"discovery" | "validate" | "activate" | null>(
+     "discovery",
+   );
+   const [error, setError] = useState<string | null>(null);
+   const [message, setMessage] = useState<string | null>(null);
+ 
+   useEffect(() => {
+     let cancelled = false;
+ 
+     async function loadDiscovery() {
+       try {
+-        const response = await fetch("/api/config/discovery");
+-        const body = await readApi<Discovery>(response);
+-        if (!response.ok || !body.data) {
++        const [response, currentResponse] = await Promise.all([
++          fetch("/api/config/discovery"),
++          fetch("/api/config/current"),
++        ]);
++        const [body, currentBody] = await Promise.all([
++          readApi<Discovery>(response),
++          readApi<CurrentConfig | null>(currentResponse),
++        ]);
++        if (!response.ok || !body.data || !currentResponse.ok) {
+           if (!cancelled) setError(body.error?.message ?? "Метаданные amoCRM недоступны");
+           return;
+         }
++        const current = currentBody.data ?? null;
+ 
+         const preferredPipeline =
++          body.data.pipelines.find((pipeline) => pipeline.id === current?.pipelineId) ??
+           body.data.pipelines.find((pipeline) => pipeline.name === "РЕАЛ ДВА") ??
+           body.data.pipelines[0];
+-        const applicationStatus = preferredPipeline?.statuses.find(
+-          (status) => status.name === expectedApplicationName,
+-        );
+-        const wonStatus = preferredPipeline?.statuses.find(
+-          (status) => status.name === expectedWonName,
+-        );
++        const applicationStatus = current
++          ? preferredPipeline?.statuses.find(
++              (status) => status.id === current.applicationStatusId,
++            )
++          : preferredPipeline?.statuses.find(
++              (status) => status.name === expectedApplicationName,
++            );
++        const wonStatus = current
++          ? preferredPipeline?.statuses.find((status) => status.id === current.wonStatusId)
++          : preferredPipeline?.statuses.find((status) => status.name === expectedWonName);
+         const sourceField = body.data.leadCustomFields.find(
+-          (field) => field.name === "Источник сделки",
++          (field) =>
++            current
++              ? field.id === current.sourceFieldId
++              : field.name === "Источник сделки",
+         );
+ 
+         if (!cancelled) {
+           setDiscovery(body.data);
++          setExpectedActiveConfigId(current?.configId ?? null);
++          setChannelRules(current?.channelRules ?? initialChannelRules);
+           if (preferredPipeline && applicationStatus && wonStatus) {
+             setCandidate({
+               pipelineId: preferredPipeline.id,
+               applicationStatusId: applicationStatus.id,
+               wonStatusId: wonStatus.id,
+               channelFieldId: sourceField?.id ?? null,
+             });
+           }
+         }
+       } catch {
+         if (!cancelled) setError("Сервис временно недоступен. Повторите попытку");
+       } finally {
+         if (!cancelled) setPending(null);
+       }
+     }
+ 
+     void loadDiscovery();
+     return () => {
+       cancelled = true;
+     };
+-  }, []);
++  }, [initialChannelRules]);
+ 
+   const selectedPipeline = useMemo(
+     () => discovery?.pipelines.find((pipeline) => pipeline.id === candidate?.pipelineId),
+     [candidate?.pipelineId, discovery],
+   );
+ 
+   function choosePipeline(pipelineId: number) {
+     const pipeline = discovery?.pipelines.find((item) => item.id === pipelineId);
+     setCandidate({
+       pipelineId,
+       applicationStatusId: pipeline?.statuses[0]?.id ?? 0,
+       wonStatusId: pipeline?.statuses[1]?.id ?? pipeline?.statuses[0]?.id ?? 0,
+       channelFieldId: candidate?.channelFieldId ?? null,
+     });
+     setValidation(null);
++    setConfirmNameChanges(false);
+   }
+ 
+   function updateCandidate(change: Partial<Candidate>) {
+     setCandidate((current) => (current ? { ...current, ...change } : null));
+     setValidation(null);
++    setConfirmNameChanges(false);
+     setMessage(null);
+   }
+ 
+   async function validate() {
+     if (!candidate) return;
+     setPending("validate");
+     setError(null);
+     setMessage(null);
+     try {
+       const response = await fetch("/api/config/validate", {
+         method: "POST",
+         headers: { "content-type": "application/json" },
+         body: JSON.stringify(candidate),
+       });
+       const body = await readApi<Validation>(response);
+       if (!response.ok || !body.data) {
+         setError(body.error?.message ?? "Проверка конфигурации не выполнена");
+         return;
+       }
+       setValidation(body.data);
++      setConfirmNameChanges(false);
+       if (!body.data.valid) {
+         setError("ID и имена не подтверждены live-метаданными amoCRM");
++      } else if (body.data.requiresNameConfirmation) {
++        setMessage("ID сохранены, но имена изменились. Проверьте и подтвердите новые имена.");
+       } else {
+         setMessage("ID, имена и принадлежность этапов подтверждены");
+       }
+     } catch {
+       setError("Сервис временно недоступен. Повторите попытку");
+     } finally {
+       setPending(null);
+     }
+   }
+ 
+@@ -167,33 +203,42 @@ export function PipelineConfigManager({
+     if (!candidate || !validation?.valid) return;
+     setPending("activate");
+     setError(null);
+     setMessage(null);
+     try {
+       const response = await fetch("/api/config/activate", {
+         method: "POST",
+         headers: { "content-type": "application/json" },
+         body: JSON.stringify({
+           candidate,
+-          channelRules: initialChannelRules,
++          channelRules,
+           metadataChecksum: validation.metadataChecksum,
++          expectedActiveConfigId,
++          confirmNameChanges,
+         }),
+       });
+-      const body = await readApi<{ version: number }>(response);
++      const body = await readApi<{
++        configId: string;
++        version: number;
++        channelRules: readonly ChannelRule[];
++      }>(response);
+       if (!response.ok || !body.data) {
+         setError(body.error?.message ?? "Конфигурация не активирована");
+         return;
+       }
+       setMessage(
+         `Версия ${body.data.version} активирована. Пересчёт поставлен в очередь; текущий снимок не изменён.`,
+       );
++      setExpectedActiveConfigId(body.data.configId);
++      setChannelRules(body.data.channelRules);
+       setValidation(null);
++      setConfirmNameChanges(false);
+     } catch {
+       setError("Сервис временно недоступен. Повторите попытку");
+     } finally {
+       setPending(null);
+     }
+   }
+ 
+   if (pending === "discovery") {
+     return <div className="panel skeleton" aria-label="Загрузка метаданных amoCRM" />;
+   }
+@@ -268,20 +313,39 @@ export function PipelineConfigManager({
+               {discovery.leadCustomFields.map((field) => (
+                 <option key={field.id} value={field.id}>{field.name} · {field.id}</option>
+               ))}
+             </select>
+           </label>
+         </div>
+         <div className="card-actions config-actions">
+           <button className="button button-secondary" disabled={pending !== null} onClick={validate} type="button">
+             {pending === "validate" ? "Проверяем…" : "Проверить по API"}
+           </button>
+-          <button className="button" disabled={!validation?.valid || pending !== null} onClick={activate} type="button">
++          <button
++            className="button"
++            disabled={
++              !validation?.valid ||
++              (validation.requiresNameConfirmation && !confirmNameChanges) ||
++              pending !== null
++            }
++            onClick={activate}
++            type="button"
++          >
+             {pending === "activate" ? "Активируем…" : "Активировать новую версию"}
+           </button>
+         </div>
++        {validation?.requiresNameConfirmation ? (
++          <label className="confirmation-field">
++            <input
++              checked={confirmNameChanges}
++              onChange={(event) => setConfirmNameChanges(event.target.checked)}
++              type="checkbox"
++            />
++            Подтверждаю новые имена при сохранённых ID воронки и этапов
++          </label>
++        ) : null}
+       </section>
+       {error ? <p className="form-error" role="alert">{error}</p> : null}
+       {message ? <p className="form-success" aria-live="polite">{message}</p> : null}
+     </div>
+   );
+ }
+diff --git a/apps/web/src/lib/amo/config-discovery.ts b/apps/web/src/lib/amo/config-discovery.ts
+index c1e94d1..5b66fb2 100644
+--- a/apps/web/src/lib/amo/config-discovery.ts
++++ b/apps/web/src/lib/amo/config-discovery.ts
+@@ -1,15 +1,20 @@
+ import {
+   getCurrentSafeAmoConnectionStatus,
+   type Database,
+ } from "@real2/db";
+-import { AppError, type AmoConfigDiscovery, type ServerEnv } from "@real2/domain";
++import {
++  amoConfigDiscoverySchema,
++  AppError,
++  type AmoConfigDiscovery,
++  type ServerEnv,
++} from "@real2/domain";
+ import {
+   amoFetch,
+   createAmoTokenProvider,
+   decodeTokenEncryptionKey,
+ } from "@real2/integrations";
+ import { z } from "zod";
+ 
+ import {
+   AMO_BASE_URL,
+   amoAccountSchema,
+@@ -129,16 +134,16 @@ export async function discoverAmoConfigMetadata(
+       method: "GET",
+       url: `${AMO_BASE_URL}/api/v4/users`,
+       schema: usersResponseSchema,
+       traceId,
+       tokenProvider,
+       auditSink,
+       redirect: "error",
+     }),
+   ]);
+ 
+-  return {
++  return amoConfigDiscoverySchema.parse({
+     pipelines: pipelineStatuses,
+     leadCustomFields: customFieldsResponse._embedded.custom_fields,
+     users: usersResponse._embedded.users,
+-  };
++  });
+ }
+diff --git a/apps/web/src/lib/amo/config-public.ts b/apps/web/src/lib/amo/config-public.ts
+index f610404..7a91cb8 100644
+--- a/apps/web/src/lib/amo/config-public.ts
++++ b/apps/web/src/lib/amo/config-public.ts
+@@ -1,13 +1,14 @@
+ import type { ActivePipelineConfig } from "@real2/db";
+ 
+ export type PublicPipelineConfig = Readonly<{
++  configId: string;
+   pipelineId: number;
+   pipelineName: string;
+   applicationStatusId: number;
+   applicationStatusName: string;
+   wonStatusId: number;
+   wonStatusName: string;
+   sourceFieldId: number | null;
+   timezone: "Europe/Moscow";
+   version: number;
+   confirmedAt: string;
+@@ -25,20 +26,21 @@ export type PublicPipelineConfig = Readonly<{
+     matchValue: string;
+     normalizedChannel: string;
+     isActive: boolean;
+   }>[];
+ }>;
+ 
+ export function toPublicPipelineConfig(
+   config: ActivePipelineConfig,
+ ): PublicPipelineConfig {
+   return {
++    configId: config.id,
+     pipelineId: config.pipelineId,
+     pipelineName: config.pipelineName,
+     applicationStatusId: config.applicationStatusId,
+     applicationStatusName: config.applicationStatusName,
+     wonStatusId: config.wonStatusId,
+     wonStatusName: config.wonStatusName,
+     sourceFieldId: config.sourceFieldId,
+     timezone: config.timezone,
+     version: config.version,
+     confirmedAt: config.confirmedAt.toISOString(),
+diff --git a/packages/db/src/amo-config.ts b/packages/db/src/amo-config.ts
+index 813a061..a1ea678 100644
+--- a/packages/db/src/amo-config.ts
++++ b/packages/db/src/amo-config.ts
+@@ -65,20 +65,21 @@ export type ActiveChannelRule = Readonly<{
+   priority: number;
+   matchType: ChannelRuleCandidate["matchType"];
+   matchValue: string;
+   normalizedChannel: ChannelRuleCandidate["normalizedChannel"];
+   isActive: boolean;
+   createdAt: Date;
+ }>;
+ 
+ export type ActivatePipelineConfigInput = Readonly<{
+   amoConnectionId: string;
++  expectedActiveConfigId: string | null;
+   candidate: ResolvedPipelineConfig;
+   channelRules: readonly ChannelRuleCandidate[];
+   metadataChecksum: string;
+   actorId: string;
+   now?: Date;
+ }>;
+ 
+ function databaseError(error: unknown): never {
+   if (typeof error === "object" && error !== null && "code" in error) {
+     const code = (error as { code?: unknown }).code;
+@@ -230,26 +231,34 @@ export async function activatePipelineConfig(
+       }[]>`
+         select id, status
+         from public.amo_connections
+         where id = ${input.amoConnectionId}
+         for update
+       `;
+       if (!connection || connection.status !== "active") {
+         throw new AppError("E_CONFIG_INCOMPLETE", 422);
+       }
+ 
+-      await transaction`
+-        select id
++      const lockedConfigs = await transaction<{
++        id: string;
++        is_active: boolean;
++      }[]>`
++        select id, is_active
+         from public.pipeline_configs
+         where amo_connection_id = ${input.amoConnectionId}
+         for update
+       `;
++      const currentActiveConfigId =
++        lockedConfigs.find((config) => config.is_active)?.id ?? null;
++      if (currentActiveConfigId !== input.expectedActiveConfigId) {
++        throw new AppError("E_CONFLICT", 409);
++      }
+ 
+       const [versionRow] = await transaction<{ version: number }[]>`
+         select coalesce(max(version), 0) + 1 as version
+         from public.pipeline_configs
+         where amo_connection_id = ${input.amoConnectionId}
+       `;
+       if (!versionRow) throw new AppError("E_DB", 500);
+ 
+       await transaction`
+         update public.pipeline_configs
+diff --git a/packages/domain/src/amo/config.test.ts b/packages/domain/src/amo/config.test.ts
+index ff77829..b15609a 100644
+--- a/packages/domain/src/amo/config.test.ts
++++ b/packages/domain/src/amo/config.test.ts
+@@ -1,14 +1,15 @@
+ import { describe, expect, it } from "vitest";
+ 
+ import { AppError } from "../errors.js";
+ import {
++  amoConfigDiscoverySchema,
+   INITIAL_CHANNEL_RULES,
+   validateChannelRules,
+   validatePipelineConfig,
+   type AmoConfigDiscovery,
+   type ChannelRuleCandidate,
+   type PipelineConfigCandidate,
+ } from "./config.js";
+ 
+ const candidate: PipelineConfigCandidate = {
+   pipelineId: 10_243_278,
+@@ -110,20 +111,98 @@ describe("validatePipelineConfig", () => {
+         leadCustomFields: [{ id: 77, name: "Источник сделки" }],
+         users: [{ id: 501, name: "Synthetic User" }],
+       }),
+     );
+ 
+     expect(ordered).toMatchObject({ valid: true });
+     expect(reordered).toMatchObject({ valid: true });
+     if (!ordered.valid || !reordered.valid) throw new Error("fixture must validate");
+     expect(reordered.metadataChecksum).toBe(ordered.metadataChecksum);
+   });
++
++  it("reports same-ID name drift as a warning only after the IDs were previously confirmed", () => {
++    const original = validatePipelineConfig(candidate, fixtureDiscovery());
++    if (!original.valid) throw new Error("fixture must validate");
++    const renamedDiscovery = fixtureDiscovery({
++      pipelines: [
++        {
++          id: candidate.pipelineId,
++          name: "РЕАЛ ДВА — новое имя",
++          statuses: [
++            { id: candidate.applicationStatusId, name: "Завершение — новое имя" },
++            { id: candidate.wonStatusId, name: "Продажа — новое имя" },
++          ],
++        },
++      ],
++    });
++
++    expect(validatePipelineConfig(candidate, renamedDiscovery)).toMatchObject({
++      valid: false,
++      code: "E_CONFIG_INCOMPLETE",
++    });
++    expect(
++      validatePipelineConfig(candidate, renamedDiscovery, {
++        activeConfig: original.resolved,
++      }),
++    ).toMatchObject({
++      valid: true,
++      requiresNameConfirmation: true,
++      warnings: [
++        "pipeline_name_changed",
++        "application_status_name_changed",
++        "won_status_name_changed",
++      ],
++      resolved: {
++        pipelineName: "РЕАЛ ДВА — новое имя",
++        applicationStatusName: "Завершение — новое имя",
++        wonStatusName: "Продажа — новое имя",
++      },
++    });
++  });
++
++  it.each([
++    [
++      "pipeline",
++      fixtureDiscovery({
++        pipelines: [
++          ...fixtureDiscovery().pipelines,
++          { id: 10_243_278, name: "Conflicting duplicate", statuses: [] },
++        ],
++      }),
++    ],
++    [
++      "status",
++      fixtureDiscovery({
++        pipelines: [
++          {
++            ...fixtureDiscovery().pipelines[0]!,
++            statuses: [
++              ...fixtureDiscovery().pipelines[0]!.statuses,
++              { id: 11, name: "Conflicting duplicate" },
++            ],
++          },
++        ],
++      }),
++    ],
++    [
++      "custom field",
++      fixtureDiscovery({
++        leadCustomFields: [
++          { id: 77, name: "Источник сделки" },
++          { id: 77, name: "Источник сделки" },
++        ],
++      }),
++    ],
++  ])("rejects duplicate %s IDs before response order can affect selection", (_label, discovery) => {
++    expect(() => amoConfigDiscoverySchema.parse(discovery)).toThrow();
++    expect(() => validatePipelineConfig(candidate, discovery)).toThrow();
++  });
+ });
+ 
+ describe("validateChannelRules", () => {
+   it("ships exact mappings for every catalogued non-unknown source variant", () => {
+     expect(() => validateChannelRules(INITIAL_CHANNEL_RULES)).not.toThrow();
+ 
+     expect(INITIAL_CHANNEL_RULES).toEqual(
+       expect.arrayContaining([
+         expect.objectContaining({ matchValue: "Звонок", normalizedChannel: "phone_uis" }),
+         expect.objectContaining({ matchValue: "WhatsApp", normalizedChannel: "whatsapp" }),
+diff --git a/packages/domain/src/amo/config.ts b/packages/domain/src/amo/config.ts
+index e9f5e8a..5a8e156 100644
+--- a/packages/domain/src/amo/config.ts
++++ b/packages/domain/src/amo/config.ts
+@@ -33,41 +33,78 @@ export const channelRuleCandidateSchema = z.strictObject({
+   normalizedChannel: normalizedChannelSchema,
+ });
+ 
+ export type ChannelRuleCandidate = z.infer<typeof channelRuleCandidateSchema>;
+ 
+ const pipelineStatusSchema = z.strictObject({
+   id: z.number().int().positive(),
+   name: z.string().min(1).max(500),
+ });
+ 
+-const pipelineDiscoverySchema = z.strictObject({
+-  id: z.number().int().positive(),
+-  name: z.string().min(1).max(500),
+-  statuses: z.array(pipelineStatusSchema),
+-});
++function duplicateIdIndexes(values: readonly { id: number }[]): number[] {
++  const seen = new Set<number>();
++  const duplicates: number[] = [];
++  values.forEach((value, index) => {
++    if (seen.has(value.id)) duplicates.push(index);
++    seen.add(value.id);
++  });
++  return duplicates;
++}
++
++const pipelineDiscoverySchema = z
++  .strictObject({
++    id: z.number().int().positive(),
++    name: z.string().min(1).max(500),
++    statuses: z.array(pipelineStatusSchema),
++  })
++  .superRefine((pipeline, context) => {
++    for (const index of duplicateIdIndexes(pipeline.statuses)) {
++      context.addIssue({
++        code: "custom",
++        message: "duplicate status id",
++        path: ["statuses", index, "id"],
++      });
++    }
++  });
+ 
+ const customFieldSchema = z.strictObject({
+   id: z.number().int().positive(),
+   name: z.string().min(1).max(500),
+ });
+ 
+ const amoUserSchema = z.strictObject({
+   id: z.number().int().positive(),
+   name: z.string().min(1).max(500),
+ });
+ 
+-export const amoConfigDiscoverySchema = z.strictObject({
+-  pipelines: z.array(pipelineDiscoverySchema),
+-  leadCustomFields: z.array(customFieldSchema),
+-  users: z.array(amoUserSchema),
+-});
++export const amoConfigDiscoverySchema = z
++  .strictObject({
++    pipelines: z.array(pipelineDiscoverySchema),
++    leadCustomFields: z.array(customFieldSchema),
++    users: z.array(amoUserSchema),
++  })
++  .superRefine((discovery, context) => {
++    for (const index of duplicateIdIndexes(discovery.pipelines)) {
++      context.addIssue({
++        code: "custom",
++        message: "duplicate pipeline id",
++        path: ["pipelines", index, "id"],
++      });
++    }
++    for (const index of duplicateIdIndexes(discovery.leadCustomFields)) {
++      context.addIssue({
++        code: "custom",
++        message: "duplicate custom field id",
++        path: ["leadCustomFields", index, "id"],
++      });
++    }
++  });
+ 
+ export type AmoConfigDiscovery = z.infer<typeof amoConfigDiscoverySchema>;
+ 
+ export const pipelineConfigCandidateSchema = z.strictObject({
+   pipelineId: z.number().int().positive(),
+   applicationStatusId: z.number().int().positive(),
+   wonStatusId: z.number().int().positive(),
+   channelFieldId: z.number().int().positive().nullable().optional(),
+ });
+ 
+@@ -82,28 +119,39 @@ export type ResolvedPipelineConfig = Readonly<{
+   wonStatusName: string;
+   channelFieldId: number | null;
+   channelFieldName: string | null;
+ }>;
+ 
+ export type PipelineConfigValidation =
+   | Readonly<{
+       valid: true;
+       metadataChecksum: string;
+       resolved: ResolvedPipelineConfig;
++      warnings: readonly PipelineConfigWarning[];
++      requiresNameConfirmation: boolean;
+     }>
+   | Readonly<{
+       valid: false;
+       code: "E_CONFIG_INCOMPLETE";
+       metadataChecksum: string;
+       reasons: readonly string[];
+     }>;
+ 
++export type PipelineConfigWarning =
++  | "pipeline_name_changed"
++  | "application_status_name_changed"
++  | "won_status_name_changed";
++
++export type PipelineConfigValidationContext = Readonly<{
++  activeConfig?: ResolvedPipelineConfig | null;
++}>;
++
+ type RequiredChannelMapping = Readonly<{
+   matchValue: string;
+   normalizedChannel: z.infer<typeof normalizedChannelSchema>;
+ }>;
+ 
+ const requiredChannelMappings = [
+   { matchValue: "Звонок", normalizedChannel: "phone_uis" },
+   { matchValue: "UIS", normalizedChannel: "phone_uis" },
+   { matchValue: "uis", normalizedChannel: "phone_uis" },
+   { matchValue: "WhatsApp", normalizedChannel: "whatsapp" },
+@@ -157,48 +205,72 @@ export function checksumAmoConfigDiscovery(discovery: AmoConfigDiscovery): strin
+       name: user.name,
+     })),
+   };
+ 
+   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+ }
+ 
+ export function validatePipelineConfig(
+   candidate: PipelineConfigCandidate,
+   discovery: AmoConfigDiscovery,
++  context: PipelineConfigValidationContext = {},
+ ): PipelineConfigValidation {
+   const parsedCandidate = pipelineConfigCandidateSchema.parse(candidate);
+   const parsedDiscovery = amoConfigDiscoverySchema.parse(discovery);
+   const metadataChecksum = checksumAmoConfigDiscovery(parsedDiscovery);
+   const reasons: string[] = [];
++  const warnings: PipelineConfigWarning[] = [];
++  const activeConfig = context.activeConfig ?? null;
+   const pipeline = parsedDiscovery.pipelines.find(
+     (item) => item.id === parsedCandidate.pipelineId,
+   );
+ 
+-  if (!pipeline || pipeline.name !== EXPECTED_PIPELINE_NAME) {
++  if (!pipeline) {
+     reasons.push("pipeline_not_confirmed");
++  } else if (pipeline.name !== EXPECTED_PIPELINE_NAME) {
++    if (activeConfig?.pipelineId !== pipeline.id) {
++      reasons.push("pipeline_not_confirmed");
++    } else if (activeConfig.pipelineName !== pipeline.name) {
++      warnings.push("pipeline_name_changed");
++    }
+   }
+ 
+   const applicationStatus = pipeline?.statuses.find(
+     (item) => item.id === parsedCandidate.applicationStatusId,
+   );
+-  if (
+-    !applicationStatus ||
+-    applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME
+-  ) {
++  if (!applicationStatus) {
+     reasons.push("application_status_not_confirmed");
++  } else if (applicationStatus.name !== EXPECTED_APPLICATION_STATUS_NAME) {
++    if (
++      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
++      activeConfig.applicationStatusId !== applicationStatus.id
++    ) {
++      reasons.push("application_status_not_confirmed");
++    } else if (activeConfig.applicationStatusName !== applicationStatus.name) {
++      warnings.push("application_status_name_changed");
++    }
+   }
+ 
+   const wonStatus = pipeline?.statuses.find(
+     (item) => item.id === parsedCandidate.wonStatusId,
+   );
+-  if (!wonStatus || wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
++  if (!wonStatus) {
+     reasons.push("won_status_not_confirmed");
++  } else if (wonStatus.name !== EXPECTED_WON_STATUS_NAME) {
++    if (
++      activeConfig?.pipelineId !== parsedCandidate.pipelineId ||
++      activeConfig.wonStatusId !== wonStatus.id
++    ) {
++      reasons.push("won_status_not_confirmed");
++    } else if (activeConfig.wonStatusName !== wonStatus.name) {
++      warnings.push("won_status_name_changed");
++    }
+   }
+ 
+   if (parsedCandidate.applicationStatusId === parsedCandidate.wonStatusId) {
+     reasons.push("application_and_won_must_differ");
+   }
+ 
+   const requestedFieldId = parsedCandidate.channelFieldId ?? null;
+   const channelField = requestedFieldId
+     ? parsedDiscovery.leadCustomFields.find((item) => item.id === requestedFieldId)
+     : null;
+@@ -211,20 +283,22 @@ export function validatePipelineConfig(
+       valid: false,
+       code: "E_CONFIG_INCOMPLETE",
+       metadataChecksum,
+       reasons,
+     };
+   }
+ 
+   return {
+     valid: true,
+     metadataChecksum,
++    warnings,
++    requiresNameConfirmation: warnings.length > 0,
+     resolved: {
+       pipelineId: pipeline.id,
+       pipelineName: pipeline.name,
+       applicationStatusId: applicationStatus.id,
+       applicationStatusName: applicationStatus.name,
+       wonStatusId: wonStatus.id,
+       wonStatusName: wonStatus.name,
+       channelFieldId: requestedFieldId,
+       channelFieldName: channelField?.name ?? null,
+     },

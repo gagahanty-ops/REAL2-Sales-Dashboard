@@ -1,0 +1,3309 @@
+# Review package: 30aa40cde8525fa69513af3311f820374c841ce7..bde1c9a
+
+## Commits
+bde1c9a feat: sync amoCRM through guarded read-only worker
+
+## Files changed
+ .../task-6-report.md                               |  73 ++
+ apps/web/next.config.ts                            |   5 +-
+ apps/web/package.json                              |   1 +
+ apps/web/src/app/api/sync-runs/[id]/route.ts       |  23 +
+ apps/web/src/app/api/sync-runs/route.ts            |  56 ++
+ .../api/sync-runs/sync-runs.integration.test.ts    | 166 ++++
+ apps/web/src/app/globals.css                       |  27 +
+ apps/web/src/app/sync/[id]/page.tsx                |  40 +
+ apps/web/src/app/sync/page.tsx                     |  85 ++
+ apps/web/src/components/app-shell.tsx              |   5 +-
+ apps/web/src/components/sync-trigger.test.tsx      |  23 +
+ apps/web/src/components/sync-trigger.tsx           |  58 ++
+ apps/worker/package.json                           |   6 +
+ apps/worker/src/jobs/amo-sync.test.ts              | 193 +++++
+ apps/worker/src/jobs/amo-sync.ts                   | 914 +++++++++++++++++++++
+ apps/worker/src/jobs/raw-retention.test.ts         |  42 +
+ apps/worker/src/jobs/raw-retention.ts              |  32 +
+ apps/worker/src/jobs/sync-watchdog.test.ts         |  16 +
+ apps/worker/src/jobs/sync-watchdog.ts              |  13 +
+ apps/worker/src/schedule.test.ts                   |  29 +
+ apps/worker/src/schedule.ts                        |  56 ++
+ packages/db/src/client.ts                          |  13 +
+ packages/db/src/index.ts                           |  17 +
+ .../db/src/sync-operations.integration.test.ts     | 235 ++++++
+ packages/db/src/sync-operations.ts                 | 381 +++++++++
+ .../src/amo/transport.integration.test.ts          |  19 +
+ packages/integrations/src/amo/transport.ts         |  16 +-
+ packages/testkit/src/amo-fixtures.ts               |  70 ++
+ packages/testkit/src/amo-server.test.ts            |  34 +
+ packages/testkit/src/amo-server.ts                 |  71 ++
+ packages/testkit/src/index.ts                      |   6 +
+ pnpm-lock.yaml                                     |   3 +
+ supabase/migrations/0006_sync_operations.sql       | 122 +++
+ 33 files changed, 2844 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
+new file mode 100644
+index 0000000..ca0d660
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
+@@ -0,0 +1,73 @@
++# Task 6 report — guarded amoCRM synchronization operations
++
++## Summary
++
++- Recovered and independently audited the uncommitted Task 6 diff on top of
++  `30aa40c`; no existing tracked or untracked work was discarded.
++- Added migration `0006_sync_operations.sql` and DB operational repositories
++  for per-connection PostgreSQL advisory locking, safe run/history projections,
++  cursor reads, full-run count comparison, stale-run sealing, and the
++  proof-gated retention boundary.
++- Implemented the guarded worker sync runner: both `SYNC_ENABLED` and the DB
++  `system_controls.sync_enabled` must be true before a connection, token
++  provider, lock, or amoCRM request is reached. It uses the sole guarded
++  `amoFetch` transport, processes account/pipeline/status/user metadata before
++  events and leads, validates every page before append, follows validated next
++  links, rejects a repeated page checksum, and advances cursors only in the
++  existing atomic successful finalizer.
++- Incremental runs query a ten-minute overlap and retain stable `(event_at,
++  amo_event_id)` cursor ordering. Retry behavior is deterministic under an
++  injected clock: one refresh/retry for 401, then 1/3/9/27/60 second retries
++  with bounded injected jitter for 429 and 5xx. Partial/failed runs retain safe
++  diagnostics and cannot advance cursors or replace later production data.
++- Added schedule helpers for five-minute incremental dispatch and the 02:30
++  `Europe/Moscow` nightly reconciliation, a 20-minute watchdog, and a
++  90-day raw-retention job. Retention is executable only by the separate
++  `retention_worker` role through a security-definer function matching each
++  raw hash to a retained normalized-history proof; normal worker and user
++  roles receive no raw-delete permission.
++- Added test-only synthetic amoCRM fixtures/server and exported them solely
++  from `@real2/testkit`; production networking remains confined to
++  `@real2/integrations` `amoFetch`.
++- Added safe admin/head `GET /api/sync-runs` and `GET /api/sync-runs/{id}`
++  projections, admin-only `POST /api/sync-runs`, and `/sync` / `/sync/{id}`
++  screens. The manual button explicitly confirms a run begun in the preceding
++  minute; a held advisory lock becomes `409 E_SYNC_LOCKED` before network use.
++  The UI exposes only safe counters, page metadata, error summaries, and
++  aggregate audit paths—never raw payloads, query values, or credentials.
++
++## Recovery fixes
++
++- The inherited diff omitted the required `/sync` and `/sync/{id}` pages and
++  the manual trigger component; these were added with existing role and safe
++  projection patterns.
++- The web package was missing the installed workspace link to the worker
++  entrypoint. Its lockfile dependency and Next transpilation configuration now
++  compile the guarded worker entrypoint rather than relying on ignored stale
++  build output.
++- A fresh lint run found one unused `Database` type import in the inherited
++  DB integration test; it was removed. No behavior changed for that fix.
++
++## Fresh verification
++
++All commands used Node `v22.23.2` from the required pinned runtime and pnpm
++`10.34.5`. The database reset was local/synthetic only.
++
++| Check | Evidence |
++|---|---|
++| Local schema | `supabase db reset` applied migrations `0001`–`0006` cleanly. |
++| Focused Task 6 | 8 files / 29 tests passed: sync, schedule, watchdog, retention, mock server, guarded transport, sync API, and manual trigger. |
++| Repository + unit | `pnpm test`: 12 repository/worker TAP tests and 99 unit tests passed. |
++| Integration | `pnpm test:integration`: 8 files / 73 tests passed, including 4 operational DB tests and 5 safe sync-route tests. |
++| Security | `pnpm test:security`: 18 tests passed. |
++| Contracts | `pnpm test:contracts` exited 0 with no contract files. |
++| Static/build | `pnpm lint`, `pnpm typecheck`, and `pnpm build` all passed; build lists `/api/sync-runs`, `/api/sync-runs/[id]`, `/sync`, and `/sync/[id]`. |
++| Hygiene | `pnpm check:secrets` and `git diff --check` passed. |
++
++## Safety boundary
++
++- No live amoCRM business request, OAuth action, Google request, credential
++  lookup, protected spreadsheet operation, or switch enablement occurred.
++- Both external switches remain false in the repository configuration.
++- Task 5's append-only raw journal and atomic terminal/cursor seal remain the
++  only ordinary sync write path; retention is separate and proof-gated.
+diff --git a/apps/web/next.config.ts b/apps/web/next.config.ts
+index 73303a2..03afeb0 100644
+--- a/apps/web/next.config.ts
++++ b/apps/web/next.config.ts
+@@ -1,12 +1,15 @@
+ import type { NextConfig } from "next";
+ import { fileURLToPath } from "node:url";
+ 
+ const nextConfig: NextConfig = {
+   output: "standalone",
+   outputFileTracingRoot: fileURLToPath(new URL("../..", import.meta.url)),
+   poweredByHeader: false,
+   reactStrictMode: true,
+-  transpilePackages: ["@real2/domain"],
++  // The manual sync route consumes the worker's guarded entrypoint. Keep it
++  // in Next's compilation graph so a workspace install never relies on a
++  // stale ignored worker dist directory.
++  transpilePackages: ["@real2/domain", "@real2/worker"],
+ };
+ 
+ export default nextConfig;
+diff --git a/apps/web/package.json b/apps/web/package.json
+index d77c2b9..a9a54da 100644
+--- a/apps/web/package.json
++++ b/apps/web/package.json
+@@ -7,20 +7,21 @@
+     "dev": "next dev --hostname 127.0.0.1",
+     "lint": "eslint src next.config.ts",
+     "typecheck": "tsc --noEmit",
+     "build": "next build",
+     "start": "next start"
+   },
+   "dependencies": {
+     "@real2/db": "workspace:*",
+     "@real2/domain": "workspace:*",
+     "@real2/integrations": "workspace:*",
++    "@real2/worker": "workspace:*",
+     "@supabase/ssr": "^0.8.0",
+     "@supabase/supabase-js": "^2.90.0",
+     "next": "^16.0.0",
+     "react": "^19.0.0",
+     "react-dom": "^19.0.0",
+     "ulid": "^3.0.1",
+     "zod": "^4.0.0"
+   },
+   "devDependencies": {
+     "@types/react": "^19.0.0",
+diff --git a/apps/web/src/app/api/sync-runs/[id]/route.ts b/apps/web/src/app/api/sync-runs/[id]/route.ts
+new file mode 100644
+index 0000000..2b97a3b
+--- /dev/null
++++ b/apps/web/src/app/api/sync-runs/[id]/route.ts
+@@ -0,0 +1,23 @@
++import { getSyncRunDetail } from "@real2/db";
++import { AppError } from "@real2/domain";
++import { z } from "zod";
++
++import { requireRole } from "../../../../lib/auth/authorization";
++import { requireUser } from "../../../../lib/auth/require-user";
++import { withRoute } from "../../../../lib/http/route";
++import { getDatabase } from "../../../../lib/server/runtime";
++
++type SyncRunRouteContext = { params: Promise<{ id: string }> };
++
++export const GET = withRoute<unknown, SyncRunRouteContext>(async (
++  _request,
++  context,
++) => {
++  requireRole(await requireUser(), ["admin", "head"]);
++  if (!context.routeContext) throw new AppError("E_NOT_FOUND", 404);
++  const { id } = await context.routeContext.params;
++  const runId = z.uuid().parse(id);
++  const run = await getSyncRunDetail(getDatabase(), runId);
++  if (!run) throw new AppError("E_NOT_FOUND", 404);
++  return run;
++});
+diff --git a/apps/web/src/app/api/sync-runs/route.ts b/apps/web/src/app/api/sync-runs/route.ts
+new file mode 100644
+index 0000000..042a13f
+--- /dev/null
++++ b/apps/web/src/app/api/sync-runs/route.ts
+@@ -0,0 +1,56 @@
++import { getLatestSyncRun, listSyncRuns } from "@real2/db";
++import { AppError, success } from "@real2/domain";
++import { runSync } from "@real2/worker/amo-sync";
++import { z } from "zod";
++
++import { requireRole } from "../../../lib/auth/authorization";
++import { requireUser } from "../../../lib/auth/require-user";
++import { requireSameOrigin } from "../../../lib/http-security";
++import { readJson, withRoute } from "../../../lib/http/route";
++import { getDatabase } from "../../../lib/server/runtime";
++
++const manualSyncSchema = z.strictObject({
++  confirmRecent: z.boolean().optional().default(false),
++});
++
++export const GET = withRoute(async (request) => {
++  requireRole(await requireUser(), ["admin", "head"]);
++  const pageValue = new URL(request.url).searchParams.get("page") ?? "1";
++  const page = Number(pageValue);
++  return listSyncRuns(getDatabase(), { page, pageSize: 25 });
++});
++
++export const POST = withRoute(async (request, context) => {
++  requireSameOrigin(request);
++  requireRole(await requireUser(), ["admin"]);
++  const input = manualSyncSchema.parse(await readJson(request));
++  const latest = await getLatestSyncRun(getDatabase());
++  if (
++    latest &&
++    Date.now() - latest.startedAt.getTime() < 60_000 &&
++    !input.confirmRecent
++  ) {
++    throw new AppError(
++      "E_CONFLICT",
++      409,
++      "Последняя синхронизация началась менее минуты назад",
++    );
++  }
++
++  const result = await runSync("manual");
++  if ("kind" in result) throw new AppError("E_CONFIG_INCOMPLETE", 422);
++  if (result.status === "locked") {
++    throw new AppError("E_SYNC_LOCKED", 409);
++  }
++  return Response.json(
++    success(
++      {
++        runId: result.runId,
++        traceId: result.traceId,
++        status: result.status,
++      },
++      { trace_id: context.traceId },
++    ),
++    { status: 202 },
++  );
++});
+diff --git a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+new file mode 100644
+index 0000000..37dde3b
+--- /dev/null
++++ b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+@@ -0,0 +1,166 @@
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import { finishSyncRun, startSyncRun } from "@real2/db";
++import {
++  createAdminDb,
++  resetAndSeedUsers,
++  testUsers,
++} from "../../../../../../tests/helpers/local-db";
++
++import { GET, POST } from "./route";
++import { GET as GET_DETAIL } from "./[id]/route";
++
++const adminDb = createAdminDb();
++const session = vi.hoisted(() => ({
++  user: {
++    id: "10000000-0000-4000-8000-000000000010",
++    email: "admin@example.test",
++    fullName: "Admin User",
++    role: "admin" as "admin" | "head" | "manager",
++    amoUserId: null,
++  },
++}));
++const sync = vi.hoisted(() => ({
++  run: vi.fn(async () => ({
++    status: "success" as const,
++    runId: "20000000-0000-4000-8000-000000000020",
++    traceId: "synthetic-manual-trace",
++  })),
++}));
++
++vi.mock("../../../lib/auth/require-user", () => ({
++  requireUser: vi.fn(async () => session.user),
++}));
++vi.mock("../../../lib/server/runtime", () => ({
++  getDatabase: () => adminDb,
++  getServerEnv: () => ({ APP_URL: "https://dashboard.example.test" }),
++}));
++vi.mock("@real2/worker/amo-sync", () => ({ runSync: sync.run }));
++
++async function clearFixtures(): Promise<void> {
++  await adminDb.unsafe(
++    "truncate table public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++  );
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
++}
++
++async function seedRun(startedAt: Date) {
++  const [connection] = await adminDb<{ id: string }[]>`
++    insert into public.amo_connections (
++      account_id, subdomain, base_url, access_token_ciphertext,
++      refresh_token_ciphertext, token_expires_at, status, installed_by
++    ) values (
++      9001, '555151', 'https://555151.amocrm.ru', ${Buffer.alloc(64)},
++      ${Buffer.alloc(64)}, '2030-01-01T00:00:00Z', 'active', ${testUsers.admin.id}
++    ) returning id
++  `;
++  if (!connection) throw new Error("missing synthetic connection");
++  const [config] = await adminDb<{ id: string }[]>`
++    insert into public.pipeline_configs (
++      amo_connection_id, pipeline_id, pipeline_name, application_status_id,
++      application_status_name, won_status_id, won_status_name, version,
++      is_active, confirmed_by
++    ) values (
++      ${connection.id}, 77, 'Synthetic', 771, 'Application', 772, 'Won', 1,
++      true, ${testUsers.admin.id}
++    ) returning id
++  `;
++  if (!config) throw new Error("missing synthetic config");
++  const run = await startSyncRun(adminDb, {
++    traceId: `safe-trace-${startedAt.getTime()}`,
++    connectionId: connection.id,
++    configId: config.id,
++    kind: "incremental",
++    createdBy: testUsers.admin.id,
++    startedAt,
++  });
++  await adminDb`
++    insert into public.amo_api_audit (
++      sync_run_id, trace_id, method, normalized_path, response_status,
++      duration_ms, attempt, result
++    ) values (
++      ${run.id}, ${run.traceId}, 'GET', '/api/v4/leads/12345', 200, 8, 1, 'success'
++    )
++  `;
++  await finishSyncRun(adminDb, run.id, {
++    status: "success",
++    counts: { pagesRead: 2, leadsRead: 3, eventsRead: 4, usersRead: 1, retries: 1 },
++    nextCursors: {},
++  }, new Date(startedAt.getTime() + 1_000));
++  return run;
++}
++
++beforeEach(async () => {
++  await clearFixtures();
++  await resetAndSeedUsers(adminDb, [testUsers.admin, testUsers.head, testUsers.managerOne]);
++  session.user.id = testUsers.admin.id;
++  session.user.role = "admin";
++  sync.run.mockClear();
++});
++afterEach(clearFixtures);
++afterAll(async () => adminDb.end());
++
++describe("safe synchronization routes", () => {
++  it.each(["admin", "head"] as const)("lets %s list and inspect safe run data", async (role) => {
++    session.user.role = role;
++    session.user.id = role === "admin" ? testUsers.admin.id : testUsers.head.id;
++    const run = await seedRun(new Date("2026-09-15T08:00:00.000Z"));
++
++    const list = await GET(new Request("https://dashboard.example.test/api/sync-runs?page=1"));
++    const detail = await GET_DETAIL(
++      new Request(`https://dashboard.example.test/api/sync-runs/${run.id}`),
++      { params: Promise.resolve({ id: run.id }) },
++    );
++
++    expect(list.status).toBe(200);
++    expect((await list.json()).data.items[0]).toMatchObject({
++      id: run.id,
++      status: "success",
++      counts: { pages: 2, leads: 3, events: 4, users: 1, retries: 1 },
++    });
++    const detailBody = await detail.json();
++    expect(detailBody.data.audit[0]).toMatchObject({
++      normalizedPath: "/api/v4/leads/:id",
++      requestCount: 1,
++    });
++    expect(JSON.stringify(detailBody)).not.toContain("12345");
++  });
++
++  it("denies manager status access", async () => {
++    session.user.role = "manager";
++    session.user.id = testUsers.managerOne.id;
++    expect((await GET(new Request("https://dashboard.example.test/api/sync-runs"))).status).toBe(403);
++  });
++
++  it("requires recent-run confirmation, then accepts an admin manual run", async () => {
++    await seedRun(new Date(Date.now() - 30_000));
++    const first = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
++      method: "POST",
++      headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
++      body: JSON.stringify({ confirmRecent: false }),
++    }));
++    expect(first.status).toBe(409);
++    expect(sync.run).not.toHaveBeenCalled();
++
++    const accepted = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
++      method: "POST",
++      headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
++      body: JSON.stringify({ confirmRecent: true }),
++    }));
++    expect(accepted.status).toBe(202);
++    expect((await accepted.json()).data.traceId).toBe("synthetic-manual-trace");
++    expect(sync.run).toHaveBeenCalledWith("manual");
++  });
++
++  it("maps an occupied worker lock to 409 before accepting", async () => {
++    sync.run.mockResolvedValueOnce({ status: "locked", code: "E_SYNC_LOCKED" } as never);
++    const response = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
++      method: "POST",
++      headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
++      body: JSON.stringify({ confirmRecent: true }),
++    }));
++    expect(response.status).toBe(409);
++    expect((await response.json()).error.code).toBe("E_SYNC_LOCKED");
++  });
++});
+diff --git a/apps/web/src/app/globals.css b/apps/web/src/app/globals.css
+index 71962dc..66f9e8f 100644
+--- a/apps/web/src/app/globals.css
++++ b/apps/web/src/app/globals.css
+@@ -314,20 +314,39 @@ p {
+ }
+ 
+ .safe-mode {
+   padding: 16px;
+   border: 1px solid rgb(151 231 88 / 38%);
+   border-radius: 12px;
+   color: #dfffc8;
+   background: rgb(151 231 88 / 9%);
+ }
+ 
++.sync-trigger {
++  display: grid;
++  gap: 8px;
++  justify-items: end;
++}
++
++.sync-recent {
++  max-width: 260px;
++  margin: 0;
++  color: #ffe2a8;
++  font-size: 0.84rem;
++  text-align: right;
++}
++
++.sync-summary,
++.sync-history {
++  margin-bottom: 24px;
++}
++
+ .settings-grid {
+   display: grid;
+   gap: 24px;
+ }
+ 
+ .config-form {
+   display: grid;
+   grid-template-columns: repeat(2, minmax(0, 1fr));
+   gap: 16px;
+   margin-top: 20px;
+@@ -487,20 +506,28 @@ p {
+   .page-heading,
+   .header-actions {
+     align-items: flex-start;
+   }
+ 
+   .app-header,
+   .page-heading {
+     flex-direction: column;
+   }
+ 
++  .sync-trigger {
++    justify-items: start;
++  }
++
++  .sync-recent {
++    text-align: left;
++  }
++
+   .user-identity {
+     align-items: flex-start;
+   }
+ 
+   .user-form,
+   .user-card,
+   .config-form,
+   .quality-list {
+     grid-template-columns: 1fr;
+   }
+diff --git a/apps/web/src/app/sync/[id]/page.tsx b/apps/web/src/app/sync/[id]/page.tsx
+new file mode 100644
+index 0000000..1ca6b61
+--- /dev/null
++++ b/apps/web/src/app/sync/[id]/page.tsx
+@@ -0,0 +1,40 @@
++import Link from "next/link";
++import { notFound, redirect } from "next/navigation";
++import { z } from "zod";
++
++import { getSyncRunDetail } from "@real2/db";
++
++import { AppShell } from "../../../components/app-shell";
++import { requireRole } from "../../../lib/auth/authorization";
++import { requireUser } from "../../../lib/auth/require-user";
++import { getDatabase } from "../../../lib/server/runtime";
++
++export const dynamic = "force-dynamic";
++
++function formatDate(value: Date): string {
++  return new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(value);
++}
++
++export default async function SyncRunDetailPage({
++  params,
++}: Readonly<{ params: Promise<{ id: string }> }>) {
++  let user;
++  try {
++    user = requireRole(await requireUser(), ["admin", "head"]);
++  } catch {
++    redirect("/");
++  }
++  const parsed = z.uuid().safeParse((await params).id);
++  if (!parsed.success) notFound();
++  const run = await getSyncRunDetail(getDatabase(), parsed.data);
++  if (!run) notFound();
++
++  return (
++    <AppShell user={user}>
++      <div className="page-heading"><div><p className="eyebrow">Синхронизация</p><h1>{run.kind}</h1><p className="muted">Trace ID: {run.traceId}</p></div><Link href="/sync">К истории</Link></div>
++      <section className="panel"><h2>{run.status}</h2><dl className="integration-details"><div><dt>Начало</dt><dd>{formatDate(run.startedAt)}</dd></div><div><dt>Завершение</dt><dd>{run.finishedAt ? formatDate(run.finishedAt) : "выполняется"}</dd></div><div><dt>Страницы</dt><dd>{run.counts.pages}</dd></div><div><dt>Retries</dt><dd>{run.counts.retries}</dd></div></dl>{run.errorSummary ? <p className="form-error">{run.errorSummary}</p> : null}</section>
++      <section className="panel sync-history"><h2>Этапы</h2><div className="config-table-wrap"><table className="config-table"><thead><tr><th>Поток</th><th>Страница</th><th>Объектов</th><th>Получено</th></tr></thead><tbody>{run.pages.map((page) => <tr key={`${page.stream}-${page.pageNumber}`}><td>{page.stream}</td><td>{page.pageNumber}</td><td>{page.itemCount}</td><td>{formatDate(page.receivedAt)}</td></tr>)}{run.pages.length === 0 ? <tr><td colSpan={4} className="muted">Страницы ещё не записаны.</td></tr> : null}</tbody></table></div></section>
++      <section className="panel sync-history"><h2>HTTP audit</h2><div className="config-table-wrap"><table className="config-table"><thead><tr><th>Метод</th><th>Путь</th><th>Статус</th><th>Запросы</th><th>Время, мс</th><th>Макс. попытка</th></tr></thead><tbody>{run.audit.map((audit) => <tr key={`${audit.method}-${audit.normalizedPath}-${audit.responseStatus}-${audit.result}`}><td>{audit.method}</td><td>{audit.normalizedPath}</td><td>{audit.responseStatus ?? "—"}</td><td>{audit.requestCount}</td><td>{audit.totalDurationMs}</td><td>{audit.maxAttempt}</td></tr>)}{run.audit.length === 0 ? <tr><td colSpan={6} className="muted">Безопасных audit-записей нет.</td></tr> : null}</tbody></table></div></section>
++    </AppShell>
++  );
++}
+diff --git a/apps/web/src/app/sync/page.tsx b/apps/web/src/app/sync/page.tsx
+new file mode 100644
+index 0000000..e2c67b7
+--- /dev/null
++++ b/apps/web/src/app/sync/page.tsx
+@@ -0,0 +1,85 @@
++import Link from "next/link";
++import { redirect } from "next/navigation";
++
++import { getLatestSyncRun, listSyncRuns } from "@real2/db";
++
++import { AppShell } from "../../components/app-shell";
++import { SyncTrigger } from "../../components/sync-trigger";
++import { requireRole } from "../../lib/auth/authorization";
++import { requireUser } from "../../lib/auth/require-user";
++import { getDatabase } from "../../lib/server/runtime";
++
++export const dynamic = "force-dynamic";
++
++function formatDate(value: Date | null): string {
++  if (!value) return "выполняется";
++  return new Intl.DateTimeFormat("ru-RU", {
++    dateStyle: "medium",
++    timeStyle: "short",
++  }).format(value);
++}
++
++function duration(startedAt: Date, finishedAt: Date | null): string {
++  if (!finishedAt) return "выполняется";
++  return `${Math.max(0, Math.round((finishedAt.getTime() - startedAt.getTime()) / 1_000))} с`;
++}
++
++export default async function SyncRunsPage() {
++  let user;
++  try {
++    user = requireRole(await requireUser(), ["admin", "head"]);
++  } catch {
++    redirect("/");
++  }
++
++  const db = getDatabase();
++  const [latest, history] = await Promise.all([
++    getLatestSyncRun(db),
++    listSyncRuns(db, { page: 1, pageSize: 25 }),
++  ]);
++  const recentRun = latest
++    ? Date.now() - latest.startedAt.getTime() < 60_000
++    : false;
++
++  return (
++    <AppShell user={user}>
++      <div className="page-heading">
++        <div>
++          <p className="eyebrow">Контроль синхронизации</p>
++          <h1>Запуски amoCRM</h1>
++          <p className="muted">Показываются только безопасные статусы, счётчики и агрегированный audit.</p>
++        </div>
++        {user.role === "admin" ? <SyncTrigger recentRun={recentRun} /> : null}
++      </div>
++      <section className="panel sync-summary">
++        <h2>Свежесть</h2>
++        {latest ? (
++          <dl className="integration-details">
++            <div><dt>Последний запуск</dt><dd>{formatDate(latest.startedAt)}</dd></div>
++            <div><dt>Статус</dt><dd>{latest.status}</dd></div>
++            <div><dt>Тип</dt><dd>{latest.kind}</dd></div>
++            <div><dt>Длительность</dt><dd>{duration(latest.startedAt, latest.finishedAt)}</dd></div>
++          </dl>
++        ) : <p className="muted">Запусков ещё не было.</p>}
++      </section>
++      <section className="panel sync-history">
++        <h2>История</h2>
++        <div className="config-table-wrap">
++          <table className="config-table">
++            <thead><tr><th>Начало</th><th>Тип</th><th>Статус</th><th>Страницы</th><th>Лиды</th><th>События</th><th>Retries</th></tr></thead>
++            <tbody>
++              {history.items.map((run) => (
++                <tr key={run.id}>
++                  <td><Link href={`/sync/${run.id}`}>{formatDate(run.startedAt)}</Link></td>
++                  <td>{run.kind}</td><td>{run.status}</td><td>{run.counts.pages}</td>
++                  <td>{run.counts.leads}</td><td>{run.counts.events}</td><td>{run.counts.retries}</td>
++                </tr>
++              ))}
++              {history.items.length === 0 ? <tr><td colSpan={7} className="muted">Нет безопасной истории запусков.</td></tr> : null}
++            </tbody>
++          </table>
++        </div>
++      </section>
++    </AppShell>
++  );
++}
+diff --git a/apps/web/src/components/app-shell.tsx b/apps/web/src/components/app-shell.tsx
+index d0a1a3b..e4375a2 100644
+--- a/apps/web/src/components/app-shell.tsx
++++ b/apps/web/src/components/app-shell.tsx
+@@ -23,21 +23,24 @@ export function AppShell({
+         <div className="header-actions">
+           {user.role === "admin" ? (
+             <nav className="app-nav" aria-label="Администрирование">
+               <Link href="/settings/pipeline">Воронка</Link>
+               <Link href="/settings/channels">Каналы</Link>
+               <Link href="/settings/integrations/amo">amoCRM</Link>
+               <Link href="/settings/users">Пользователи</Link>
+             </nav>
+           ) : null}
+           {user.role === "admin" || user.role === "head" ? (
+-            <Link href="/quality/config">Качество</Link>
++            <>
++              <Link href="/quality/config">Качество</Link>
++              <Link href="/sync">Синхронизации</Link>
++            </>
+           ) : null}
+           <div className="user-identity">
+             <span>{user.fullName}</span>
+             <span className="role-chip">{roleLabels[user.role]}</span>
+           </div>
+           <LogoutButton />
+         </div>
+       </header>
+       <main className="content">{children}</main>
+     </div>
+diff --git a/apps/web/src/components/sync-trigger.test.tsx b/apps/web/src/components/sync-trigger.test.tsx
+new file mode 100644
+index 0000000..453b7d4
+--- /dev/null
++++ b/apps/web/src/components/sync-trigger.test.tsx
+@@ -0,0 +1,23 @@
++import { renderToStaticMarkup } from "react-dom/server";
++import React from "react";
++import { expect, it } from "vitest";
++
++import { buildManualSyncRequest, SyncTrigger } from "./sync-trigger";
++
++it("renders the admin manual trigger and sends explicit recent confirmation", () => {
++  const html = renderToStaticMarkup(<SyncTrigger recentRun />);
++
++  expect(html).toContain("Синхронизировать");
++  expect(html).toContain("Последний запуск начался менее минуты назад");
++  expect(buildManualSyncRequest(true)).toMatchObject({
++    method: "POST",
++    body: '{"confirmRecent":true}',
++  });
++});
++
++it("does not claim recent confirmation for an older run", () => {
++  expect(buildManualSyncRequest(false)).toMatchObject({
++    method: "POST",
++    body: '{"confirmRecent":false}',
++  });
++});
+diff --git a/apps/web/src/components/sync-trigger.tsx b/apps/web/src/components/sync-trigger.tsx
+new file mode 100644
+index 0000000..31564bb
+--- /dev/null
++++ b/apps/web/src/components/sync-trigger.tsx
+@@ -0,0 +1,58 @@
++"use client";
++
++import React, { useState } from "react";
++
++type ApiBody = Readonly<{
++  error?: Readonly<{ message?: string }>;
++}>;
++
++export function buildManualSyncRequest(confirmRecent: boolean): RequestInit {
++  return {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify({ confirmRecent }),
++  };
++}
++
++export function SyncTrigger({ recentRun }: Readonly<{ recentRun: boolean }>) {
++  const [pending, setPending] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  async function start(): Promise<void> {
++    const confirmRecent = recentRun
++      ? window.confirm("Последний запуск начался менее минуты назад. Запустить ещё раз?")
++      : false;
++    if (recentRun && !confirmRecent) return;
++
++    setPending(true);
++    setError(null);
++    try {
++      const response = await fetch(
++        "/api/sync-runs",
++        buildManualSyncRequest(confirmRecent),
++      );
++      if (!response.ok) {
++        const body = (await response.json().catch(() => ({}))) as ApiBody;
++        setError(body.error?.message ?? "Не удалось запустить синхронизацию");
++        return;
++      }
++      window.location.reload();
++    } catch {
++      setError("Сервис временно недоступен. Повторите попытку");
++    } finally {
++      setPending(false);
++    }
++  }
++
++  return (
++    <div className="sync-trigger">
++      {recentRun ? (
++        <p className="sync-recent">Последний запуск начался менее минуты назад</p>
++      ) : null}
++      <button className="button" disabled={pending} onClick={start} type="button">
++        {pending ? "Запускаем…" : "Синхронизировать"}
++      </button>
++      {error ? <p aria-live="polite" className="form-error" role="alert">{error}</p> : null}
++    </div>
++  );
++}
+diff --git a/apps/worker/package.json b/apps/worker/package.json
+index b081a82..dedafeb 100644
+--- a/apps/worker/package.json
++++ b/apps/worker/package.json
+@@ -1,15 +1,21 @@
+ {
+   "name": "@real2/worker",
+   "version": "0.0.0",
+   "private": true,
+   "type": "module",
++  "exports": {
++    "./amo-sync": {
++      "types": "./src/jobs/amo-sync.ts",
++      "import": "./dist/jobs/amo-sync.js"
++    }
++  },
+   "scripts": {
+     "dev": "tsx watch src/main.ts",
+     "lint": "eslint src",
+     "typecheck": "tsc --noEmit",
+     "test": "node --test src/*.test.mts",
+     "build": "tsc -p tsconfig.build.json",
+     "start": "node dist/main.js"
+   },
+   "dependencies": {
+     "@real2/db": "workspace:*",
+diff --git a/apps/worker/src/jobs/amo-sync.test.ts b/apps/worker/src/jobs/amo-sync.test.ts
+new file mode 100644
+index 0000000..007f24d
+--- /dev/null
++++ b/apps/worker/src/jobs/amo-sync.test.ts
+@@ -0,0 +1,193 @@
++import { describe, expect, it, vi } from "vitest";
++
++import {
++  createAmoSyncRunner,
++  type AmoSyncDependencies,
++  type Clock,
++} from "./amo-sync";
++
++const fixedNow = new Date("2026-09-15T09:00:00.000Z");
++
++function createClock(): Clock & { sleeps: number[] } {
++  const sleeps: number[] = [];
++  return {
++    sleeps,
++    now: () => fixedNow,
++    random: () => 0,
++    sleep: async (milliseconds) => {
++      sleeps.push(milliseconds);
++    },
++  };
++}
++
++function disabledHarness(envEnabled: boolean, dbEnabled: boolean) {
++  const tokenProvider = { getAccessToken: vi.fn(async () => "test-token") };
++  const requestPage = vi.fn();
++  const acquire = vi.fn();
++  const dependencies = {
++    envEnabled,
++    controls: { isSyncEnabled: vi.fn(async () => dbEnabled) },
++    connections: { getActive: vi.fn() },
++    configs: { getActive: vi.fn() },
++    locks: { withSyncLock: acquire },
++    cursors: { get: vi.fn() },
++    runs: { start: vi.fn(), finish: vi.fn() },
++    raw: { appendPage: vi.fn(), quarantinePage: vi.fn() },
++    transport: { requestPage },
++    tokens: { createProvider: vi.fn(() => tokenProvider), refresh: vi.fn() },
++    reconciliation: { previousFullLeadCount: vi.fn() },
++  } as unknown as AmoSyncDependencies;
++  return { dependencies, acquire, requestPage, tokenProvider };
++}
++
++describe("amoCRM read-only sync", () => {
++  it.each([
++    { envEnabled: false, dbEnabled: false },
++    { envEnabled: false, dbEnabled: true },
++    { envEnabled: true, dbEnabled: false },
++  ])(
++    "does not acquire a token or call the network when env=$envEnabled db=$dbEnabled",
++    async ({ envEnabled, dbEnabled }) => {
++      const harness = disabledHarness(envEnabled, dbEnabled);
++      const result = await createAmoSyncRunner(harness.dependencies)(
++        "incremental",
++        createClock(),
++      );
++
++      expect(result).toEqual({ kind: "disabled" });
++      expect(harness.acquire).not.toHaveBeenCalled();
++      expect(harness.tokenProvider.getAccessToken).not.toHaveBeenCalled();
++      expect(harness.requestPage).not.toHaveBeenCalled();
++    },
++  );
++
++  it("does not advance cursors when page three fails after five retries", async () => {
++    const clock = createClock();
++    const finished: unknown[] = [];
++    const paths: string[] = [];
++    const dependencies = {
++      envEnabled: true,
++      controls: { isSyncEnabled: vi.fn(async () => true) },
++      connections: {
++        getActive: vi.fn(async () => ({
++          id: "connection-1",
++          accountId: 9001,
++          baseUrl: "https://555151.amocrm.ru",
++        })),
++      },
++      configs: {
++        getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })),
++      },
++      locks: {
++        withSyncLock: vi.fn(async (_connectionId, action) => action()),
++      },
++      cursors: {
++        get: vi.fn(async () => ({
++          events: {
++            cursorTime: new Date("2026-09-15T08:30:00.000Z"),
++            cursorExternalId: "event-before",
++          },
++        })),
++      },
++      runs: {
++        start: vi.fn(async () => ({ id: "run-1", traceId: "trace-1" })),
++        finish: vi.fn(async (_runId, outcome) => {
++          finished.push(outcome);
++        }),
++      },
++      raw: { appendPage: vi.fn(), quarantinePage: vi.fn() },
++      transport: {
++        requestPage: vi.fn(async (request) => {
++          paths.push(request.url);
++          if (request.url.includes("/account")) {
++            return { id: 9001, subdomain: "555151" };
++          }
++          if (request.url.includes("/pipelines/77/statuses")) {
++            return { _embedded: { statuses: [] } };
++          }
++          if (request.url.includes("/pipelines")) {
++            return { _embedded: { pipelines: [] } };
++          }
++          if (request.url.includes("/users")) {
++            return { _embedded: { users: [] } };
++          }
++          if (request.url.includes("/events")) {
++            return { _embedded: { events: [] } };
++          }
++          if (request.url.includes("page=3")) {
++            throw Object.assign(new Error("upstream"), {
++              code: "E_AMO_UPSTREAM",
++              responseStatus: 503,
++            });
++          }
++          const page = request.url.includes("page=2") ? 2 : 1;
++          return {
++            _embedded: { leads: [{ id: page, account_id: 9001, created_at: 1, updated_at: 1 }] },
++            _links: {
++              next: {
++                href: `https://555151.amocrm.ru/api/v4/leads?page=${page + 1}`,
++              },
++            },
++          };
++        }),
++      },
++      tokens: {
++        createProvider: vi.fn(() => ({ getAccessToken: vi.fn(async () => "test-token") })),
++        refresh: vi.fn(),
++      },
++      reconciliation: { previousFullLeadCount: vi.fn(async () => null) },
++    } as unknown as AmoSyncDependencies;
++
++    const result = await createAmoSyncRunner(dependencies)("incremental", clock);
++
++    expect(result).toMatchObject({ status: "partial", runId: "run-1" });
++    expect(clock.sleeps).toEqual([1_000, 3_000, 9_000, 27_000, 60_000]);
++    expect(finished).toHaveLength(1);
++    expect(finished[0]).toMatchObject({ status: "partial" });
++    expect(finished[0]).not.toHaveProperty("nextCursors");
++    expect(paths.filter((path) => path.includes("page=3"))).toHaveLength(6);
++  });
++
++  it("quarantines the exact malformed 200 payload and does not retry it", async () => {
++    const malformed = { id: "not-an-account-id", diagnostic: "synthetic" };
++    const quarantined: unknown[] = [];
++    const requestPage = vi.fn(async () => malformed);
++    const dependencies = {
++      envEnabled: true,
++      controls: { isSyncEnabled: vi.fn(async () => true) },
++      connections: {
++        getActive: vi.fn(async () => ({
++          id: "connection-1",
++          accountId: 9001,
++          baseUrl: "https://555151.amocrm.ru",
++        })),
++      },
++      configs: { getActive: vi.fn(async () => ({ id: "config-1", pipelineId: 77 })) },
++      locks: { withSyncLock: vi.fn(async (_id, action) => action()) },
++      cursors: { get: vi.fn(async () => ({})) },
++      runs: {
++        start: vi.fn(async () => ({ id: "run-1", traceId: "trace-1" })),
++        finish: vi.fn(),
++      },
++      raw: {
++        appendPage: vi.fn(),
++        quarantinePage: vi.fn(async (input) => {
++          quarantined.push(input);
++        }),
++      },
++      transport: { requestPage },
++      tokens: {
++        createProvider: vi.fn(() => ({ getAccessToken: vi.fn() })),
++        refresh: vi.fn(),
++      },
++      reconciliation: { previousFullLeadCount: vi.fn() },
++    } as unknown as AmoSyncDependencies;
++
++    await expect(
++      createAmoSyncRunner(dependencies)("incremental", createClock()),
++    ).resolves.toMatchObject({ status: "partial" });
++    expect(requestPage).toHaveBeenCalledOnce();
++    expect(quarantined).toHaveLength(1);
++    expect(quarantined[0]).toMatchObject({ payload: malformed });
++  });
++});
+diff --git a/apps/worker/src/jobs/amo-sync.ts b/apps/worker/src/jobs/amo-sync.ts
+new file mode 100644
+index 0000000..cc3d79a
+--- /dev/null
++++ b/apps/worker/src/jobs/amo-sync.ts
+@@ -0,0 +1,914 @@
++import { createHash, randomUUID } from "node:crypto";
++
++import {
++  appendAmoApiAudit,
++  appendRawPage,
++  closeDbClient,
++  createServiceWorkerDbClient,
++  finishSyncRun,
++  getActivePipelineConfig,
++  getCurrentSafeAmoConnectionStatus,
++  getPreviousFullLeadCount,
++  getSyncCursors,
++  getSystemControl,
++  quarantineRawPage,
++  startSyncRun,
++  withSyncAdvisoryLock,
++  type Database,
++} from "@real2/db";
++import type {
++  AmoApiAuditInput,
++  AppendRawPageInput,
++  RawAmoEventInput,
++  RawAmoObjectInput,
++  SyncCounts,
++  SyncCursorPosition,
++  SyncKind,
++  SyncOutcome,
++  SyncStream,
++} from "@real2/db";
++import {
++  AppError,
++  parseServerEnv,
++  type AppErrorCode,
++  type ServerEnv,
++} from "@real2/domain";
++import {
++  amoFetch,
++  amoAccountResponseSchema,
++  amoEventsResponseSchema,
++  amoLeadsResponseSchema,
++  amoPipelinesResponseSchema,
++  amoStatusesResponseSchema,
++  amoUsersResponseSchema,
++  createAmoTokenProvider,
++  decodeTokenEncryptionKey,
++  refreshConnection,
++  type AmoAccountResponse,
++  type AmoEvent,
++  type AmoEventsResponse,
++  type AmoLead,
++  type AmoLeadsResponse,
++  type AmoPipeline,
++  type AmoPipelinesResponse,
++  type AmoStatus,
++  type AmoStatusesResponse,
++  type AmoTokenProvider,
++  type AmoUser,
++  type AmoUsersResponse,
++} from "@real2/integrations";
++import type { JSONValue } from "postgres";
++import { z } from "zod";
++
++const RETRY_DELAYS_MS = [1_000, 3_000, 9_000, 27_000, 60_000] as const;
++const OVERLAP_MS = 10 * 60_000;
++const MAX_COUNT_DROP_RATIO = 0.05;
++
++export type Clock = Readonly<{
++  now(): Date;
++  sleep(milliseconds: number): Promise<void>;
++  random(): number;
++}>;
++
++export const systemClock: Clock = {
++  now: () => new Date(),
++  sleep: (milliseconds) =>
++    new Promise((resolve) => setTimeout(resolve, milliseconds)),
++  random: () => Math.random(),
++};
++
++export type ActiveSyncConnection = Readonly<{
++  id: string;
++  accountId: number;
++  baseUrl: string;
++}>;
++
++export type ActiveSyncConfig = Readonly<{
++  id: string;
++  pipelineId: number;
++}>;
++
++export type SyncCursorSnapshot = Partial<
++  Record<SyncStream, SyncCursorPosition>
++>;
++
++export type SyncRunResult =
++  | Readonly<{ kind: "disabled" }>
++  | Readonly<{ status: "success" | "partial" | "failed"; runId: string; traceId: string }>
++  | Readonly<{ status: "locked"; code: "E_SYNC_LOCKED" }>;
++
++export type SyncTransportRequest<T> = Readonly<{
++  url: string;
++  runId: string;
++  traceId: string;
++  attempt: number;
++  tokenProvider: AmoTokenProvider;
++  schema: z.ZodType<T>;
++  audit(input: AmoApiAuditInput): Promise<void>;
++}>;
++
++export type StartedSyncRun = Readonly<{ id: string; traceId: string }>;
++
++export type AmoSyncDependencies = Readonly<{
++  envEnabled: boolean;
++  controls: Readonly<{ isSyncEnabled(): Promise<boolean> }>;
++  connections: Readonly<{ getActive(): Promise<ActiveSyncConnection | null> }>;
++  configs: Readonly<{
++    getActive(connectionId: string): Promise<ActiveSyncConfig | null>;
++  }>;
++  locks: Readonly<{
++    withSyncLock<T>(connectionId: string, action: () => Promise<T>): Promise<T>;
++  }>;
++  cursors: Readonly<{
++    get(connectionId: string): Promise<SyncCursorSnapshot>;
++  }>;
++  runs: Readonly<{
++    start(input: {
++      kind: SyncKind;
++      connectionId: string;
++      configId: string;
++      traceId: string;
++      startedAt: Date;
++    }): Promise<StartedSyncRun>;
++    finish(runId: string, outcome: SyncOutcome, finishedAt: Date): Promise<void>;
++  }>;
++  raw: Readonly<{
++    appendPage(input: AppendRawPageInput): Promise<void>;
++    quarantinePage(input: {
++      syncRunId: string;
++      stream: SyncStream;
++      pageNumber: number;
++      reasonCode: string;
++      payload: JSONValue;
++      payloadSha256: string;
++      receivedAt: Date;
++    }): Promise<void>;
++  }>;
++  transport: Readonly<{
++    requestPage<T>(request: SyncTransportRequest<T>): Promise<unknown>;
++  }>;
++  tokens: Readonly<{
++    createProvider(
++      connectionId: string,
++      context: Readonly<{ runId: string; traceId: string; clock: Clock }>,
++    ): AmoTokenProvider;
++    refresh(
++      connectionId: string,
++      now: Date,
++      context: Readonly<{ runId: string; traceId: string }>,
++    ): Promise<string>;
++  }>;
++  audit?: Readonly<{
++    append(input: AmoApiAuditInput): Promise<void>;
++  }>;
++  reconciliation: Readonly<{
++    previousFullLeadCount(connectionId: string): Promise<number | null>;
++  }>;
++  traceId?: () => string;
++}>;
++
++type MutableCounts = {
++  pagesRead: number;
++  leadsRead: number;
++  eventsRead: number;
++  usersRead: number;
++  retries: number;
++};
++
++type SyncFailure = Error & {
++  code?: AppErrorCode;
++  responseStatus?: number;
++  forceStatus?: "partial" | "failed";
++};
++
++type RunContext = {
++  connection: ActiveSyncConnection;
++  config: ActiveSyncConfig;
++  run: StartedSyncRun;
++  clock: Clock;
++  counts: MutableCounts;
++  tokenProvider: AmoTokenProvider;
++  pageHashes: string[];
++  nextCursors: SyncCursorSnapshot;
++  nextPageNumber: Record<SyncStream, number>;
++};
++
++function sha256(value: unknown): string {
++  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
++}
++
++function asJsonValue(value: unknown): JSONValue {
++  return value as JSONValue;
++}
++
++function toDate(unixSeconds: number): Date {
++  return new Date(unixSeconds * 1_000);
++}
++
++function countsSnapshot(counts: MutableCounts): SyncCounts {
++  return { ...counts };
++}
++
++function appendQuery(url: string, entries: Record<string, string>): string {
++  const parsed = new URL(url);
++  for (const [key, value] of Object.entries(entries)) {
++    parsed.searchParams.set(key, value);
++  }
++  return parsed.toString();
++}
++
++function responseStatus(error: unknown): number | undefined {
++  if (typeof error !== "object" || error === null || !("responseStatus" in error)) {
++    return undefined;
++  }
++  const status = (error as { responseStatus?: unknown }).responseStatus;
++  return typeof status === "number" ? status : undefined;
++}
++
++function errorCode(error: unknown): AppErrorCode {
++  if (error instanceof AppError) return error.code;
++  if (typeof error === "object" && error !== null && "code" in error) {
++    const code = (error as { code?: unknown }).code;
++    if (typeof code === "string" && code.startsWith("E_")) {
++      return code as AppErrorCode;
++    }
++  }
++  return "E_AMO_UPSTREAM";
++}
++
++function fail(
++  code: AppErrorCode,
++  message: string,
++  forceStatus?: "partial" | "failed",
++): SyncFailure {
++  return Object.assign(new AppError(code, code === "E_SYNC_LOCKED" ? 409 : 502), {
++    message,
++    ...(forceStatus ? { forceStatus } : {}),
++  });
++}
++
++function nextCursor(
++  current: SyncCursorPosition | undefined,
++  candidateTime: Date,
++  candidateExternalId: string,
++): SyncCursorPosition {
++  if (!current?.cursorTime) {
++    return { cursorTime: candidateTime, cursorExternalId: candidateExternalId };
++  }
++  const difference = candidateTime.getTime() - current.cursorTime.getTime();
++  if (
++    difference > 0 ||
++    (difference === 0 &&
++      candidateExternalId > (current.cursorExternalId ?? ""))
++  ) {
++    return { cursorTime: candidateTime, cursorExternalId: candidateExternalId };
++  }
++  return current;
++}
++
++async function requestWithRetry<T>(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  url: string,
++  schema: z.ZodType<T>,
++): Promise<unknown> {
++  let refreshed = false;
++  let retryIndex = 0;
++  let attempt = 1;
++
++  while (true) {
++    try {
++      return await dependencies.transport.requestPage({
++        url,
++        runId: context.run.id,
++        traceId: context.run.traceId,
++        attempt,
++        tokenProvider: context.tokenProvider,
++        schema,
++        audit: async (input) => dependencies.audit?.append(input),
++      });
++    } catch (error) {
++      const status = responseStatus(error);
++      const code = errorCode(error);
++      if (!refreshed && (status === 401 || code === "E_AMO_AUTH")) {
++        refreshed = true;
++        context.counts.retries += 1;
++        await dependencies.tokens.refresh(
++          context.connection.id,
++          context.clock.now(),
++          { runId: context.run.id, traceId: context.run.traceId },
++        );
++        attempt += 1;
++        continue;
++      }
++
++      const retryable =
++        status === 429 ||
++        (status !== undefined && status >= 500 && status <= 599) ||
++        code === "E_AMO_RATE_LIMIT" ||
++        (code === "E_AMO_UPSTREAM" && status === undefined);
++      if (!retryable || retryIndex >= RETRY_DELAYS_MS.length) throw error;
++
++      const baseDelay = RETRY_DELAYS_MS[retryIndex]!;
++      const jitter = Math.round(baseDelay * 0.2 * context.clock.random());
++      context.counts.retries += 1;
++      retryIndex += 1;
++      attempt += 1;
++      await context.clock.sleep(baseDelay + jitter);
++    }
++  }
++}
++
++async function appendValidatedPage(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  stream: SyncStream,
++  payload: unknown,
++  objects: readonly RawAmoObjectInput[],
++  events: readonly RawAmoEventInput[],
++): Promise<void> {
++  const payloadSha256 = sha256(payload);
++  context.pageHashes.push(payloadSha256);
++  const pageNumber = context.nextPageNumber[stream]++;
++  await dependencies.raw.appendPage({
++    syncRunId: context.run.id,
++    stream,
++    pageNumber,
++    itemCount: objects.length + events.length,
++    payloadSha256,
++    objects,
++    events,
++    receivedAt: context.clock.now(),
++  });
++  context.counts.pagesRead += 1;
++}
++
++async function quarantineInvalidPage(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  stream: SyncStream,
++  payload: unknown,
++): Promise<never> {
++  const payloadSha256 = sha256(payload);
++  const pageNumber = context.nextPageNumber[stream]++;
++  await dependencies.raw.quarantinePage({
++    syncRunId: context.run.id,
++    stream,
++    pageNumber,
++    reasonCode: "E_SCHEMA_INVALID",
++    payload: asJsonValue(payload),
++    payloadSha256,
++    receivedAt: context.clock.now(),
++  });
++  context.counts.pagesRead += 1;
++  throw fail("E_SYNC_PARTIAL", "amoCRM page schema validation failed", "partial");
++}
++
++async function loadPage<T>(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  url: string,
++  schema: z.ZodType<T>,
++  stream: SyncStream,
++): Promise<T> {
++  const payload = await requestWithRetry(
++    dependencies,
++    context,
++    url,
++    schema,
++  );
++  const parsed = schema.safeParse(payload);
++  if (!parsed.success) {
++    return quarantineInvalidPage(dependencies, context, stream, payload);
++  }
++  return parsed.data;
++}
++
++async function paginate<
++  T extends {
++    _links?: { next?: { href: string } | undefined } | undefined;
++  },
++>(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  input: {
++    url: string;
++    schema: z.ZodType<T>;
++    stream: SyncStream;
++    map(payload: T): {
++      objects: readonly RawAmoObjectInput[];
++      events: readonly RawAmoEventInput[];
++    };
++  },
++): Promise<void> {
++  const seenChecksums = new Set<string>();
++  let url: string | undefined = input.url;
++
++  while (url) {
++    const payload: T = await loadPage<T>(
++      dependencies,
++      context,
++      url,
++      input.schema,
++      input.stream,
++    );
++    const payloadSha256 = sha256(payload);
++    if (seenChecksums.has(payloadSha256)) {
++      throw fail("E_AMO_UPSTREAM", "amoCRM pagination loop detected", "failed");
++    }
++    seenChecksums.add(payloadSha256);
++    const mapped = input.map(payload);
++    await appendValidatedPage(
++      dependencies,
++      context,
++      input.stream,
++      payload,
++      mapped.objects,
++      mapped.events,
++    );
++    url = payload._links?.next?.href;
++  }
++}
++
++function objectInput(
++  accountId: number,
++  entityType: RawAmoObjectInput["entityType"],
++  externalId: number,
++  payload: object,
++  sourceUpdatedAt?: Date | null,
++): RawAmoObjectInput {
++  return {
++    accountId,
++    entityType,
++    externalId,
++    ...(sourceUpdatedAt !== undefined ? { sourceUpdatedAt } : {}),
++    payload: asJsonValue(payload),
++    payloadSha256: sha256(payload),
++  };
++}
++
++async function ingestMetadata(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++): Promise<void> {
++  const accountUrl = `${context.connection.baseUrl}/api/v4/account`;
++  const account = await loadPage(
++    dependencies,
++    context,
++    accountUrl,
++    amoAccountResponseSchema,
++    "metadata",
++  );
++  await appendValidatedPage(
++    dependencies,
++    context,
++    "metadata",
++    account,
++    [objectInput(account.id, "account", account.id, account)],
++    [],
++  );
++
++  await paginate<AmoPipelinesResponse>(dependencies, context, {
++    url: `${context.connection.baseUrl}/api/v4/leads/pipelines`,
++    schema: amoPipelinesResponseSchema,
++    stream: "metadata",
++    map: (payload) => ({
++      objects: payload._embedded.pipelines.map((pipeline: AmoPipeline) =>
++        objectInput(account.id, "pipeline", pipeline.id, pipeline),
++      ),
++      events: [],
++    }),
++  });
++
++  await paginate<AmoStatusesResponse>(dependencies, context, {
++    url: `${context.connection.baseUrl}/api/v4/leads/pipelines/${context.config.pipelineId}/statuses`,
++    schema: amoStatusesResponseSchema,
++    stream: "metadata",
++    map: (payload) => ({
++      objects: payload._embedded.statuses.map((status: AmoStatus) =>
++        objectInput(account.id, "status", status.id, status),
++      ),
++      events: [],
++    }),
++  });
++}
++
++async function ingestUsers(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++): Promise<void> {
++  await paginate<AmoUsersResponse>(dependencies, context, {
++    url: `${context.connection.baseUrl}/api/v4/users`,
++    schema: amoUsersResponseSchema,
++    stream: "users",
++    map: (payload) => {
++      const users = payload._embedded.users;
++      context.counts.usersRead += users.length;
++      return {
++        objects: users.map((user: AmoUser) =>
++          objectInput(context.connection.accountId, "user", user.id, user),
++        ),
++        events: [],
++      };
++    },
++  });
++}
++
++async function ingestEvents(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  incremental: boolean,
++): Promise<void> {
++  let url = `${context.connection.baseUrl}/api/v4/events`;
++  const existing = context.nextCursors.events;
++  if (incremental && existing?.cursorTime) {
++    url = appendQuery(url, {
++      "filter[created_at][from]": String(
++        Math.floor((existing.cursorTime.getTime() - OVERLAP_MS) / 1_000),
++      ),
++    });
++  }
++  await paginate<AmoEventsResponse>(dependencies, context, {
++    url,
++    schema: amoEventsResponseSchema,
++    stream: "events",
++    map: (payload) => {
++      const events = payload._embedded.events;
++      context.counts.eventsRead += events.length;
++      for (const event of events) {
++        context.nextCursors.events = nextCursor(
++          context.nextCursors.events,
++          toDate(event.created_at),
++          event.id,
++        );
++      }
++      return {
++        objects: [],
++        events: events.map((event: AmoEvent) => ({
++          accountId: event.account_id,
++          amoEventId: event.id,
++          amoLeadId: event.entity_type === "lead" ? event.entity_id : null,
++          eventType: event.type,
++          eventAt: toDate(event.created_at),
++          payload: asJsonValue(event),
++          payloadSha256: sha256(event),
++        })),
++      };
++    },
++  });
++}
++
++async function ingestLeads(
++  dependencies: AmoSyncDependencies,
++  context: RunContext,
++  incremental: boolean,
++): Promise<void> {
++  let url = appendQuery(`${context.connection.baseUrl}/api/v4/leads`, {
++    "filter[pipeline_id]": String(context.config.pipelineId),
++  });
++  const existing = context.nextCursors.leads;
++  if (incremental && existing?.cursorTime) {
++    url = appendQuery(url, {
++      "filter[updated_at][from]": String(
++        Math.floor((existing.cursorTime.getTime() - OVERLAP_MS) / 1_000),
++      ),
++    });
++  }
++  await paginate<AmoLeadsResponse>(dependencies, context, {
++    url,
++    schema: amoLeadsResponseSchema,
++    stream: "leads",
++    map: (payload) => {
++      const leads = payload._embedded.leads;
++      context.counts.leadsRead += leads.length;
++      for (const lead of leads) {
++        context.nextCursors.leads = nextCursor(
++          context.nextCursors.leads,
++          toDate(lead.updated_at),
++          String(lead.id),
++        );
++      }
++      return {
++        objects: leads.map((lead: AmoLead) =>
++          objectInput(
++            lead.account_id,
++            "lead",
++            lead.id,
++            lead,
++            toDate(lead.updated_at),
++          ),
++        ),
++        events: [],
++      };
++    },
++  });
++}
++
++async function executeLockedSync(
++  dependencies: AmoSyncDependencies,
++  kind: SyncKind,
++  clock: Clock,
++  connection: ActiveSyncConnection,
++): Promise<SyncRunResult> {
++  const config = await dependencies.configs.getActive(connection.id);
++  if (!config) throw new AppError("E_CONFIG_INCOMPLETE", 422);
++  const traceId = dependencies.traceId?.() ?? randomUUID();
++  const run = await dependencies.runs.start({
++    kind,
++    connectionId: connection.id,
++    configId: config.id,
++    traceId,
++    startedAt: clock.now(),
++  });
++  const counts: MutableCounts = {
++    pagesRead: 0,
++    leadsRead: 0,
++    eventsRead: 0,
++    usersRead: 0,
++    retries: 0,
++  };
++  const incremental = kind === "incremental";
++  const context: RunContext = {
++    connection,
++    config,
++    run,
++    clock,
++    counts,
++    tokenProvider: dependencies.tokens.createProvider(connection.id, {
++      runId: run.id,
++      traceId: run.traceId,
++      clock,
++    }),
++    pageHashes: [],
++    nextCursors: await dependencies.cursors.get(connection.id),
++    nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
++  };
++
++  try {
++    await ingestMetadata(dependencies, context);
++    await ingestUsers(dependencies, context);
++    await ingestEvents(dependencies, context, incremental);
++    await ingestLeads(dependencies, context, incremental);
++
++    if (!incremental) {
++      const previousCount = await dependencies.reconciliation.previousFullLeadCount(
++        connection.id,
++      );
++      if (
++        previousCount !== null &&
++        previousCount > 0 &&
++        counts.leadsRead < previousCount * (1 - MAX_COUNT_DROP_RATIO)
++      ) {
++        throw fail(
++          "E_DATA_QUALITY_BLOCK",
++          "Full lead count dropped by more than five percent",
++          "failed",
++        );
++      }
++    }
++
++    await dependencies.runs.finish(
++      run.id,
++      {
++        status: "success",
++        nextCursors: context.nextCursors,
++        counts: countsSnapshot(counts),
++        checksum: sha256(context.pageHashes),
++      },
++      clock.now(),
++    );
++    return { status: "success", runId: run.id, traceId: run.traceId };
++  } catch (error) {
++    const forced = (error as SyncFailure).forceStatus;
++    const status = forced ?? (counts.pagesRead > 0 ? "partial" : "failed");
++    const code = errorCode(error);
++    await dependencies.runs.finish(
++      run.id,
++      {
++        status,
++        safeError:
++          code === "E_DATA_QUALITY_BLOCK"
++            ? "Full lead count dropped by more than five percent"
++            : code === "E_AMO_AUTH"
++              ? "amoCRM authorization failed"
++              : code === "E_SYNC_PARTIAL"
++                ? "amoCRM returned an invalid page"
++                : "amoCRM synchronization failed",
++        errorCode: code,
++        counts: countsSnapshot(counts),
++        checksum: context.pageHashes.length > 0 ? sha256(context.pageHashes) : null,
++      },
++      clock.now(),
++    );
++    return { status, runId: run.id, traceId: run.traceId };
++  }
++}
++
++export function createAmoSyncRunner(dependencies: AmoSyncDependencies) {
++  return async function runSyncWithDependencies(
++    kind: SyncKind,
++    clock: Clock = systemClock,
++  ): Promise<SyncRunResult> {
++    if (!dependencies.envEnabled) return { kind: "disabled" };
++    if (!(await dependencies.controls.isSyncEnabled())) {
++      return { kind: "disabled" };
++    }
++
++    const connection = await dependencies.connections.getActive();
++    if (!connection || !Number.isSafeInteger(connection.accountId)) {
++      throw new AppError("E_AMO_AUTH", 502);
++    }
++
++    try {
++      return await dependencies.locks.withSyncLock(connection.id, () =>
++        executeLockedSync(dependencies, kind, clock, connection),
++      );
++    } catch (error) {
++      if (errorCode(error) === "E_SYNC_LOCKED") {
++        return { status: "locked", code: "E_SYNC_LOCKED" };
++      }
++      throw error;
++    }
++  };
++}
++
++function productionAuditSink(
++  db: Database,
++  runId: string,
++  attempt: number,
++) {
++  return {
++    async record(entry: {
++      method: string;
++      normalizedPath: string;
++      responseStatus?: number;
++      durationMs: number;
++      traceId: string;
++      result: "denied" | "success" | "error";
++    }): Promise<void> {
++      await appendAmoApiAudit(db, {
++        syncRunId: runId,
++        traceId: entry.traceId,
++        method: entry.method as AmoApiAuditInput["method"],
++        normalizedPath: entry.normalizedPath,
++        ...(entry.responseStatus !== undefined
++          ? { responseStatus: entry.responseStatus }
++          : {}),
++        durationMs: entry.durationMs,
++        attempt,
++        result: entry.result,
++      });
++    },
++  };
++}
++
++function productionTokenDependencies(
++  db: Database,
++  env: ServerEnv,
++  context: Readonly<{ runId: string; traceId: string }>,
++) {
++  const encryptionKey = decodeTokenEncryptionKey(env.TOKEN_ENCRYPTION_KEY);
++  const oauthConfig = {
++    clientId: env.AMO_CLIENT_ID,
++    clientSecret: env.AMO_CLIENT_SECRET,
++    redirectUri: env.AMO_REDIRECT_URI,
++  };
++  const transport = {
++    traceId: context.traceId,
++    auditSink: productionAuditSink(db, context.runId, 1),
++  };
++  return {
++    db,
++    encryptionKey,
++    oauthConfig,
++    transport,
++    async validateRefreshedAccessToken(
++      accessToken: string,
++      connection: Readonly<{
++        accountId: number;
++        subdomain: string;
++        baseUrl: string;
++      }>,
++    ): Promise<void> {
++      const account: AmoAccountResponse = await amoFetch({
++        method: "GET",
++        url: `${connection.baseUrl}/api/v4/account`,
++        schema: amoAccountResponseSchema,
++        traceId: context.traceId,
++        tokenProvider: { getAccessToken: async () => accessToken },
++        auditSink: productionAuditSink(db, context.runId, 1),
++        redirect: "error",
++      });
++      if (
++        account.id !== connection.accountId ||
++        account.subdomain !== connection.subdomain
++      ) {
++        throw new AppError("E_AMO_AUTH", 502);
++      }
++    },
++  };
++}
++
++export function createProductionAmoSyncDependencies(
++  db: Database,
++  env: ServerEnv,
++): AmoSyncDependencies {
++  return {
++    envEnabled: env.SYNC_ENABLED,
++    controls: {
++      async isSyncEnabled() {
++        return (await getSystemControl(db, "sync_enabled")).enabled;
++      },
++    },
++    connections: {
++      async getActive() {
++        const connection = await getCurrentSafeAmoConnectionStatus(db);
++        if (!connection || connection.status !== "active") return null;
++        return {
++          id: connection.id,
++          accountId: connection.accountId,
++          baseUrl: connection.baseUrl,
++        };
++      },
++    },
++    configs: {
++      async getActive(connectionId) {
++        const config = await getActivePipelineConfig(db, connectionId);
++        return config ? { id: config.id, pipelineId: config.pipelineId } : null;
++      },
++    },
++    locks: {
++      withSyncLock: (connectionId, action) =>
++        withSyncAdvisoryLock(db, connectionId, action),
++    },
++    cursors: { get: (connectionId) => getSyncCursors(db, connectionId) },
++    runs: {
++      async start(input) {
++        const run = await startSyncRun(db, input);
++        return { id: run.id, traceId: run.traceId };
++      },
++      finish: (runId, outcome, finishedAt) =>
++        finishSyncRun(db, runId, outcome, finishedAt),
++    },
++    raw: {
++      appendPage: (input) => appendRawPage(db, input),
++      quarantinePage: (input) => quarantineRawPage(db, input),
++    },
++    transport: {
++      requestPage: async (request) =>
++        amoFetch({
++          method: "GET",
++          url: request.url,
++          schema: z.unknown(),
++          traceId: request.traceId,
++          tokenProvider: request.tokenProvider,
++          auditSink: productionAuditSink(db, request.runId, request.attempt),
++          redirect: "error",
++        }),
++    },
++    tokens: {
++      createProvider(connectionId, context) {
++        return createAmoTokenProvider(connectionId, {
++          ...productionTokenDependencies(db, env, context),
++          now: context.clock.now,
++        });
++      },
++      refresh(connectionId, now, context) {
++        return refreshConnection(
++          connectionId,
++          productionTokenDependencies(db, env, context),
++          now,
++        );
++      },
++    },
++    audit: { append: (input) => appendAmoApiAudit(db, input) },
++    reconciliation: {
++      previousFullLeadCount: (connectionId) =>
++        getPreviousFullLeadCount(db, connectionId),
++    },
++  };
++}
++
++let defaultDependencies: AmoSyncDependencies | undefined;
++
++export function configureAmoSync(dependencies: AmoSyncDependencies): void {
++  defaultDependencies = dependencies;
++}
++
++export async function runSync(
++  kind: SyncKind,
++  clock: Clock = systemClock,
++): Promise<SyncRunResult> {
++  if (defaultDependencies) {
++    return createAmoSyncRunner(defaultDependencies)(kind, clock);
++  }
++  const env = parseServerEnv(process.env);
++  const db = createServiceWorkerDbClient(env.DATABASE_URL);
++  try {
++    return await createAmoSyncRunner(
++      createProductionAmoSyncDependencies(db, env),
++    )(kind, clock);
++  } finally {
++    await closeDbClient(db);
++  }
++}
+diff --git a/apps/worker/src/jobs/raw-retention.test.ts b/apps/worker/src/jobs/raw-retention.test.ts
+new file mode 100644
+index 0000000..4087aad
+--- /dev/null
++++ b/apps/worker/src/jobs/raw-retention.test.ts
+@@ -0,0 +1,42 @@
++import { expect, it, vi } from "vitest";
++
++import { runRawRetention } from "./raw-retention";
++
++it("deletes only proven raw payloads older than ninety days", async () => {
++  const deleteProvenBefore = vi.fn(async () => ({
++    objectsDeleted: 2,
++    eventsDeleted: 3,
++    quarantineDeleted: 1,
++    hashesPreserved: 6,
++    normalizedRowsVerified: 6,
++  }));
++  const now = new Date("2026-09-15T09:00:00.000Z");
++
++  const result = await runRawRetention({ deleteProvenBefore }, now);
++
++  expect(deleteProvenBefore).toHaveBeenCalledWith(
++    new Date("2026-06-17T09:00:00.000Z"),
++  );
++  expect(result).toMatchObject({
++    deleted: 6,
++    hashesPreserved: 6,
++    normalizedRowsVerified: 6,
++  });
++});
++
++it("fails closed when deletion proof counts do not match", async () => {
++  const deleteProvenBefore = vi.fn(async () => ({
++    objectsDeleted: 1,
++    eventsDeleted: 0,
++    quarantineDeleted: 0,
++    hashesPreserved: 0,
++    normalizedRowsVerified: 1,
++  }));
++
++  await expect(
++    runRawRetention(
++      { deleteProvenBefore },
++      new Date("2026-09-15T09:00:00.000Z"),
++    ),
++  ).rejects.toMatchObject({ code: "E_DATA_QUALITY_BLOCK" });
++});
+diff --git a/apps/worker/src/jobs/raw-retention.ts b/apps/worker/src/jobs/raw-retention.ts
+new file mode 100644
+index 0000000..b4505fb
+--- /dev/null
++++ b/apps/worker/src/jobs/raw-retention.ts
+@@ -0,0 +1,32 @@
++import { AppError } from "@real2/domain";
++
++const RAW_RETENTION_MS = 90 * 24 * 60 * 60_000;
++
++export type RawRetentionProofResult = Readonly<{
++  objectsDeleted: number;
++  eventsDeleted: number;
++  quarantineDeleted: number;
++  hashesPreserved: number;
++  normalizedRowsVerified: number;
++}>;
++
++export type RawRetentionRepository = Readonly<{
++  deleteProvenBefore(cutoff: Date): Promise<RawRetentionProofResult>;
++}>;
++
++export async function runRawRetention(
++  repository: RawRetentionRepository,
++  now = new Date(),
++): Promise<RawRetentionProofResult & Readonly<{ deleted: number }>> {
++  const cutoff = new Date(now.getTime() - RAW_RETENTION_MS);
++  const result = await repository.deleteProvenBefore(cutoff);
++  const deleted =
++    result.objectsDeleted + result.eventsDeleted + result.quarantineDeleted;
++  if (
++    deleted !== result.hashesPreserved ||
++    deleted !== result.normalizedRowsVerified
++  ) {
++    throw new AppError("E_DATA_QUALITY_BLOCK", 500);
++  }
++  return { ...result, deleted };
++}
+diff --git a/apps/worker/src/jobs/sync-watchdog.test.ts b/apps/worker/src/jobs/sync-watchdog.test.ts
+new file mode 100644
+index 0000000..c4bed57
+--- /dev/null
++++ b/apps/worker/src/jobs/sync-watchdog.test.ts
+@@ -0,0 +1,16 @@
++import { expect, it, vi } from "vitest";
++
++import { runSyncWatchdog } from "./sync-watchdog";
++
++it("fails runs that have remained running for twenty minutes", async () => {
++  const markStaleFailed = vi.fn(async () => ["run-stale"]);
++  const now = new Date("2026-09-15T09:00:00.000Z");
++
++  const result = await runSyncWatchdog({ markStaleFailed }, now);
++
++  expect(markStaleFailed).toHaveBeenCalledWith(
++    new Date("2026-09-15T08:40:00.000Z"),
++    now,
++  );
++  expect(result).toEqual({ failedRunIds: ["run-stale"] });
++});
+diff --git a/apps/worker/src/jobs/sync-watchdog.ts b/apps/worker/src/jobs/sync-watchdog.ts
+new file mode 100644
+index 0000000..631a978
+--- /dev/null
++++ b/apps/worker/src/jobs/sync-watchdog.ts
+@@ -0,0 +1,13 @@
++const WATCHDOG_TIMEOUT_MS = 20 * 60_000;
++
++export type SyncWatchdogRepository = Readonly<{
++  markStaleFailed(cutoff: Date, finishedAt: Date): Promise<readonly string[]>;
++}>;
++
++export async function runSyncWatchdog(
++  repository: SyncWatchdogRepository,
++  now = new Date(),
++): Promise<Readonly<{ failedRunIds: readonly string[] }>> {
++  const cutoff = new Date(now.getTime() - WATCHDOG_TIMEOUT_MS);
++  return { failedRunIds: await repository.markStaleFailed(cutoff, now) };
++}
+diff --git a/apps/worker/src/schedule.test.ts b/apps/worker/src/schedule.test.ts
+new file mode 100644
+index 0000000..0c8fc28
+--- /dev/null
++++ b/apps/worker/src/schedule.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it } from "vitest";
++
++import { dueSyncKinds } from "./schedule";
++
++describe("amoCRM schedules", () => {
++  it("runs incrementals at five-minute boundaries only once", () => {
++    expect(
++      dueSyncKinds(
++        new Date("2026-09-15T09:10:00.000Z"),
++        new Date("2026-09-15T09:05:00.000Z"),
++      ),
++    ).toEqual(["incremental"]);
++    expect(
++      dueSyncKinds(
++        new Date("2026-09-15T09:10:30.000Z"),
++        new Date("2026-09-15T09:10:00.000Z"),
++      ),
++    ).toEqual([]);
++  });
++
++  it("adds nightly reconciliation at 02:30 Europe/Moscow", () => {
++    expect(
++      dueSyncKinds(
++        new Date("2026-09-14T23:30:00.000Z"),
++        new Date("2026-09-14T23:25:00.000Z"),
++      ),
++    ).toEqual(["incremental", "nightly_reconciliation"]);
++  });
++});
+diff --git a/apps/worker/src/schedule.ts b/apps/worker/src/schedule.ts
+new file mode 100644
+index 0000000..dcbcfeb
+--- /dev/null
++++ b/apps/worker/src/schedule.ts
+@@ -0,0 +1,56 @@
++import type { SyncKind } from "@real2/db";
++
++const FIVE_MINUTES_MS = 5 * 60_000;
++const MOSCOW_OFFSET_MS = 3 * 60 * 60_000;
++
++function fiveMinuteSlot(value: Date): number {
++  return Math.floor(value.getTime() / FIVE_MINUTES_MS);
++}
++
++function moscowParts(value: Date): { date: string; hour: number; minute: number } {
++  const shifted = new Date(value.getTime() + MOSCOW_OFFSET_MS);
++  return {
++    date: shifted.toISOString().slice(0, 10),
++    hour: shifted.getUTCHours(),
++    minute: shifted.getUTCMinutes(),
++  };
++}
++
++export function dueSyncKinds(
++  now: Date,
++  lastDispatchAt: Date | null,
++): readonly Extract<SyncKind, "incremental" | "nightly_reconciliation">[] {
++  const due: Extract<SyncKind, "incremental" | "nightly_reconciliation">[] = [];
++  if (
++    now.getUTCMinutes() % 5 === 0 &&
++    (!lastDispatchAt || fiveMinuteSlot(lastDispatchAt) < fiveMinuteSlot(now))
++  ) {
++    due.push("incremental");
++  }
++
++  const moscowNow = moscowParts(now);
++  const moscowPrevious = lastDispatchAt ? moscowParts(lastDispatchAt) : null;
++  if (
++    moscowNow.hour === 2 &&
++    moscowNow.minute === 30 &&
++    (!moscowPrevious ||
++      moscowPrevious.date !== moscowNow.date ||
++      moscowPrevious.hour < 2 ||
++      (moscowPrevious.hour === 2 && moscowPrevious.minute < 30))
++  ) {
++    due.push("nightly_reconciliation");
++  }
++  return due;
++}
++
++export async function dispatchDueSyncs(
++  input: Readonly<{
++    now: Date;
++    lastDispatchAt: Date | null;
++    run(kind: Extract<SyncKind, "incremental" | "nightly_reconciliation">): Promise<void>;
++  }>,
++): Promise<readonly SyncKind[]> {
++  const due = dueSyncKinds(input.now, input.lastDispatchAt);
++  for (const kind of due) await input.run(kind);
++  return due;
++}
+diff --git a/packages/db/src/client.ts b/packages/db/src/client.ts
+index 674fac1..e639c5d 100644
+--- a/packages/db/src/client.ts
++++ b/packages/db/src/client.ts
+@@ -19,13 +19,26 @@ export function createServiceWorkerDbClient(
+ ): Database {
+   return createDbClient(databaseUrl, {
+     ...options,
+     connection: {
+       ...options.connection,
+       role: "service_worker",
+     },
+   });
+ }
+ 
++export function createRetentionWorkerDbClient(
++  databaseUrl: string,
++  options: Options<Record<string, never>> = {},
++): Database {
++  return createDbClient(databaseUrl, {
++    ...options,
++    connection: {
++      ...options.connection,
++      role: "retention_worker",
++    },
++  });
++}
++
+ export async function closeDbClient(db: Database): Promise<void> {
+   await db.end({ timeout: 5 });
+ }
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index b85ae8f..9fbfe8f 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,13 +1,14 @@
+ export {
+   closeDbClient,
+   createDbClient,
++  createRetentionWorkerDbClient,
+   createServiceWorkerDbClient,
+   type Database,
+ } from "./client.js";
+ export {
+   AppIdentityError,
+   findAppUserByAuthId,
+   getSystemControl,
+   requireActiveAppUser,
+   type AppRole,
+   type AppUser,
+@@ -58,10 +59,26 @@ export {
+   getRawChannelValues,
+   quarantineRawPage,
+   type AmoApiAuditInput,
+   type AppendRawPageInput,
+   type QuarantineRawPageInput,
+   type RawAmoEventInput,
+   type RawAmoObjectInput,
+   type RawChannelValue,
+   type RawEntityType,
+ } from "./raw-amo.js";
++export {
++  deleteProvenRawBefore,
++  failStaleSyncRuns,
++  getLatestSyncRun,
++  getPreviousFullLeadCount,
++  getSyncCursors,
++  getSyncRunDetail,
++  listSyncRuns,
++  recordRawRetentionProofs,
++  withSyncAdvisoryLock,
++  type RawRetentionProofInput,
++  type RawRetentionResult,
++  type RawRetentionSourceTable,
++  type SafeSyncRunDetail,
++  type SafeSyncRunSummary,
++} from "./sync-operations.js";
+diff --git a/packages/db/src/sync-operations.integration.test.ts b/packages/db/src/sync-operations.integration.test.ts
+new file mode 100644
+index 0000000..0b24440
+--- /dev/null
++++ b/packages/db/src/sync-operations.integration.test.ts
+@@ -0,0 +1,235 @@
++import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import {
++  closeDbClient,
++  createRetentionWorkerDbClient,
++  createServiceWorkerDbClient,
++} from "./client";
++import { appendRawPage, quarantineRawPage } from "./raw-amo";
++import {
++  deleteProvenRawBefore,
++  failStaleSyncRuns,
++  getPreviousFullLeadCount,
++  getSyncCursors,
++  recordRawRetentionProofs,
++  withSyncAdvisoryLock,
++} from "./sync-operations";
++import { finishSyncRun, startSyncRun } from "./sync-runs";
++import {
++  createAdminDb,
++  localDatabaseUrl,
++  resetAndSeedUsers,
++  testUsers,
++} from "../../../tests/helpers/local-db";
++
++const adminDb = createAdminDb();
++const workerOne = createServiceWorkerDbClient(localDatabaseUrl, { max: 2 });
++const workerTwo = createServiceWorkerDbClient(localDatabaseUrl, { max: 2 });
++const retentionDb = createRetentionWorkerDbClient(localDatabaseUrl, { max: 1 });
++const oldAt = new Date("2026-01-01T00:00:00.000Z");
++const now = new Date("2026-09-15T09:00:00.000Z");
++
++type Fixture = Readonly<{ connectionId: string; configId: string }>;
++
++async function seedFixture(): Promise<Fixture> {
++  await resetAndSeedUsers(adminDb, [testUsers.admin]);
++  const [connection] = await adminDb<{ id: string }[]>`
++    insert into public.amo_connections (
++      account_id, subdomain, base_url, access_token_ciphertext,
++      refresh_token_ciphertext, token_expires_at, status, installed_by
++    ) values (
++      9001, '555151', 'https://555151.amocrm.ru', ${Buffer.alloc(64)},
++      ${Buffer.alloc(64)}, '2030-01-01T00:00:00Z', 'active', ${testUsers.admin.id}
++    ) returning id
++  `;
++  if (!connection) throw new Error("missing synthetic connection");
++  const [config] = await adminDb<{ id: string }[]>`
++    insert into public.pipeline_configs (
++      amo_connection_id, pipeline_id, pipeline_name, application_status_id,
++      application_status_name, won_status_id, won_status_name, version,
++      is_active, confirmed_by
++    ) values (
++      ${connection.id}, 77, 'Synthetic', 771, 'Application', 772, 'Won', 1,
++      true, ${testUsers.admin.id}
++    ) returning id
++  `;
++  if (!config) throw new Error("missing synthetic config");
++  return { connectionId: connection.id, configId: config.id };
++}
++
++async function clearFixtures(): Promise<void> {
++  await adminDb.unsafe(
++    "truncate table public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++  );
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
++}
++
++beforeEach(clearFixtures);
++afterEach(clearFixtures);
++afterAll(async () => {
++  await Promise.all([
++    closeDbClient(retentionDb),
++    closeDbClient(workerTwo),
++    closeDbClient(workerOne),
++    closeDbClient(adminDb),
++  ]);
++});
++
++describe("sync operational boundaries", () => {
++  it("allows only one session advisory-lock owner", async () => {
++    const fixture = await seedFixture();
++    let release!: () => void;
++    const held = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    let entered!: () => void;
++    const acquired = new Promise<void>((resolve) => {
++      entered = resolve;
++    });
++    const first = withSyncAdvisoryLock(workerOne, fixture.connectionId, async () => {
++      entered();
++      await held;
++      return "first";
++    });
++    await acquired;
++
++    await expect(
++      withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "second"),
++    ).rejects.toMatchObject({ code: "E_SYNC_LOCKED" });
++    release();
++    await expect(first).resolves.toBe("first");
++    await expect(
++      withSyncAdvisoryLock(workerTwo, fixture.connectionId, async () => "after"),
++    ).resolves.toBe("after");
++  });
++
++  it("returns cursors and the previous successful full lead count", async () => {
++    const fixture = await seedFixture();
++    const run = await startSyncRun(workerOne, {
++      traceId: "full-count",
++      connectionId: fixture.connectionId,
++      configId: fixture.configId,
++      kind: "nightly_reconciliation",
++      startedAt: oldAt,
++    });
++    await finishSyncRun(workerOne, run.id, {
++      status: "success",
++      counts: { pagesRead: 1, leadsRead: 100, eventsRead: 0, usersRead: 0, retries: 0 },
++      nextCursors: {
++        leads: { cursorTime: oldAt, cursorExternalId: "lead-100" },
++      },
++    }, now);
++
++    await expect(getPreviousFullLeadCount(workerOne, fixture.connectionId)).resolves.toBe(100);
++    await expect(getSyncCursors(workerOne, fixture.connectionId)).resolves.toMatchObject({
++      leads: { cursorTime: oldAt, cursorExternalId: "lead-100" },
++    });
++  });
++
++  it("watchdog seals stale runs and the journal rejects later appends", async () => {
++    const fixture = await seedFixture();
++    const run = await startSyncRun(workerOne, {
++      traceId: "stale-run",
++      connectionId: fixture.connectionId,
++      configId: fixture.configId,
++      kind: "incremental",
++      startedAt: oldAt,
++    });
++
++    await expect(
++      failStaleSyncRuns(workerOne, new Date("2026-09-15T08:40:00.000Z"), now),
++    ).resolves.toEqual([run.id]);
++    await expect(
++      appendRawPage(workerOne, {
++        syncRunId: run.id,
++        stream: "leads",
++        pageNumber: 1,
++        itemCount: 0,
++        payloadSha256: "a".repeat(64),
++        objects: [],
++        events: [],
++      }),
++    ).rejects.toMatchObject({ code: "23514" });
++  });
++
++  it("retention deletes only hash-matched proven rows and preserves proof history", async () => {
++    const fixture = await seedFixture();
++    const run = await startSyncRun(workerOne, {
++      traceId: "retention-run",
++      connectionId: fixture.connectionId,
++      configId: fixture.configId,
++      kind: "initial_backfill",
++      startedAt: oldAt,
++    });
++    const objectHash = "a".repeat(64);
++    const eventHash = "b".repeat(64);
++    const quarantineHash = "c".repeat(64);
++    await appendRawPage(workerOne, {
++      syncRunId: run.id,
++      stream: "leads",
++      pageNumber: 1,
++      itemCount: 2,
++      payloadSha256: "d".repeat(64),
++      objects: [{
++        accountId: 9001,
++        entityType: "lead",
++        externalId: 1,
++        payload: { id: 1 },
++        payloadSha256: objectHash,
++      }],
++      events: [{
++        accountId: 9001,
++        amoEventId: "event:1",
++        amoLeadId: 1,
++        eventType: "lead_status_changed",
++        eventAt: oldAt,
++        payload: { id: "event:1" },
++        payloadSha256: eventHash,
++      }],
++      receivedAt: oldAt,
++    });
++    await quarantineRawPage(workerOne, {
++      syncRunId: run.id,
++      stream: "events",
++      pageNumber: 1,
++      reasonCode: "E_SCHEMA_INVALID",
++      payload: { synthetic: true },
++      payloadSha256: quarantineHash,
++      receivedAt: oldAt,
++    });
++    const rawRows = await adminDb<{ source_table: string; source_id: string; payload_sha256: string }[]>`
++      select 'raw_amo_objects' as source_table, id as source_id, payload_sha256 from public.raw_amo_objects
++      union all
++      select 'raw_amo_events', id, payload_sha256 from public.raw_amo_events
++      union all
++      select 'raw_amo_quarantine', id, payload_sha256 from public.raw_amo_quarantine
++      order by source_table
++    `;
++    await recordRawRetentionProofs(workerOne, rawRows.map((row, index) => ({
++      sourceTable: row.source_table as "raw_amo_objects" | "raw_amo_events" | "raw_amo_quarantine",
++      sourceId: row.source_id,
++      payloadSha256: row.payload_sha256,
++      normalizedEntityType: "lead_history",
++      normalizedEntityId: `synthetic:${index + 1}`,
++      provedAt: now,
++    })));
++
++    await expect(deleteProvenRawBefore(retentionDb, new Date("2026-06-17T09:00:00.000Z"))).resolves.toEqual({
++      objectsDeleted: 1,
++      eventsDeleted: 1,
++      quarantineDeleted: 1,
++      hashesPreserved: 3,
++      normalizedRowsVerified: 3,
++    });
++    const [remaining] = await adminDb<{ raw_count: number; proof_count: number }[]>`
++      select
++        ((select count(*) from public.raw_amo_objects) +
++         (select count(*) from public.raw_amo_events) +
++         (select count(*) from public.raw_amo_quarantine))::integer as raw_count,
++        (select count(*)::integer from public.raw_retention_proofs) as proof_count
++    `;
++    expect(remaining).toEqual({ raw_count: 0, proof_count: 3 });
++    await expect(workerOne`delete from public.raw_amo_objects`).rejects.toMatchObject({ code: "42501" });
++  });
++});
+diff --git a/packages/db/src/sync-operations.ts b/packages/db/src/sync-operations.ts
+new file mode 100644
+index 0000000..99801e0
+--- /dev/null
++++ b/packages/db/src/sync-operations.ts
+@@ -0,0 +1,381 @@
++import { AppError } from "@real2/domain";
++
++import type { Database } from "./client.js";
++import type {
++  SyncCursorPosition,
++  SyncKind,
++  SyncStatus,
++  SyncStream,
++} from "./sync-runs.js";
++
++export type SafeSyncRunSummary = Readonly<{
++  id: string;
++  traceId: string;
++  kind: SyncKind;
++  status: SyncStatus;
++  startedAt: Date;
++  finishedAt: Date | null;
++  counts: Readonly<{
++    pages: number;
++    leads: number;
++    events: number;
++    users: number;
++    retries: number;
++  }>;
++  errorCode: string | null;
++  errorSummary: string | null;
++}>;
++
++export type SafeSyncRunDetail = SafeSyncRunSummary & Readonly<{
++  pages: readonly Readonly<{
++    stream: SyncStream;
++    pageNumber: number;
++    itemCount: number;
++    receivedAt: Date;
++  }>[];
++  audit: readonly Readonly<{
++    method: string;
++    normalizedPath: string;
++    responseStatus: number | null;
++    result: string;
++    requestCount: number;
++    totalDurationMs: number;
++    maxAttempt: number;
++  }>[];
++}>;
++
++type SafeSyncRunRow = {
++  id: string;
++  trace_id: string;
++  kind: SyncKind;
++  status: SyncStatus;
++  started_at: Date;
++  finished_at: Date | null;
++  pages_read: number;
++  leads_read: number;
++  events_read: number;
++  users_read: number;
++  retries: number;
++  error_code: string | null;
++  error_summary: string | null;
++};
++
++function mapSafeRun(row: SafeSyncRunRow): SafeSyncRunSummary {
++  return {
++    id: row.id,
++    traceId: row.trace_id,
++    kind: row.kind,
++    status: row.status,
++    startedAt: row.started_at,
++    finishedAt: row.finished_at,
++    counts: {
++      pages: row.pages_read,
++      leads: row.leads_read,
++      events: row.events_read,
++      users: row.users_read,
++      retries: row.retries,
++    },
++    errorCode: row.error_code,
++    errorSummary: row.error_summary,
++  };
++}
++
++export type RawRetentionSourceTable =
++  | "raw_amo_objects"
++  | "raw_amo_events"
++  | "raw_amo_quarantine";
++
++export type RawRetentionProofInput = Readonly<{
++  sourceTable: RawRetentionSourceTable;
++  sourceId: string;
++  payloadSha256: string;
++  normalizedEntityType: string;
++  normalizedEntityId: string;
++  provedAt?: Date;
++}>;
++
++export type RawRetentionResult = Readonly<{
++  objectsDeleted: number;
++  eventsDeleted: number;
++  quarantineDeleted: number;
++  hashesPreserved: number;
++  normalizedRowsVerified: number;
++}>;
++
++function isSha256(value: string): boolean {
++  return /^[a-f0-9]{64}$/.test(value);
++}
++
++export async function withSyncAdvisoryLock<T>(
++  db: Database,
++  connectionId: string,
++  action: () => Promise<T>,
++): Promise<T> {
++  const reserved = await db.reserve();
++  let locked = false;
++  try {
++    const [row] = await reserved<{ locked: boolean }[]>`
++      select pg_try_advisory_lock(
++        hashtextextended(${`${connectionId}:sync`}, 0)
++      ) as locked
++    `;
++    locked = row?.locked === true;
++    if (!locked) throw new AppError("E_SYNC_LOCKED", 409);
++    return await action();
++  } finally {
++    if (locked) {
++      await reserved`
++        select pg_advisory_unlock(
++          hashtextextended(${`${connectionId}:sync`}, 0)
++        )
++      `;
++    }
++    reserved.release();
++  }
++}
++
++export async function getSyncCursors(
++  db: Database,
++  connectionId: string,
++): Promise<Partial<Record<SyncStream, SyncCursorPosition>>> {
++  const rows = await db<{
++    stream: SyncStream;
++    cursor_time: Date | null;
++    cursor_external_id: string | null;
++  }[]>`
++    select stream, cursor_time, cursor_external_id
++    from public.sync_cursors
++    where connection_id = ${connectionId}
++    order by stream
++  `;
++  return Object.fromEntries(rows.map((row) => [
++    row.stream,
++    { cursorTime: row.cursor_time, cursorExternalId: row.cursor_external_id },
++  ]));
++}
++
++export async function getPreviousFullLeadCount(
++  db: Database,
++  connectionId: string,
++): Promise<number | null> {
++  const [row] = await db<{ leads_read: number }[]>`
++    select leads_read
++    from public.sync_runs
++    where connection_id = ${connectionId}
++      and status = 'success'
++      and kind in ('initial_backfill', 'nightly_reconciliation', 'manual')
++    order by finished_at desc, id desc
++    limit 1
++  `;
++  return row?.leads_read ?? null;
++}
++
++export async function failStaleSyncRuns(
++  db: Database,
++  cutoff: Date,
++  finishedAt: Date,
++): Promise<readonly string[]> {
++  const rows = await db<{ id: string }[]>`
++    select id from app.fail_stale_sync_runs(${cutoff}, ${finishedAt}) as id
++  `;
++  return rows.map((row) => row.id);
++}
++
++export async function recordRawRetentionProofs(
++  db: Database,
++  proofs: readonly RawRetentionProofInput[],
++): Promise<void> {
++  for (const proof of proofs) {
++    if (
++      !isSha256(proof.payloadSha256) ||
++      proof.normalizedEntityType.length < 1 ||
++      proof.normalizedEntityType.length > 80 ||
++      proof.normalizedEntityId.length < 1 ||
++      proof.normalizedEntityId.length > 128
++    ) {
++      throw new AppError("E_VALIDATION", 422);
++    }
++    const inserted = await db<{ source_id: string }[]>`
++      insert into public.raw_retention_proofs (
++        source_table,
++        source_id,
++        payload_sha256,
++        normalized_entity_type,
++        normalized_entity_id,
++        proved_at
++      ) values (
++        ${proof.sourceTable},
++        ${proof.sourceId},
++        ${proof.payloadSha256},
++        ${proof.normalizedEntityType},
++        ${proof.normalizedEntityId},
++        ${proof.provedAt ?? new Date()}
++      )
++      on conflict (source_table, source_id) do nothing
++      returning source_id
++    `;
++    if (inserted.length > 0) continue;
++    const [existing] = await db<{
++      payload_sha256: string;
++      normalized_entity_type: string;
++      normalized_entity_id: string;
++    }[]>`
++      select payload_sha256, normalized_entity_type, normalized_entity_id
++      from public.raw_retention_proofs
++      where source_table = ${proof.sourceTable}
++        and source_id = ${proof.sourceId}
++    `;
++    if (
++      !existing ||
++      existing.payload_sha256 !== proof.payloadSha256 ||
++      existing.normalized_entity_type !== proof.normalizedEntityType ||
++      existing.normalized_entity_id !== proof.normalizedEntityId
++    ) {
++      throw new AppError("E_CONFLICT", 409);
++    }
++  }
++}
++
++export async function deleteProvenRawBefore(
++  db: Database,
++  cutoff: Date,
++): Promise<RawRetentionResult> {
++  const [row] = await db<{
++    objects_deleted: number;
++    events_deleted: number;
++    quarantine_deleted: number;
++    hashes_preserved: number;
++    normalized_rows_verified: number;
++  }[]>`
++    select * from app.delete_proven_raw_before(${cutoff})
++  `;
++  if (!row) throw new AppError("E_DB", 500);
++  return {
++    objectsDeleted: row.objects_deleted,
++    eventsDeleted: row.events_deleted,
++    quarantineDeleted: row.quarantine_deleted,
++    hashesPreserved: row.hashes_preserved,
++    normalizedRowsVerified: row.normalized_rows_verified,
++  };
++}
++
++const safeRunColumns = `
++  id, trace_id, kind, status, started_at, finished_at,
++  pages_read, leads_read, events_read, users_read, retries,
++  error_code, error_summary
++`;
++
++export async function listSyncRuns(
++  db: Database,
++  input: Readonly<{ page: number; pageSize: number }>,
++): Promise<Readonly<{
++  items: readonly SafeSyncRunSummary[];
++  page: number;
++  pageSize: number;
++  total: number;
++}>> {
++  if (
++    !Number.isSafeInteger(input.page) ||
++    input.page < 1 ||
++    !Number.isSafeInteger(input.pageSize) ||
++    input.pageSize < 1 ||
++    input.pageSize > 100
++  ) {
++    throw new AppError("E_VALIDATION", 422);
++  }
++  const offset = (input.page - 1) * input.pageSize;
++  const rows = await db.unsafe<SafeSyncRunRow[]>(
++    `select ${safeRunColumns}
++     from public.sync_runs
++     order by started_at desc, id desc
++     limit $1 offset $2`,
++    [input.pageSize, offset],
++  );
++  const [count] = await db<{ total: number }[]>`
++    select count(*)::integer as total from public.sync_runs
++  `;
++  return {
++    items: rows.map(mapSafeRun),
++    page: input.page,
++    pageSize: input.pageSize,
++    total: count?.total ?? 0,
++  };
++}
++
++export async function getLatestSyncRun(
++  db: Database,
++): Promise<SafeSyncRunSummary | null> {
++  const rows = await db.unsafe<SafeSyncRunRow[]>(
++    `select ${safeRunColumns}
++     from public.sync_runs
++     order by started_at desc, id desc
++     limit 1`,
++  );
++  return rows[0] ? mapSafeRun(rows[0]) : null;
++}
++
++export async function getSyncRunDetail(
++  db: Database,
++  runId: string,
++): Promise<SafeSyncRunDetail | null> {
++  const runs = await db.unsafe<SafeSyncRunRow[]>(
++    `select ${safeRunColumns}
++     from public.sync_runs
++     where id = $1::uuid
++     limit 1`,
++    [runId],
++  );
++  const run = runs[0];
++  if (!run) return null;
++  const pages = await db<{
++    stream: SyncStream;
++    page_number: number;
++    item_count: number;
++    received_at: Date;
++  }[]>`
++    select stream, page_number, item_count, received_at
++    from public.sync_pages
++    where sync_run_id = ${runId}
++    order by received_at, stream, page_number
++  `;
++  const audit = await db<{
++    method: string;
++    normalized_path: string;
++    response_status: number | null;
++    result: string;
++    request_count: number;
++    total_duration_ms: number;
++    max_attempt: number;
++  }[]>`
++    select
++      method,
++      normalized_path,
++      response_status,
++      result,
++      count(*)::integer as request_count,
++      sum(duration_ms)::integer as total_duration_ms,
++      max(attempt)::integer as max_attempt
++    from public.amo_api_audit
++    where sync_run_id = ${runId}
++    group by method, normalized_path, response_status, result
++    order by normalized_path, method, response_status nulls last, result
++  `;
++  return {
++    ...mapSafeRun(run),
++    pages: pages.map((page) => ({
++      stream: page.stream,
++      pageNumber: page.page_number,
++      itemCount: page.item_count,
++      receivedAt: page.received_at,
++    })),
++    audit: audit.map((entry) => ({
++      method: entry.method,
++      normalizedPath: entry.normalized_path,
++      responseStatus: entry.response_status,
++      result: entry.result,
++      requestCount: entry.request_count,
++      totalDurationMs: entry.total_duration_ms,
++      maxAttempt: entry.max_attempt,
++    })),
++  };
++}
+diff --git a/packages/integrations/src/amo/transport.integration.test.ts b/packages/integrations/src/amo/transport.integration.test.ts
+index c599df3..e22abd9 100644
+--- a/packages/integrations/src/amo/transport.integration.test.ts
++++ b/packages/integrations/src/amo/transport.integration.test.ts
+@@ -97,20 +97,39 @@ describe("amoFetch", () => {
+ 
+     expect(audit).toHaveLength(1);
+     expect(audit[0]).toMatchObject({
+       normalizedPath: "/api/v4/account",
+       responseStatus: 200,
+       result: "error",
+     });
+     expect(JSON.stringify(audit[0])).not.toContain("synthetic-private-value");
+   });
+ 
++  it.each([
++    [401, "E_AMO_AUTH"],
++    [429, "E_AMO_RATE_LIMIT"],
++    [503, "E_AMO_UPSTREAM"],
++  ])("preserves retryable HTTP status %i without response data", async (status, code) => {
++    const { audit, fetchFn, request } = createRequest();
++    fetchFn.mockResolvedValue(
++      new Response(JSON.stringify({ private: "synthetic-private-value" }), {
++        status,
++      }),
++    );
++
++    const rejection = await amoFetch(request).catch((error: unknown) => error);
++
++    expect(rejection).toMatchObject({ code, responseStatus: status });
++    expect(JSON.stringify(rejection)).not.toContain("synthetic-private-value");
++    expect(audit).toHaveLength(1);
++  });
++
+   it.each([
+     ["forbidden method", { method: "PATCH" }, "E_AMO_METHOD_DENIED"],
+     [
+       "forbidden path",
+       { url: "https://555151.amocrm.ru/api/v4/contacts" },
+       "E_AMO_PATH_DENIED",
+     ],
+     [
+       "forbidden host",
+       { url: "https://example.org/api/v4/leads" },
+diff --git a/packages/integrations/src/amo/transport.ts b/packages/integrations/src/amo/transport.ts
+index 1f548e8..96c7ee9 100644
+--- a/packages/integrations/src/amo/transport.ts
++++ b/packages/integrations/src/amo/transport.ts
+@@ -15,22 +15,30 @@ async function recordAudit(
+   request: AmoFetchRequest<unknown>,
+   entry: AmoAuditEntry,
+ ): Promise<void> {
+   await request.auditSink.record(entry);
+ }
+ 
+ function deniedRedirect(): AppError {
+   return new AppError("E_AMO_PATH_DENIED", 403);
+ }
+ 
+-function upstreamError(): AppError {
+-  return new AppError("E_AMO_UPSTREAM", 502);
++function upstreamError(responseStatus?: number): AppError & { responseStatus?: number } {
++  const code =
++    responseStatus === 401
++      ? "E_AMO_AUTH"
++      : responseStatus === 429
++        ? "E_AMO_RATE_LIMIT"
++        : "E_AMO_UPSTREAM";
++  return Object.assign(new AppError(code, 502), {
++    ...(responseStatus !== undefined ? { responseStatus } : {}),
++  });
+ }
+ 
+ export async function amoFetch<T>(request: AmoFetchRequest<T>): Promise<T> {
+   const startedAt = Date.now();
+   let normalized: NormalizedAmoRequest;
+ 
+   try {
+     normalized = assertAmoRequestAllowed(request);
+     if (request.redirect !== undefined && request.redirect !== "error") {
+       throw deniedRedirect();
+@@ -59,26 +67,26 @@ export async function amoFetch<T>(request: AmoFetchRequest<T>): Promise<T> {
+ 
+     const response = await (request.fetchFn ?? globalThis.fetch)(normalized.url, {
+       method: normalized.method,
+       headers,
+       ...(request.body !== undefined ? { body: request.body } : {}),
+       redirect: "error",
+     });
+     responseStatus = response.status;
+ 
+     if (!response.ok) {
+-      throw upstreamError();
++      throw upstreamError(response.status);
+     }
+ 
+     const parsed = request.schema.safeParse(await response.json());
+     if (!parsed.success) {
+-      throw upstreamError();
++      throw upstreamError(response.status);
+     }
+ 
+     await recordAudit(request, {
+       method: normalized.method,
+       normalizedPath: normalized.normalizedPath,
+       responseStatus,
+       durationMs: durationSince(startedAt),
+       traceId: request.traceId,
+       result: "success",
+     });
+diff --git a/packages/testkit/src/amo-fixtures.ts b/packages/testkit/src/amo-fixtures.ts
+new file mode 100644
+index 0000000..cc12d3f
+--- /dev/null
++++ b/packages/testkit/src/amo-fixtures.ts
+@@ -0,0 +1,70 @@
++export const syntheticAmoFixtures = {
++  account: { id: 9001, subdomain: "555151" },
++  pipelinesPage: {
++    _embedded: {
++      pipelines: [{ id: 77, name: "Synthetic sales", account_id: 9001 }],
++    },
++  },
++  statusesPage: {
++    _embedded: {
++      statuses: [
++        { id: 771, name: "Application", pipeline_id: 77, account_id: 9001 },
++        { id: 772, name: "Won", pipeline_id: 77, account_id: 9001 },
++      ],
++    },
++  },
++  usersPage: {
++    _embedded: { users: [{ id: 501, name: "Synthetic Manager" }] },
++  },
++  eventsPage(page = 1, hasNext = false) {
++    return {
++      _page: page,
++      _embedded: {
++        events: [
++          {
++            id: `event:${page}`,
++            type: "lead_status_changed",
++            entity_id: page,
++            entity_type: "lead",
++            created_at: 1_789_470_000 + page,
++            account_id: 9001,
++          },
++        ],
++      },
++      ...(hasNext
++        ? {
++            _links: {
++              next: {
++                href: `https://555151.amocrm.ru/api/v4/events?page=${page + 1}`,
++              },
++            },
++          }
++        : {}),
++    };
++  },
++  leadsPage(page = 1, hasNext = false) {
++    return {
++      _page: page,
++      _embedded: {
++        leads: [
++          {
++            id: page,
++            account_id: 9001,
++            created_at: 1_789_470_000,
++            updated_at: 1_789_470_000 + page,
++            pipeline_id: 77,
++          },
++        ],
++      },
++      ...(hasNext
++        ? {
++            _links: {
++              next: {
++                href: `https://555151.amocrm.ru/api/v4/leads?page=${page + 1}`,
++              },
++            },
++          }
++        : {}),
++    };
++  },
++} as const;
+diff --git a/packages/testkit/src/amo-server.test.ts b/packages/testkit/src/amo-server.test.ts
+new file mode 100644
+index 0000000..4abfbf8
+--- /dev/null
++++ b/packages/testkit/src/amo-server.test.ts
+@@ -0,0 +1,34 @@
++import { afterEach, expect, it } from "vitest";
++
++import { createAmoMockServer, type AmoMockServer } from "./amo-server";
++import { syntheticAmoFixtures } from "./amo-fixtures";
++
++let server: AmoMockServer | undefined;
++
++afterEach(async () => {
++  await server?.close();
++  server = undefined;
++});
++
++it("serves synthetic pages, records requests, and injects finite failures", async () => {
++  server = await createAmoMockServer({
++    "/api/v4/leads": [
++      syntheticAmoFixtures.leadsPage(1, true),
++      syntheticAmoFixtures.leadsPage(2, false),
++    ],
++  });
++  server.failPage("/api/v4/leads", 2, 503, 1);
++
++  const first = await fetch(`${server.origin}/api/v4/leads?page=1`);
++  const failed = await fetch(`${server.origin}/api/v4/leads?page=2`);
++  const recovered = await fetch(`${server.origin}/api/v4/leads?page=2`);
++
++  expect(first.status).toBe(200);
++  expect(failed.status).toBe(503);
++  expect(recovered.status).toBe(200);
++  expect(server.requests).toEqual([
++    { method: "GET", pathname: "/api/v4/leads", page: 1 },
++    { method: "GET", pathname: "/api/v4/leads", page: 2 },
++    { method: "GET", pathname: "/api/v4/leads", page: 2 },
++  ]);
++});
+diff --git a/packages/testkit/src/amo-server.ts b/packages/testkit/src/amo-server.ts
+new file mode 100644
+index 0000000..005dd4c
+--- /dev/null
++++ b/packages/testkit/src/amo-server.ts
+@@ -0,0 +1,71 @@
++import { createServer } from "node:http";
++
++type PagePayload = object;
++
++export type AmoMockRequest = Readonly<{
++  method: string;
++  pathname: string;
++  page: number;
++}>;
++
++export type AmoMockServer = Readonly<{
++  origin: string;
++  requests: AmoMockRequest[];
++  failPage(pathname: string, page: number, status: number, times: number): void;
++  close(): Promise<void>;
++}>;
++
++export async function createAmoMockServer(
++  pages: Readonly<Record<string, readonly PagePayload[]>>,
++): Promise<AmoMockServer> {
++  const requests: AmoMockRequest[] = [];
++  const failures = new Map<string, { status: number; remaining: number }>();
++  const server = createServer((request, response) => {
++    const url = new URL(request.url ?? "/", "http://127.0.0.1");
++    const page = Number(url.searchParams.get("page") ?? "1");
++    const method = request.method ?? "GET";
++    requests.push({ method, pathname: url.pathname, page });
++
++    const failureKey = `${url.pathname}:${page}`;
++    const failure = failures.get(failureKey);
++    if (failure && failure.remaining > 0) {
++      failure.remaining -= 1;
++      response.writeHead(failure.status, { "content-type": "application/json" });
++      response.end(JSON.stringify({ error: "synthetic_failure" }));
++      return;
++    }
++
++    const payload = pages[url.pathname]?.[page - 1];
++    if (!payload) {
++      response.writeHead(404, { "content-type": "application/json" });
++      response.end(JSON.stringify({ error: "synthetic_not_found" }));
++      return;
++    }
++    response.writeHead(200, { "content-type": "application/json" });
++    response.end(JSON.stringify(payload));
++  });
++
++  await new Promise<void>((resolve, reject) => {
++    server.once("error", reject);
++    server.listen(0, "127.0.0.1", () => {
++      server.off("error", reject);
++      resolve();
++    });
++  });
++  const address = server.address();
++  if (!address || typeof address === "string") {
++    await new Promise<void>((resolve) => server.close(() => resolve()));
++    throw new Error("Synthetic amoCRM server did not bind a TCP port");
++  }
++
++  return {
++    origin: `http://127.0.0.1:${address.port}`,
++    requests,
++    failPage(pathname, page, status, times) {
++      failures.set(`${pathname}:${page}`, { status, remaining: times });
++    },
++    close: () => new Promise<void>((resolve, reject) => {
++      server.close((error) => (error ? reject(error) : resolve()));
++    }),
++  };
++}
+diff --git a/packages/testkit/src/index.ts b/packages/testkit/src/index.ts
+index 688bde2..60ae944 100644
+--- a/packages/testkit/src/index.ts
++++ b/packages/testkit/src/index.ts
+@@ -1 +1,7 @@
+ export { createLogCapture, type LogCapture } from "./log-capture.js";
++export {
++  createAmoMockServer,
++  type AmoMockRequest,
++  type AmoMockServer,
++} from "./amo-server.js";
++export { syntheticAmoFixtures } from "./amo-fixtures.js";
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 272bb8e..a8f1a36 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -52,20 +52,23 @@ importers:
+     dependencies:
+       '@real2/db':
+         specifier: workspace:*
+         version: link:../../packages/db
+       '@real2/domain':
+         specifier: workspace:*
+         version: link:../../packages/domain
+       '@real2/integrations':
+         specifier: workspace:*
+         version: link:../../packages/integrations
++      '@real2/worker':
++        specifier: workspace:*
++        version: link:../worker
+       '@supabase/ssr':
+         specifier: ^0.8.0
+         version: 0.8.0(@supabase/supabase-js@2.116.0)
+       '@supabase/supabase-js':
+         specifier: ^2.90.0
+         version: 2.116.0
+       next:
+         specifier: ^16.0.0
+         version: 16.3.5(@playwright/test@1.63.0)(@types/node@22.20.2)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       react:
+diff --git a/supabase/migrations/0006_sync_operations.sql b/supabase/migrations/0006_sync_operations.sql
+new file mode 100644
+index 0000000..0fc254c
+--- /dev/null
++++ b/supabase/migrations/0006_sync_operations.sql
+@@ -0,0 +1,122 @@
++create table public.raw_retention_proofs (
++  source_table text not null check (
++    source_table in ('raw_amo_objects', 'raw_amo_events', 'raw_amo_quarantine')
++  ),
++  source_id uuid not null,
++  payload_sha256 text not null check (payload_sha256 ~ '^[a-f0-9]{64}$'),
++  normalized_entity_type text not null check (
++    char_length(normalized_entity_type) between 1 and 80
++  ),
++  normalized_entity_id text not null check (
++    char_length(normalized_entity_id) between 1 and 128
++  ),
++  proved_at timestamptz not null default now(),
++  primary key (source_table, source_id)
++);
++
++-- Proof rows are an append-only bridge to M5 normalized history. They retain
++-- the source hash and normalized identity after the raw payload expires.
++alter table public.raw_retention_proofs enable row level security;
++revoke all on table public.raw_retention_proofs from anon, authenticated;
++grant select, insert on table public.raw_retention_proofs to service_worker;
++
++create function app.fail_stale_sync_runs(
++  p_cutoff timestamptz,
++  p_finished_at timestamptz
++)
++returns setof uuid
++language sql
++security definer
++set search_path = ''
++as $$
++  update public.sync_runs
++  set
++    status = 'failed',
++    finished_at = p_finished_at,
++    error_code = 'E_SYNC_WATCHDOG',
++    error_summary = 'Synchronization exceeded the twenty minute watchdog'
++  where status = 'running'
++    and started_at <= p_cutoff
++  returning id;
++$$;
++
++revoke all on function app.fail_stale_sync_runs(timestamptz, timestamptz)
++from public;
++grant execute on function app.fail_stale_sync_runs(timestamptz, timestamptz)
++to service_worker;
++
++do $$
++begin
++  if not exists (select 1 from pg_roles where rolname = 'retention_worker') then
++    create role retention_worker nologin noinherit bypassrls;
++  end if;
++end
++$$;
++
++grant usage on schema public, app to retention_worker;
++grant retention_worker to postgres, service_role;
++
++create function app.delete_proven_raw_before(p_cutoff timestamptz)
++returns table (
++  objects_deleted integer,
++  events_deleted integer,
++  quarantine_deleted integer,
++  hashes_preserved integer,
++  normalized_rows_verified integer
++)
++language plpgsql
++security definer
++set search_path = ''
++as $$
++declare
++  deleted_objects integer;
++  deleted_events integer;
++  deleted_quarantine integer;
++  deleted_total integer;
++begin
++  with removed as (
++    delete from public.raw_amo_objects as raw
++    using public.raw_retention_proofs as proof
++    where proof.source_table = 'raw_amo_objects'
++      and proof.source_id = raw.id
++      and proof.payload_sha256 = raw.payload_sha256
++      and raw.received_at < p_cutoff
++    returning raw.id
++  ) select count(*)::integer into deleted_objects from removed;
++
++  with removed as (
++    delete from public.raw_amo_events as raw
++    using public.raw_retention_proofs as proof
++    where proof.source_table = 'raw_amo_events'
++      and proof.source_id = raw.id
++      and proof.payload_sha256 = raw.payload_sha256
++      and raw.received_at < p_cutoff
++    returning raw.id
++  ) select count(*)::integer into deleted_events from removed;
++
++  with removed as (
++    delete from public.raw_amo_quarantine as raw
++    using public.raw_retention_proofs as proof
++    where proof.source_table = 'raw_amo_quarantine'
++      and proof.source_id = raw.id
++      and proof.payload_sha256 = raw.payload_sha256
++      and raw.received_at < p_cutoff
++    returning raw.id
++  ) select count(*)::integer into deleted_quarantine from removed;
++
++  deleted_total := deleted_objects + deleted_events + deleted_quarantine;
++  return query select
++    deleted_objects,
++    deleted_events,
++    deleted_quarantine,
++    deleted_total,
++    deleted_total;
++end
++$$;
++
++revoke all on function app.delete_proven_raw_before(timestamptz) from public;
++grant execute on function app.delete_proven_raw_before(timestamptz)
++to retention_worker;
++
++-- No DELETE grant is added to service_worker or a user-facing role. Only the
++-- retention role can execute the hash-matched, proof-gated deletion function.

@@ -1,0 +1,436 @@
+# Review package: ff500c556e9c9d59a608d4fcea8fb9d6b8e009e9..HEAD
+
+## Commits
+09eb0f5 fix: harden amoCRM OAuth worker runtime
+
+## Files changed
+ apps/worker/src/main.test.mts        | 50 ++++++++++++++++++++++++++++++++++++
+ apps/worker/src/main.ts              | 30 ++++++++++++++++++++--
+ docker-compose.yml                   |  4 +++
+ packages/db/src/client.ts            | 13 ++++++++++
+ packages/db/src/index.ts             |  1 +
+ packages/integrations/package.json   |  3 ++-
+ pnpm-lock.yaml                       |  3 +++
+ tests/repo/container-safety.test.mjs |  7 +++++
+ tests/repo/workspace.test.mjs        | 16 ++++++++++++
+ tests/security/rls.security.test.ts  | 20 +++++++++++++++
+ 10 files changed, 144 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/apps/worker/src/main.test.mts b/apps/worker/src/main.test.mts
+index e7a3ad7..026948a 100644
+--- a/apps/worker/src/main.test.mts
++++ b/apps/worker/src/main.test.mts
+@@ -15,34 +15,84 @@ test("worker refuses enabled network switches before integrations are configured
+       runWorkerOnce({
+         SYNC_ENABLED: true,
+         SHEET_PUBLISH_ENABLED: false,
+       }),
+     /Network integrations are not configured/,
+   );
+ });
+ 
+ test("worker CLI validates disabled switches and emits a safe one-shot result", async () => {
+   const lines: string[] = [];
++  const dependencies = {
++    createWorkerDbClient() {
++      return {};
++    },
++    async purgeExpiredOAuthStates() {
++      return 0;
++    },
++    async closeDbClient() {
++      return undefined;
++    },
++  };
+ 
+   await runWorkerCli(
+     {
+       APP_URL: "http://localhost:3000",
+       DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
+       SUPABASE_URL: "http://supabase:54321",
+       SUPABASE_ANON_KEY: "local-anon-key",
+       SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
+       AMO_CLIENT_ID: "synthetic-client-id",
+       AMO_CLIENT_SECRET: "synthetic-client-secret",
+       AMO_REDIRECT_URI:
+         "https://dashboard.example.invalid/api/integrations/amo/callback",
+       TOKEN_ENCRYPTION_KEY:
+         "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
+       SYNC_ENABLED: "false",
+       SHEET_PUBLISH_ENABLED: "false",
+     },
+     (line) => lines.push(line),
++    dependencies,
+   );
+ 
+   assert.deepEqual(lines.map((line) => JSON.parse(line)), [
+     { status: "idle", networkRequests: 0 },
+   ]);
+ });
++
++test("worker CLI runs OAuth-state retention with its scoped database client", async () => {
++  const calls: string[] = [];
++
++  await runWorkerCli(
++    {
++      APP_URL: "http://localhost:3000",
++      DATABASE_URL: "postgresql://postgres:postgres@db:5432/postgres",
++      SUPABASE_URL: "http://supabase:54321",
++      SUPABASE_ANON_KEY: "local-anon-key",
++      SUPABASE_SERVICE_ROLE_KEY: "local-service-role-key",
++      AMO_CLIENT_ID: "synthetic-client-id",
++      AMO_CLIENT_SECRET: "synthetic-client-secret",
++      AMO_REDIRECT_URI:
++        "https://dashboard.example.invalid/api/integrations/amo/callback",
++      TOKEN_ENCRYPTION_KEY:
++        "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=",
++      SYNC_ENABLED: "false",
++      SHEET_PUBLISH_ENABLED: "false",
++    },
++    () => undefined,
++    {
++      createWorkerDbClient() {
++        calls.push("create");
++        return {};
++      },
++      async purgeExpiredOAuthStates() {
++        calls.push("purge");
++        return 1;
++      },
++      async closeDbClient() {
++        calls.push("close");
++      },
++    },
++  );
++
++  assert.deepEqual(calls, ["create", "purge", "close"]);
++});
+diff --git a/apps/worker/src/main.ts b/apps/worker/src/main.ts
+index 168638e..679ca76 100644
+--- a/apps/worker/src/main.ts
++++ b/apps/worker/src/main.ts
+@@ -1,44 +1,70 @@
++import {
++  closeDbClient,
++  createServiceWorkerDbClient,
++  purgeExpiredOAuthStates,
++  type Database,
++} from "@real2/db";
+ import { parseServerEnv, type ServerEnv } from "@real2/domain";
+ import { pathToFileURL } from "node:url";
+ 
+ export type WorkerIdleResult = Readonly<{
+   status: "idle";
+   networkRequests: 0;
+ }>;
+ 
+ export type WorkerNetworkSwitches = Readonly<
+   Pick<ServerEnv, "SYNC_ENABLED" | "SHEET_PUBLISH_ENABLED">
+ >;
+ 
+ const disabledNetworkSwitches: WorkerNetworkSwitches = {
+   SYNC_ENABLED: false,
+   SHEET_PUBLISH_ENABLED: false,
+ };
+ 
++export type WorkerCliDependencies = Readonly<{
++  createWorkerDbClient(databaseUrl: string): Database;
++  purgeExpiredOAuthStates(db: Database): Promise<number>;
++  closeDbClient(db: Database): Promise<void>;
++}>;
++
++const workerCliDependencies: WorkerCliDependencies = {
++  createWorkerDbClient: createServiceWorkerDbClient,
++  purgeExpiredOAuthStates,
++  closeDbClient,
++};
++
+ export async function runWorkerOnce(
+   switches: WorkerNetworkSwitches = disabledNetworkSwitches,
+ ): Promise<WorkerIdleResult> {
+   if (switches.SYNC_ENABLED || switches.SHEET_PUBLISH_ENABLED) {
+     throw new Error("Network integrations are not configured");
+   }
+ 
+   return { status: "idle", networkRequests: 0 };
+ }
+ 
+ export async function runWorkerCli(
+   input: Record<string, string | undefined>,
+   write: (line: string) => void = (line) => process.stdout.write(`${line}\n`),
++  dependencies: WorkerCliDependencies = workerCliDependencies,
+ ): Promise<void> {
+   const env = parseServerEnv(input);
+-  const result = await runWorkerOnce(env);
+-  write(JSON.stringify(result));
++  const db = dependencies.createWorkerDbClient(env.DATABASE_URL);
++
++  try {
++    await dependencies.purgeExpiredOAuthStates(db);
++    const result = await runWorkerOnce(env);
++    write(JSON.stringify(result));
++  } finally {
++    await dependencies.closeDbClient(db);
++  }
+ }
+ 
+ if (
+   process.argv[1] &&
+   import.meta.url === pathToFileURL(process.argv[1]).href
+ ) {
+   runWorkerCli(process.env).catch(() => {
+     process.stderr.write("Worker failed safely\n");
+     process.exitCode = 1;
+   });
+diff --git a/docker-compose.yml b/docker-compose.yml
+index b957d31..ca9ba08 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,18 +1,22 @@
+ name: real2-sales-dashboard
+ 
+ x-runtime-environment: &runtime-environment
+   APP_URL: "${APP_URL:-http://localhost:3000}"
+   DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:54322/postgres"
+   SUPABASE_URL: "http://host.docker.internal:54321"
+   SUPABASE_ANON_KEY: "${REAL2_SUPABASE_ANON_KEY:-local-anon-key}"
+   SUPABASE_SERVICE_ROLE_KEY: "${REAL2_SUPABASE_SERVICE_ROLE_KEY:-local-service-role-key}"
++  AMO_CLIENT_ID: "synthetic-client-id"
++  AMO_CLIENT_SECRET: "synthetic-client-secret-change-before-use"
++  AMO_REDIRECT_URI: "https://dashboard.example.invalid/api/integrations/amo/callback"
++  TOKEN_ENCRYPTION_KEY: "bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE="
+   SYNC_ENABLED: "false"
+   SHEET_PUBLISH_ENABLED: "false"
+ 
+ x-service-security: &service-security
+   init: true
+   read_only: true
+   cap_drop:
+     - ALL
+   security_opt:
+     - no-new-privileges:true
+diff --git a/packages/db/src/client.ts b/packages/db/src/client.ts
+index a1fbb29..674fac1 100644
+--- a/packages/db/src/client.ts
++++ b/packages/db/src/client.ts
+@@ -6,13 +6,26 @@ export function createDbClient(
+   databaseUrl: string,
+   options: Options<Record<string, never>> = {},
+ ): Database {
+   return postgres(databaseUrl, {
+     idle_timeout: 20,
+     max: 10,
+     ...options,
+   });
+ }
+ 
++export function createServiceWorkerDbClient(
++  databaseUrl: string,
++  options: Options<Record<string, never>> = {},
++): Database {
++  return createDbClient(databaseUrl, {
++    ...options,
++    connection: {
++      ...options.connection,
++      role: "service_worker",
++    },
++  });
++}
++
+ export async function closeDbClient(db: Database): Promise<void> {
+   await db.end({ timeout: 5 });
+ }
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 03a53b8..25c4c6b 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,13 +1,14 @@
+ export {
+   closeDbClient,
+   createDbClient,
++  createServiceWorkerDbClient,
+   type Database,
+ } from "./client.js";
+ export {
+   AppIdentityError,
+   findAppUserByAuthId,
+   getSystemControl,
+   requireActiveAppUser,
+   type AppRole,
+   type AppUser,
+   type SystemControl,
+diff --git a/packages/integrations/package.json b/packages/integrations/package.json
+index 9beaf74..4efc737 100644
+--- a/packages/integrations/package.json
++++ b/packages/integrations/package.json
+@@ -8,13 +8,14 @@
+       "types": "./dist/index.d.ts",
+       "import": "./dist/index.js"
+     }
+   },
+   "scripts": {
+     "lint": "eslint src",
+     "typecheck": "tsc --noEmit",
+     "build": "tsc -p tsconfig.build.json"
+   },
+   "dependencies": {
+-    "@real2/domain": "workspace:*"
++    "@real2/domain": "workspace:*",
++    "zod": "^4.0.0"
+   }
+ }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 6e6d576..2439d34 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -114,20 +114,23 @@ importers:
+     dependencies:
+       zod:
+         specifier: ^4.0.0
+         version: 4.6.2
+ 
+   packages/integrations:
+     dependencies:
+       '@real2/domain':
+         specifier: workspace:*
+         version: link:../domain
++      zod:
++        specifier: ^4.0.0
++        version: 4.6.2
+ 
+   packages/testkit:
+     dependencies:
+       '@real2/domain':
+         specifier: workspace:*
+         version: link:../domain
+ 
+ packages:
+ 
+   '@cacheable/memory@2.2.0':
+diff --git a/tests/repo/container-safety.test.mjs b/tests/repo/container-safety.test.mjs
+index 71b31b5..a4ac5a4 100644
+--- a/tests/repo/container-safety.test.mjs
++++ b/tests/repo/container-safety.test.mjs
+@@ -6,20 +6,27 @@ const root = new URL("../../", import.meta.url);
+ 
+ async function read(path) {
+   return readFile(new URL(path, root), "utf8");
+ }
+ 
+ test("Compose keeps both external network switches literally disabled", async () => {
+   const compose = await read("docker-compose.yml");
+ 
+   assert.match(compose, /SYNC_ENABLED:\s*["']false["']/);
+   assert.match(compose, /SHEET_PUBLISH_ENABLED:\s*["']false["']/);
++  assert.match(compose, /AMO_CLIENT_ID:\s*["']synthetic-client-id["']/);
++  assert.match(compose, /AMO_CLIENT_SECRET:\s*["']synthetic-client-secret-change-before-use["']/);
++  assert.match(
++    compose,
++    /AMO_REDIRECT_URI:\s*["']https:\/\/dashboard\.example\.invalid\/api\/integrations\/amo\/callback["']/,
++  );
++  assert.match(compose, /TOKEN_ENCRYPTION_KEY:\s*["']bG9jYWwtc3ludGhldGljLWVuY3J5cHRpb24ta2V5ISE=["']/);
+   assert.doesNotMatch(compose, /(?:SYNC_ENABLED|SHEET_PUBLISH_ENABLED):[^\n]*\$\{/);
+   assert.doesNotMatch(compose, /123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks/);
+   assert.match(compose, /127\.0\.0\.1:\$\{WEB_PORT:-3000\}:3000/);
+   assert.match(compose, /restart:\s*["']no["']/);
+   assert.doesNotMatch(compose, /DATABASE_URL:[^\n]*\$\{/);
+   assert.match(
+     compose,
+     /DATABASE_URL:\s*["']postgresql:\/\/postgres:postgres@host\.docker\.internal:54322\/postgres["']/,
+   );
+ });
+diff --git a/tests/repo/workspace.test.mjs b/tests/repo/workspace.test.mjs
+index 0dfe859..636346a 100644
+--- a/tests/repo/workspace.test.mjs
++++ b/tests/repo/workspace.test.mjs
+@@ -1,23 +1,39 @@
+ import { spawnSync } from "node:child_process";
+ import test from "node:test";
+ import assert from "node:assert/strict";
++import { readFile } from "node:fs/promises";
++
++const root = new URL("../../", import.meta.url);
+ 
+ test("pnpm discovers both apps and every shared package", () => {
+   const result = spawnSync("pnpm", ["-r", "list", "--depth", "-1", "--json"], {
+     cwd: new URL("../..", import.meta.url),
+     encoding: "utf8",
+   });
+ 
+   assert.equal(result.status, 0, result.stderr);
+   const entries = result.stdout.trim() === "" ? [] : JSON.parse(result.stdout);
+   const names = entries.map((entry) => entry.name).sort();
+   assert.deepEqual(names, [
+     "@real2/db",
+     "@real2/domain",
+     "@real2/integrations",
+     "@real2/testkit",
+     "@real2/web",
+     "@real2/worker",
+     "real2-sales-dashboard",
+   ]);
+ });
++
++test("the integrations package declares its runtime schema dependency", async () => {
++  const manifest = JSON.parse(
++    await readFile(new URL("packages/integrations/package.json", root), "utf8"),
++  );
++  const lockfile = await readFile(new URL("pnpm-lock.yaml", root), "utf8");
++
++  assert.equal(manifest.dependencies.zod, "^4.0.0");
++  assert.match(
++    lockfile,
++    /packages\/integrations:\n    dependencies:\n(?:      [^\n]+\n)*      zod:\n        specifier: \^4\.0\.0\n        version: 4\.6\.2/m,
++  );
++});
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index 8fa7fa3..c695f2f 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -1,14 +1,17 @@
+ import { afterAll, beforeEach, describe, expect, it } from "vitest";
+ 
++import { closeDbClient, createServiceWorkerDbClient } from "@real2/db";
++
+ import {
+   createAdminDb,
++  localDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+   updateOwnNameAsManager,
+   visibleAppUserIds,
+   visibleControlKeys,
+ } from "../helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+ const allUsers = Object.values(testUsers);
+ 
+@@ -149,10 +152,27 @@ describe("amoCRM credential RLS", () => {
+             'request.jwt.claim.sub',
+             ${testUsers.admin.authUserId},
+             true
+           )
+         `;
+         await transaction`select state_hash from public.oauth_states`;
+       }),
+     ).rejects.toMatchObject({ code: "42501" });
+   });
+ });
++
++describe("worker database scope", () => {
++  it("connects as service_worker and cannot read application-user rows", async () => {
++    const workerDb = createServiceWorkerDbClient(localDatabaseUrl);
++
++    try {
++      await expect(workerDb<{ current_user: string }[]>`
++        select current_user
++      `).resolves.toEqual([{ current_user: "service_worker" }]);
++      await expect(workerDb`select id from public.app_users`).rejects.toMatchObject({
++        code: "42501",
++      });
++    } finally {
++      await closeDbClient(workerDb);
++    }
++  });
++});

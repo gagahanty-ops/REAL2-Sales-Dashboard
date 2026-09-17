@@ -1,0 +1,1157 @@
+# Review package: 4c248cbf84f779a9e34915087111eeafb78de289..0f45cd7940f6abffccd656adaf31a36c42595866
+
+## Commits
+0f45cd7 feat: add normalized lead history schema
+
+## Files changed
+ .../src/app/api/config/config.integration.test.ts  |   4 +-
+ .../api/sync-runs/sync-runs.integration.test.ts    |   2 +-
+ packages/db/src/index.ts                           |  19 ++
+ packages/db/src/leads.integration.test.ts          | 242 +++++++++++++++++++++
+ packages/db/src/leads.ts                           | 205 +++++++++++++++++
+ packages/db/src/quality.ts                         |  95 ++++++++
+ packages/db/src/raw-amo.integration.test.ts        |   2 +-
+ .../db/src/sync-operations.integration.test.ts     |   2 +-
+ supabase/migrations/0010_normalized_leads.sql      | 229 +++++++++++++++++++
+ tests/security/rls.security.test.ts                | 154 ++++++++++++-
+ 10 files changed, 946 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/apps/web/src/app/api/config/config.integration.test.ts b/apps/web/src/app/api/config/config.integration.test.ts
+index b89c8ea..bdcd4cf 100644
+--- a/apps/web/src/app/api/config/config.integration.test.ts
++++ b/apps/web/src/app/api/config/config.integration.test.ts
+@@ -139,31 +139,31 @@ async function seedActiveConnection(): Promise<void> {
+     installedBy: testUsers.admin.id,
+     lastCheckedAt: new Date("2026-09-14T00:00:00.000Z"),
+   });
+ }
+ 
+ beforeEach(async () => {
+   runtime.db = adminDb;
+   session.user.id = testUsers.admin.id;
+   session.user.role = "admin";
+   await adminDb.unsafe(
+-    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.data_quality_issues, public.lead_milestones, public.lead_responsible_events, public.lead_stage_events, public.leads, public.pipeline_statuses, public.amo_users, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+   await resetAndSeedUsers(adminDb, [testUsers.admin, testUsers.head, testUsers.managerOne]);
+   await seedActiveConnection();
+ });
+ 
+ afterEach(async () => {
+   await adminDb.unsafe(
+-    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.data_quality_issues, public.lead_milestones, public.lead_responsible_events, public.lead_stage_events, public.leads, public.pipeline_statuses, public.amo_users, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+   vi.unstubAllGlobals();
+ });
+ 
+ afterAll(async () => {
+   vi.unstubAllGlobals();
+   await adminDb.end();
+ });
+diff --git a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+index 0f1e3e2..f8701b7 100644
+--- a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
++++ b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+@@ -25,21 +25,21 @@ const session = vi.hoisted(() => ({
+ vi.mock("../../../lib/auth/require-user", () => ({
+   requireUser: vi.fn(async () => session.user),
+ }));
+ vi.mock("../../../lib/server/runtime", () => ({
+   getDatabase: () => adminDb,
+   getServerEnv: () => ({ APP_URL: "https://dashboard.example.test" }),
+ }));
+ 
+ async function clearFixtures(): Promise<void> {
+   await adminDb.unsafe(
+-    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.data_quality_issues, public.lead_milestones, public.lead_responsible_events, public.lead_stage_events, public.leads, public.pipeline_statuses, public.amo_users, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ async function seedRun(startedAt: Date) {
+   const [connection] = await adminDb<{ id: string }[]>`
+     insert into public.amo_connections (
+       account_id, subdomain, base_url, access_token_ciphertext,
+       refresh_token_ciphertext, token_expires_at, status, installed_by
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 4a8c5ac..9bd5420 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -84,10 +84,29 @@ export {
+   type ClaimedSyncWork,
+   type CompleteSyncWorkInput,
+   type RawRetentionProofInput,
+   type RawRetentionResult,
+   type RawRetentionSourceTable,
+   type QueuedSyncWork,
+   type SafeSyncRunDetail,
+   type SafeSyncRunSummary,
+   type SyncLockFence,
+ } from "./sync-operations.js";
++export {
++  createNormalizedLeadRepository,
++  type AppendResponsibleEventInput,
++  type AppendStageEventInput,
++  type NormalizedLeadKey,
++  type NormalizedLeadRepository,
++  type UpsertAmoUserInput,
++  type UpsertLeadInput,
++  type UpsertLeadMilestoneInput,
++  type UpsertPipelineStatusInput,
++} from "./leads.js";
++export {
++  createQualityRepository,
++  type OpenQualityIssueInput,
++  type QualityIssue,
++  type QualityRepository,
++  type QualitySeverity,
++  type QualityStatus,
++} from "./quality.js";
+diff --git a/packages/db/src/leads.integration.test.ts b/packages/db/src/leads.integration.test.ts
+new file mode 100644
+index 0000000..722012b
+--- /dev/null
++++ b/packages/db/src/leads.integration.test.ts
+@@ -0,0 +1,242 @@
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
++
++import { createNormalizedLeadRepository } from "./leads";
++import { createQualityRepository } from "./quality";
++import {
++  createAdminDb,
++  ensureRestrictedTestLogins,
++  resetAndSeedUsers,
++  testUsers,
++} from "../../../tests/helpers/local-db";
++
++const adminDb = createAdminDb();
++const fixtureConfig = {
++  accountId: 1,
++  amoLeadId: 55,
++  amoEventId: "01pz58t6p04ymgsgfbmfyfy1mf",
++} as const;
++
++async function clearFixture(): Promise<void> {
++  await adminDb.unsafe(`
++    do $$
++    begin
++      if to_regclass('public.data_quality_issues') is not null then
++        execute 'truncate table public.data_quality_issues, public.lead_milestones,
++          public.lead_responsible_events, public.lead_stage_events, public.leads,
++          public.pipeline_statuses, public.amo_users, public.amo_api_audit,
++          public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects,
++          public.sync_pages, public.sync_cursors, public.sync_runs,
++          public.config_recalculation_requests, public.config_validations,
++          public.channel_rules, public.pipeline_configs';
++      else
++        execute 'truncate table public.amo_api_audit, public.raw_amo_quarantine,
++          public.raw_amo_events, public.raw_amo_objects, public.sync_pages,
++          public.sync_cursors, public.sync_runs, public.config_recalculation_requests,
++          public.config_validations, public.channel_rules, public.pipeline_configs';
++      end if;
++    end
++    $$;
++  `);
++  await adminDb`delete from public.oauth_states`;
++  await adminDb`delete from public.amo_connections`;
++}
++
++async function seedNormalizedLead(): Promise<string> {
++  await resetAndSeedUsers(adminDb, [testUsers.admin]);
++  const [connection] = await adminDb<{ id: string }[]>`
++    insert into public.amo_connections (
++      account_id, subdomain, base_url, access_token_ciphertext,
++      refresh_token_ciphertext, token_expires_at, status, installed_by
++    ) values (
++      ${fixtureConfig.accountId}, '555151', 'https://555151.amocrm.ru',
++      ${Buffer.alloc(64)}, ${Buffer.alloc(64)}, '2030-01-01T00:00:00.000Z',
++      'active', ${testUsers.admin.id}
++    ) returning id
++  `;
++  if (!connection) throw new Error("amoCRM connection fixture is missing");
++  const [config] = await adminDb<{ id: string }[]>`
++    insert into public.pipeline_configs (
++      amo_connection_id, pipeline_id, pipeline_name, application_status_id,
++      application_status_name, won_status_id, won_status_name, version,
++      is_active, confirmed_by
++    ) values (
++      ${connection.id}, 10, 'Pipeline', 20, 'Application', 30, 'Won', 1,
++      true, ${testUsers.admin.id}
++    ) returning id
++  `;
++  if (!config) throw new Error("pipeline configuration fixture is missing");
++  await adminDb`
++    insert into public.leads (
++      account_id, amo_lead_id, pipeline_id, current_status_id,
++      current_responsible_user_id, name, price_rub, created_at, created_date,
++      source_updated_at, normalized_channel, normalization_config_id, amo_url
++    ) values (
++      ${fixtureConfig.accountId}, ${fixtureConfig.amoLeadId}, 10, 20, 101,
++      'Synthetic lead', 5000, '2026-09-15T09:00:00.000Z', '2026-09-15',
++      '2026-09-15T09:01:00.000Z', 'site', ${config.id},
++      'https://555151.amocrm.ru/leads/55'
++    )
++  `;
++  return config.id;
++}
++
++async function openIssue(): Promise<void> {
++  await adminDb`
++    insert into public.data_quality_issues (
++      account_id, amo_lead_id, code, severity, status
++    ) values (1, 55, 'missing_responsible', 'warning', 'open')
++    on conflict (account_id, (coalesce(amo_lead_id, 0)), code)
++      where status = 'open'
++    do update set last_seen_at = excluded.last_seen_at
++  `;
++}
++
++async function countOpenIssues(): Promise<number> {
++  const [row] = await adminDb<{ count: number }[]>`
++    select count(*)::integer as count
++    from public.data_quality_issues
++    where account_id = 1
++      and amo_lead_id = 55
++      and code = 'missing_responsible'
++      and status = 'open'
++  `;
++  if (!row) throw new Error("quality issue count is missing");
++  return row.count;
++}
++
++beforeAll(async () => {
++  await ensureRestrictedTestLogins(adminDb);
++});
++
++beforeEach(async () => {
++  await clearFixture();
++});
++
++afterEach(async () => {
++  await clearFixture();
++});
++
++afterAll(async () => {
++  await adminDb.end();
++});
++
++describe("normalized lead database invariants", () => {
++  it("rejects a stage event for a lead in another amo account", async () => {
++    await seedNormalizedLead();
++
++    await expect(adminDb`
++      insert into public.lead_stage_events (
++        account_id, amo_event_id, amo_lead_id, to_status_id, occurred_at
++      ) values (2, ${fixtureConfig.amoEventId}, 55, 20, '2026-09-15T09:02:00.000Z')
++    `).rejects.toThrow(/foreign key/i);
++  });
++
++  it("allows only one open quality issue per lead and code", async () => {
++    await seedNormalizedLead();
++
++    await openIssue();
++    await openIssue();
++
++    await expect(countOpenIssues()).resolves.toBe(1);
++  });
++
++  it("persists normalized lead history and reopens a matching quality issue once", async () => {
++    const configId = await seedNormalizedLead();
++    const leads = createNormalizedLeadRepository(adminDb);
++    const quality = createQualityRepository(adminDb);
++
++    await leads.upsertAmoUser({
++      accountId: 1,
++      amoUserId: 101,
++      name: "Manager One",
++      email: "manager.one@example.test",
++      isActive: true,
++      sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
++    });
++    await leads.upsertPipelineStatus({
++      accountId: 1,
++      pipelineId: 10,
++      statusId: 20,
++      name: "Application",
++      sortOrder: 1,
++      isClosed: false,
++      isWon: false,
++      sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
++    });
++    await leads.upsertLead({
++      accountId: 1,
++      amoLeadId: 55,
++      pipelineId: 10,
++      currentStatusId: 20,
++      currentResponsibleUserId: 101,
++      name: "Synthetic lead",
++      priceRub: 5000,
++      createdAt: new Date("2026-09-15T09:00:00.000Z"),
++      createdDate: "2026-09-15",
++      sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
++      normalizedChannel: "site",
++      channelRuleId: null,
++      normalizationConfigId: configId,
++      amoUrl: "https://555151.amocrm.ru/leads/55",
++      isDeleted: false,
++    });
++    await leads.appendStageEvent({
++      accountId: 1,
++      amoEventId: "stage-event-55",
++      amoLeadId: 55,
++      fromStatusId: null,
++      toStatusId: 20,
++      responsibleUserId: 101,
++      occurredAt: new Date("2026-09-15T09:02:00.000Z"),
++    });
++    await leads.appendResponsibleEvent({
++      accountId: 1,
++      amoEventId: "responsible-event-55",
++      amoLeadId: 55,
++      fromUserId: null,
++      toUserId: 101,
++      occurredAt: new Date("2026-09-15T09:03:00.000Z"),
++    });
++    await leads.upsertMilestone({
++      accountId: 1,
++      amoLeadId: 55,
++      applicationAt: new Date("2026-09-15T09:02:00.000Z"),
++      applicationResponsibleUserId: 101,
++      wonAt: null,
++      wonResponsibleUserId: null,
++      currentlyWon: false,
++    });
++    const issueFixture = {
++      accountId: 1,
++      amoLeadId: 55,
++      code: "missing_responsible",
++      severity: "warning" as const,
++      safeDetails: { source: "synthetic" },
++    };
++    await quality.open(issueFixture);
++    await quality.open(issueFixture);
++
++    await expect(adminDb<{
++      users: number;
++      statuses: number;
++      stageEvents: number;
++      responsibleEvents: number;
++      milestones: number;
++    }[]>`
++      select
++        (select count(*)::integer from public.amo_users) as users,
++        (select count(*)::integer from public.pipeline_statuses) as statuses,
++        (select count(*)::integer from public.lead_stage_events) as "stageEvents",
++        (select count(*)::integer from public.lead_responsible_events) as "responsibleEvents",
++        (select count(*)::integer from public.lead_milestones) as milestones
++    `).resolves.toEqual([{
++      users: 1,
++      statuses: 1,
++      stageEvents: 1,
++      responsibleEvents: 1,
++      milestones: 1,
++    }]);
++    await expect(quality.countOpen({ accountId: 1, amoLeadId: 55 }, "missing_responsible"))
++      .resolves.toBe(1);
++  });
++});
+diff --git a/packages/db/src/leads.ts b/packages/db/src/leads.ts
+new file mode 100644
+index 0000000..6d77cdc
+--- /dev/null
++++ b/packages/db/src/leads.ts
+@@ -0,0 +1,205 @@
++import type { Database } from "./client.js";
++
++export type NormalizedLeadKey = Readonly<{
++  accountId: number;
++  amoLeadId: number;
++}>;
++
++export type UpsertAmoUserInput = Readonly<{
++  accountId: number;
++  amoUserId: number;
++  name: string;
++  email: string | null;
++  isActive: boolean;
++  sourceUpdatedAt: Date | null;
++}>;
++
++export type UpsertPipelineStatusInput = Readonly<{
++  accountId: number;
++  pipelineId: number;
++  statusId: number;
++  name: string;
++  sortOrder: number;
++  isClosed: boolean;
++  isWon: boolean;
++  sourceUpdatedAt: Date | null;
++}>;
++
++export type UpsertLeadInput = Readonly<{
++  accountId: number;
++  amoLeadId: number;
++  pipelineId: number;
++  currentStatusId: number;
++  currentResponsibleUserId: number | null;
++  name: string;
++  priceRub: number | null;
++  createdAt: Date;
++  createdDate: string;
++  sourceUpdatedAt: Date;
++  normalizedChannel: string;
++  channelRuleId: string | null;
++  normalizationConfigId: string;
++  amoUrl: string;
++  isDeleted: boolean;
++}>;
++
++export type AppendStageEventInput = Readonly<{
++  accountId: number;
++  amoEventId: string;
++  amoLeadId: number;
++  fromStatusId: number | null;
++  toStatusId: number;
++  responsibleUserId: number | null;
++  occurredAt: Date;
++}>;
++
++export type AppendResponsibleEventInput = Readonly<{
++  accountId: number;
++  amoEventId: string;
++  amoLeadId: number;
++  fromUserId: number | null;
++  toUserId: number | null;
++  occurredAt: Date;
++}>;
++
++export type UpsertLeadMilestoneInput = Readonly<{
++  accountId: number;
++  amoLeadId: number;
++  applicationAt: Date | null;
++  applicationResponsibleUserId: number | null;
++  wonAt: Date | null;
++  wonResponsibleUserId: number | null;
++  currentlyWon: boolean;
++  recalculatedAt?: Date;
++}>;
++
++export type NormalizedLeadRepository = Readonly<{
++  upsertAmoUser(input: UpsertAmoUserInput): Promise<void>;
++  upsertPipelineStatus(input: UpsertPipelineStatusInput): Promise<void>;
++  upsertLead(input: UpsertLeadInput): Promise<void>;
++  appendStageEvent(input: AppendStageEventInput): Promise<void>;
++  appendResponsibleEvent(input: AppendResponsibleEventInput): Promise<void>;
++  upsertMilestone(input: UpsertLeadMilestoneInput): Promise<void>;
++}>;
++
++export function createNormalizedLeadRepository(
++  db: Database,
++): NormalizedLeadRepository {
++  return {
++    async upsertAmoUser(input) {
++      await db`
++        insert into public.amo_users (
++          account_id, amo_user_id, name, email, is_active, source_updated_at
++        ) values (
++          ${input.accountId}, ${input.amoUserId}, ${input.name}, ${input.email},
++          ${input.isActive}, ${input.sourceUpdatedAt}
++        )
++        on conflict (account_id, amo_user_id) do update set
++          name = excluded.name,
++          email = excluded.email,
++          is_active = excluded.is_active,
++          source_updated_at = excluded.source_updated_at,
++          normalized_at = now()
++      `;
++    },
++
++    async upsertPipelineStatus(input) {
++      await db`
++        insert into public.pipeline_statuses (
++          account_id, pipeline_id, status_id, name, sort_order, is_closed,
++          is_won, source_updated_at
++        ) values (
++          ${input.accountId}, ${input.pipelineId}, ${input.statusId}, ${input.name},
++          ${input.sortOrder}, ${input.isClosed}, ${input.isWon}, ${input.sourceUpdatedAt}
++        )
++        on conflict (account_id, status_id) do update set
++          pipeline_id = excluded.pipeline_id,
++          name = excluded.name,
++          sort_order = excluded.sort_order,
++          is_closed = excluded.is_closed,
++          is_won = excluded.is_won,
++          source_updated_at = excluded.source_updated_at
++      `;
++    },
++
++    async upsertLead(input) {
++      await db`
++        insert into public.leads (
++          account_id, amo_lead_id, pipeline_id, current_status_id,
++          current_responsible_user_id, name, price_rub, created_at, created_date,
++          source_updated_at, normalized_channel, channel_rule_id,
++          normalization_config_id, amo_url, is_deleted
++        ) values (
++          ${input.accountId}, ${input.amoLeadId}, ${input.pipelineId},
++          ${input.currentStatusId}, ${input.currentResponsibleUserId}, ${input.name},
++          ${input.priceRub}, ${input.createdAt}, ${input.createdDate},
++          ${input.sourceUpdatedAt}, ${input.normalizedChannel}, ${input.channelRuleId},
++          ${input.normalizationConfigId}, ${input.amoUrl}, ${input.isDeleted}
++        )
++        on conflict (account_id, amo_lead_id) do update set
++          pipeline_id = excluded.pipeline_id,
++          current_status_id = excluded.current_status_id,
++          current_responsible_user_id = excluded.current_responsible_user_id,
++          name = excluded.name,
++          price_rub = excluded.price_rub,
++          created_at = excluded.created_at,
++          created_date = excluded.created_date,
++          source_updated_at = excluded.source_updated_at,
++          normalized_channel = excluded.normalized_channel,
++          channel_rule_id = excluded.channel_rule_id,
++          normalization_config_id = excluded.normalization_config_id,
++          amo_url = excluded.amo_url,
++          is_deleted = excluded.is_deleted,
++          normalized_at = now()
++      `;
++    },
++
++    async appendStageEvent(input) {
++      await db`
++        insert into public.lead_stage_events (
++          account_id, amo_event_id, amo_lead_id, from_status_id, to_status_id,
++          responsible_user_id, occurred_at
++        ) values (
++          ${input.accountId}, ${input.amoEventId}, ${input.amoLeadId},
++          ${input.fromStatusId}, ${input.toStatusId}, ${input.responsibleUserId},
++          ${input.occurredAt}
++        )
++        on conflict (account_id, amo_event_id) do nothing
++      `;
++    },
++
++    async appendResponsibleEvent(input) {
++      await db`
++        insert into public.lead_responsible_events (
++          account_id, amo_event_id, amo_lead_id, from_user_id, to_user_id,
++          occurred_at
++        ) values (
++          ${input.accountId}, ${input.amoEventId}, ${input.amoLeadId},
++          ${input.fromUserId}, ${input.toUserId}, ${input.occurredAt}
++        )
++        on conflict (account_id, amo_event_id) do nothing
++      `;
++    },
++
++    async upsertMilestone(input) {
++      await db`
++        insert into public.lead_milestones (
++          account_id, amo_lead_id, application_at, application_responsible_user_id,
++          won_at, won_responsible_user_id, currently_won, recalculated_at
++        ) values (
++          ${input.accountId}, ${input.amoLeadId}, ${input.applicationAt},
++          ${input.applicationResponsibleUserId}, ${input.wonAt},
++          ${input.wonResponsibleUserId}, ${input.currentlyWon},
++          ${input.recalculatedAt ?? new Date()}
++        )
++        on conflict (account_id, amo_lead_id) do update set
++          application_at = excluded.application_at,
++          application_responsible_user_id = excluded.application_responsible_user_id,
++          won_at = excluded.won_at,
++          won_responsible_user_id = excluded.won_responsible_user_id,
++          currently_won = excluded.currently_won,
++          recalculated_at = excluded.recalculated_at
++      `;
++    },
++  };
++}
+diff --git a/packages/db/src/quality.ts b/packages/db/src/quality.ts
+new file mode 100644
+index 0000000..5ca0dad
+--- /dev/null
++++ b/packages/db/src/quality.ts
+@@ -0,0 +1,95 @@
++import type { JSONValue } from "postgres";
++
++import type { NormalizedLeadKey } from "./leads.js";
++import type { Database } from "./client.js";
++
++export type QualitySeverity = "info" | "warning" | "blocking";
++export type QualityStatus = "open" | "resolved" | "accepted";
++
++export type OpenQualityIssueInput = Readonly<{
++  accountId: number;
++  amoLeadId: number | null;
++  syncRunId?: string | null;
++  code: string;
++  severity: QualitySeverity;
++  safeDetails?: JSONValue;
++}>;
++
++export type QualityIssue = Readonly<{
++  id: string;
++  accountId: number;
++  amoLeadId: number | null;
++  code: string;
++  severity: QualitySeverity;
++  status: QualityStatus;
++  firstSeenAt: Date;
++  lastSeenAt: Date;
++}>;
++
++type QualityIssueRow = {
++  id: string;
++  account_id: string;
++  amo_lead_id: string | null;
++  code: string;
++  severity: QualitySeverity;
++  status: QualityStatus;
++  first_seen_at: Date;
++  last_seen_at: Date;
++};
++
++export type QualityRepository = Readonly<{
++  open(input: OpenQualityIssueInput): Promise<QualityIssue>;
++  countOpen(leadKey: Readonly<Pick<NormalizedLeadKey, "accountId" | "amoLeadId">>, code: string): Promise<number>;
++}>;
++
++function mapQualityIssue(row: QualityIssueRow): QualityIssue {
++  return {
++    id: row.id,
++    accountId: Number(row.account_id),
++    amoLeadId: row.amo_lead_id === null ? null : Number(row.amo_lead_id),
++    code: row.code,
++    severity: row.severity,
++    status: row.status,
++    firstSeenAt: row.first_seen_at,
++    lastSeenAt: row.last_seen_at,
++  };
++}
++
++export function createQualityRepository(db: Database): QualityRepository {
++  return {
++    async open(input) {
++      const [row] = await db<QualityIssueRow[]>`
++        insert into public.data_quality_issues (
++          account_id, amo_lead_id, sync_run_id, code, severity, safe_details
++        ) values (
++          ${input.accountId}, ${input.amoLeadId}, ${input.syncRunId ?? null},
++          ${input.code}, ${input.severity}, ${db.json(input.safeDetails ?? {})}
++        )
++        on conflict (account_id, (coalesce(amo_lead_id, 0)), code)
++          where status = 'open'
++        do update set
++          sync_run_id = excluded.sync_run_id,
++          severity = excluded.severity,
++          safe_details = excluded.safe_details,
++          last_seen_at = excluded.last_seen_at
++        returning id, account_id, amo_lead_id, code, severity, status,
++          first_seen_at, last_seen_at
++      `;
++      if (!row) throw new Error("quality issue insert returned no row");
++      return mapQualityIssue(row);
++    },
++
++    async countOpen(leadKey, code) {
++      const [row] = await db<{ count: number }[]>`
++        select count(*)::integer as count
++        from public.data_quality_issues
++        where account_id = ${leadKey.accountId}
++          and amo_lead_id = ${leadKey.amoLeadId}
++          and code = ${code}
++          and status = 'open'
++      `;
++      if (!row) throw new Error("quality issue count returned no row");
++      return row.count;
++    },
++  };
++}
+diff --git a/packages/db/src/raw-amo.integration.test.ts b/packages/db/src/raw-amo.integration.test.ts
+index 60be151..1ad1572 100644
+--- a/packages/db/src/raw-amo.integration.test.ts
++++ b/packages/db/src/raw-amo.integration.test.ts
+@@ -97,21 +97,21 @@ async function startFixtureRun(
+     connectionId: fixture.connectionId,
+     configId: fixture.configId,
+     kind: "incremental",
+     createdBy: testUsers.admin.id,
+     startedAt: receivedAt,
+   });
+ }
+ 
+ async function clearFixture(): Promise<void> {
+   await adminDb.unsafe(
+-    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.data_quality_issues, public.lead_milestones, public.lead_responsible_events, public.lead_stage_events, public.leads, public.pipeline_statuses, public.amo_users, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ beforeAll(async () => {
+   await ensureRestrictedTestLogins(adminDb);
+   workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 1 });
+ });
+ 
+diff --git a/packages/db/src/sync-operations.integration.test.ts b/packages/db/src/sync-operations.integration.test.ts
+index 6d28326..77b5b53 100644
+--- a/packages/db/src/sync-operations.integration.test.ts
++++ b/packages/db/src/sync-operations.integration.test.ts
+@@ -58,21 +58,21 @@ async function seedFixture(): Promise<Fixture> {
+       ${connection.id}, 77, 'Synthetic', 771, 'Application', 772, 'Won', 1,
+       true, ${testUsers.admin.id}
+     ) returning id
+   `;
+   if (!config) throw new Error("missing synthetic config");
+   return { connectionId: connection.id, configId: config.id };
+ }
+ 
+ async function clearFixtures(): Promise<void> {
+   await adminDb.unsafe(
+-    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.data_quality_issues, public.lead_milestones, public.lead_responsible_events, public.lead_stage_events, public.leads, public.pipeline_statuses, public.amo_users, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ beforeAll(async () => {
+   await ensureRestrictedTestLogins(adminDb);
+   workerOne = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 2 });
+   workerTwo = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl, { max: 2 });
+   retentionDb = createRetentionWorkerDbClient(localRetentionWorkerDatabaseUrl, { max: 1 });
+diff --git a/supabase/migrations/0010_normalized_leads.sql b/supabase/migrations/0010_normalized_leads.sql
+new file mode 100644
+index 0000000..9a6f7e0
+--- /dev/null
++++ b/supabase/migrations/0010_normalized_leads.sql
+@@ -0,0 +1,229 @@
++create table public.amo_users (
++  account_id bigint not null,
++  amo_user_id bigint not null,
++  name text not null,
++  email extensions.citext,
++  is_active boolean not null,
++  source_updated_at timestamptz,
++  normalized_at timestamptz not null default now(),
++  primary key (account_id, amo_user_id)
++);
++
++create table public.pipeline_statuses (
++  account_id bigint not null,
++  pipeline_id bigint not null,
++  status_id bigint not null,
++  name text not null,
++  sort_order integer not null,
++  is_closed boolean not null,
++  is_won boolean not null,
++  source_updated_at timestamptz,
++  primary key (account_id, status_id)
++);
++
++create table public.leads (
++  id uuid primary key default gen_random_uuid(),
++  account_id bigint not null,
++  amo_lead_id bigint not null,
++  pipeline_id bigint not null,
++  current_status_id bigint not null,
++  current_responsible_user_id bigint,
++  name text not null,
++  price_rub numeric(14,2),
++  created_at timestamptz not null,
++  created_date date not null,
++  source_updated_at timestamptz not null,
++  normalized_channel text not null,
++  channel_rule_id uuid references public.channel_rules(id),
++  normalization_config_id uuid not null references public.pipeline_configs(id),
++  amo_url text not null,
++  is_deleted boolean not null default false,
++  normalized_at timestamptz not null default now(),
++  unique (account_id, amo_lead_id)
++);
++
++create table public.lead_stage_events (
++  id uuid primary key default gen_random_uuid(),
++  account_id bigint not null,
++  amo_event_id text not null,
++  amo_lead_id bigint not null,
++  from_status_id bigint,
++  to_status_id bigint not null,
++  responsible_user_id bigint,
++  occurred_at timestamptz not null,
++  unique (account_id, amo_event_id),
++  foreign key (account_id, amo_lead_id) references public.leads(account_id, amo_lead_id)
++);
++
++create table public.lead_responsible_events (
++  id uuid primary key default gen_random_uuid(),
++  account_id bigint not null,
++  amo_event_id text not null,
++  amo_lead_id bigint not null,
++  from_user_id bigint,
++  to_user_id bigint,
++  occurred_at timestamptz not null,
++  unique (account_id, amo_event_id),
++  foreign key (account_id, amo_lead_id) references public.leads(account_id, amo_lead_id)
++);
++
++create table public.lead_milestones (
++  account_id bigint not null,
++  amo_lead_id bigint not null,
++  application_at timestamptz,
++  application_responsible_user_id bigint,
++  won_at timestamptz,
++  won_responsible_user_id bigint,
++  currently_won boolean not null default false,
++  recalculated_at timestamptz not null default now(),
++  primary key (account_id, amo_lead_id),
++  foreign key (account_id, amo_lead_id) references public.leads(account_id, amo_lead_id)
++);
++
++create type public.quality_severity as enum ('info', 'warning', 'blocking');
++create type public.quality_status as enum ('open', 'resolved', 'accepted');
++
++create table public.data_quality_issues (
++  id uuid primary key default gen_random_uuid(),
++  account_id bigint not null,
++  amo_lead_id bigint,
++  sync_run_id uuid references public.sync_runs(id),
++  code text not null,
++  severity public.quality_severity not null,
++  status public.quality_status not null default 'open',
++  safe_details jsonb not null default '{}'::jsonb,
++  first_seen_at timestamptz not null default now(),
++  last_seen_at timestamptz not null default now(),
++  resolved_at timestamptz
++);
++
++create unique index data_quality_one_open_issue_idx
++  on public.data_quality_issues (account_id, coalesce(amo_lead_id, 0), code)
++  where status = 'open';
++
++create index leads_created_idx on public.leads(created_date);
++create index leads_manager_date_idx on public.leads(current_responsible_user_id, created_date);
++create index leads_channel_date_idx on public.leads(normalized_channel, created_date);
++create index lead_stage_timeline_idx
++  on public.lead_stage_events(amo_lead_id, occurred_at, amo_event_id);
++create index quality_status_idx on public.data_quality_issues(status, severity, code);
++
++alter table public.amo_users enable row level security;
++alter table public.pipeline_statuses enable row level security;
++alter table public.leads enable row level security;
++alter table public.lead_stage_events enable row level security;
++alter table public.lead_responsible_events enable row level security;
++alter table public.lead_milestones enable row level security;
++alter table public.data_quality_issues enable row level security;
++
++revoke all on table public.amo_users from anon, authenticated;
++revoke all on table public.pipeline_statuses from anon, authenticated;
++revoke all on table public.leads from anon, authenticated;
++revoke all on table public.lead_stage_events from anon, authenticated;
++revoke all on table public.lead_responsible_events from anon, authenticated;
++revoke all on table public.lead_milestones from anon, authenticated;
++revoke all on table public.data_quality_issues from anon, authenticated;
++
++grant select on table public.amo_users, public.pipeline_statuses, public.leads,
++  public.lead_stage_events, public.lead_responsible_events, public.lead_milestones,
++  public.data_quality_issues to authenticated;
++
++create policy amo_users_leadership_select
++on public.amo_users
++for select
++to authenticated
++using ((select app.current_role()) in ('admin', 'head'));
++
++create policy pipeline_statuses_leadership_select
++on public.pipeline_statuses
++for select
++to authenticated
++using ((select app.current_role()) in ('admin', 'head'));
++
++create policy leads_leadership_or_assigned_select
++on public.leads
++for select
++to authenticated
++using (
++  (select app.current_role()) in ('admin', 'head')
++  or current_responsible_user_id = (
++    select amo_user_id
++    from public.app_users
++    where auth_user_id = auth.uid()
++      and is_active
++    limit 1
++  )
++);
++
++create policy lead_stage_events_leadership_or_assigned_select
++on public.lead_stage_events
++for select
++to authenticated
++using (
++  (select app.current_role()) in ('admin', 'head')
++  or exists (
++    select 1
++    from public.leads
++    where leads.account_id = lead_stage_events.account_id
++      and leads.amo_lead_id = lead_stage_events.amo_lead_id
++      and leads.current_responsible_user_id = (
++        select amo_user_id
++        from public.app_users
++        where auth_user_id = auth.uid()
++          and is_active
++        limit 1
++      )
++  )
++);
++
++create policy lead_responsible_events_leadership_or_assigned_select
++on public.lead_responsible_events
++for select
++to authenticated
++using (
++  (select app.current_role()) in ('admin', 'head')
++  or exists (
++    select 1
++    from public.leads
++    where leads.account_id = lead_responsible_events.account_id
++      and leads.amo_lead_id = lead_responsible_events.amo_lead_id
++      and leads.current_responsible_user_id = (
++        select amo_user_id
++        from public.app_users
++        where auth_user_id = auth.uid()
++          and is_active
++        limit 1
++      )
++  )
++);
++
++create policy lead_milestones_leadership_or_assigned_select
++on public.lead_milestones
++for select
++to authenticated
++using (
++  (select app.current_role()) in ('admin', 'head')
++  or exists (
++    select 1
++    from public.leads
++    where leads.account_id = lead_milestones.account_id
++      and leads.amo_lead_id = lead_milestones.amo_lead_id
++      and leads.current_responsible_user_id = (
++        select amo_user_id
++        from public.app_users
++        where auth_user_id = auth.uid()
++          and is_active
++        limit 1
++      )
++  )
++);
++
++create policy data_quality_issues_leadership_select
++on public.data_quality_issues
++for select
++to authenticated
++using ((select app.current_role()) in ('admin', 'head'));
++
++grant select, insert, update on table public.amo_users, public.pipeline_statuses,
++  public.leads, public.lead_stage_events, public.lead_responsible_events,
++  public.lead_milestones, public.data_quality_issues to service_worker;
+diff --git a/tests/security/rls.security.test.ts b/tests/security/rls.security.test.ts
+index 6b8c4c6..8b218de 100644
+--- a/tests/security/rls.security.test.ts
++++ b/tests/security/rls.security.test.ts
+@@ -10,23 +10,40 @@ import {
+   testUsers,
+   updateOwnNameAsManager,
+   visibleAppUserIds,
+   visibleControlKeys,
+ } from "../helpers/local-db";
+ 
+ const adminDb = createAdminDb();
+ const allUsers = Object.values(testUsers);
+ 
+ async function clearDatabaseFixtures(): Promise<void> {
+-  await adminDb.unsafe(
+-    "truncate table public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+-  );
++  await adminDb.unsafe(`
++    do $$
++    begin
++      if to_regclass('public.data_quality_issues') is not null then
++        execute 'truncate table public.data_quality_issues, public.lead_milestones,
++          public.lead_responsible_events, public.lead_stage_events, public.leads,
++          public.pipeline_statuses, public.amo_users, public.amo_api_audit,
++          public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects,
++          public.sync_pages, public.sync_cursors, public.sync_runs,
++          public.config_recalculation_requests, public.config_validations,
++          public.channel_rules, public.pipeline_configs';
++      else
++        execute 'truncate table public.amo_api_audit, public.raw_amo_quarantine,
++          public.raw_amo_events, public.raw_amo_objects, public.sync_pages,
++          public.sync_cursors, public.sync_runs, public.config_recalculation_requests,
++          public.config_validations, public.channel_rules, public.pipeline_configs';
++      end if;
++    end
++    $$;
++  `);
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ beforeEach(async () => {
+   await ensureRestrictedTestLogins(adminDb);
+   await clearDatabaseFixtures();
+   await resetAndSeedUsers(adminDb, allUsers);
+   await adminDb`
+     insert into public.amo_connections (
+@@ -462,10 +479,141 @@ describe("raw synchronization RLS", () => {
+       `;
+     })).rejects.toMatchObject({ code: "42501" });
+     await expect(adminDb.begin(async (transaction) => {
+       await transaction.unsafe("set local role authenticated");
+       await transaction`
+         update public.raw_amo_events set event_type = 'tampered'
+       `;
+     })).rejects.toMatchObject({ code: "42501" });
+   });
+ });
++
++describe("normalized lead RLS", () => {
++  async function seedNormalizedLeads(): Promise<void> {
++    const [connection] = await adminDb<{ id: string }[]>`
++      select id from public.amo_connections limit 1
++    `;
++    if (!connection) throw new Error("amoCRM fixture connection is missing");
++    const [config] = await adminDb<{ id: string }[]>`
++      insert into public.pipeline_configs (
++        amo_connection_id, pipeline_id, pipeline_name, application_status_id,
++        application_status_name, won_status_id, won_status_name, version,
++        is_active, confirmed_by
++      ) values (
++        ${connection.id}, 10, 'Pipeline', 20, 'Application', 30, 'Won', 1,
++        true, ${testUsers.admin.id}
++      ) returning id
++    `;
++    if (!config) throw new Error("pipeline configuration fixture is missing");
++    await adminDb`
++      insert into public.amo_users (
++        account_id, amo_user_id, name, email, is_active
++      ) values (555151, 101, 'Manager One', 'manager.one@example.test', true)
++    `;
++    await adminDb`
++      insert into public.pipeline_statuses (
++        account_id, pipeline_id, status_id, name, sort_order, is_closed, is_won
++      ) values (555151, 10, 20, 'Application', 1, false, false)
++    `;
++    await adminDb`
++      insert into public.leads (
++        account_id, amo_lead_id, pipeline_id, current_status_id,
++        current_responsible_user_id, name, created_at, created_date,
++        source_updated_at, normalized_channel, normalization_config_id, amo_url
++      ) values
++        (555151, 7001, 10, 20, 101, 'Manager One lead',
++          '2026-09-15T09:00:00.000Z', '2026-09-15',
++          '2026-09-15T09:01:00.000Z', 'site', ${config.id},
++          'https://555151.amocrm.ru/leads/7001'),
++        (555151, 7002, 10, 20, 102, 'Manager Two lead',
++          '2026-09-15T09:00:00.000Z', '2026-09-15',
++          '2026-09-15T09:01:00.000Z', 'site', ${config.id},
++          'https://555151.amocrm.ru/leads/7002')
++    `;
++    await adminDb`
++      insert into public.lead_stage_events (
++        account_id, amo_event_id, amo_lead_id, to_status_id, occurred_at
++      ) values
++        (555151, 'stage-7001', 7001, 20, '2026-09-15T09:02:00.000Z'),
++        (555151, 'stage-7002', 7002, 20, '2026-09-15T09:02:00.000Z')
++    `;
++    await adminDb`
++      insert into public.lead_responsible_events (
++        account_id, amo_event_id, amo_lead_id, to_user_id, occurred_at
++      ) values
++        (555151, 'responsible-7001', 7001, 101, '2026-09-15T09:03:00.000Z'),
++        (555151, 'responsible-7002', 7002, 102, '2026-09-15T09:03:00.000Z')
++    `;
++    await adminDb`
++      insert into public.lead_milestones (
++        account_id, amo_lead_id, application_at, application_responsible_user_id
++      ) values
++        (555151, 7001, '2026-09-15T09:02:00.000Z', 101),
++        (555151, 7002, '2026-09-15T09:02:00.000Z', 102)
++    `;
++    await adminDb`
++      insert into public.data_quality_issues (
++        account_id, amo_lead_id, code, severity
++      ) values (555151, 7001, 'missing_source', 'warning')
++    `;
++  }
++
++  async function visibleNormalizedCounts(authUserId: string) {
++    return adminDb.begin(async (transaction) => {
++      await transaction.unsafe("set local role authenticated");
++      await transaction`
++        select set_config('request.jwt.claim.sub', ${authUserId}, true)
++      `;
++      const [counts] = await transaction<{
++        users: number;
++        statuses: number;
++        leads: number;
++        stage_events: number;
++        responsible_events: number;
++        milestones: number;
++        quality_issues: number;
++      }[]>`
++        select
++          (select count(*)::integer from public.amo_users) as users,
++          (select count(*)::integer from public.pipeline_statuses) as statuses,
++          (select count(*)::integer from public.leads) as leads,
++          (select count(*)::integer from public.lead_stage_events) as stage_events,
++          (select count(*)::integer from public.lead_responsible_events) as responsible_events,
++          (select count(*)::integer from public.lead_milestones) as milestones,
++          (select count(*)::integer from public.data_quality_issues) as quality_issues
++      `;
++      if (!counts) throw new Error("normalized counts are missing");
++      return counts;
++    });
++  }
++
++  it.each([testUsers.admin, testUsers.head])(
++    "$role reads every normalized row",
++    async (user) => {
++      await seedNormalizedLeads();
++      await expect(visibleNormalizedCounts(user.authUserId)).resolves.toEqual({
++        users: 1,
++        statuses: 1,
++        leads: 2,
++        stage_events: 2,
++        responsible_events: 2,
++        milestones: 2,
++        quality_issues: 1,
++      });
++    },
++  );
++
++  it("limits a manager to assigned leads and their related history", async () => {
++    await seedNormalizedLeads();
++    await expect(
++      visibleNormalizedCounts(testUsers.managerOne.authUserId),
++    ).resolves.toEqual({
++      users: 0,
++      statuses: 0,
++      leads: 1,
++      stage_events: 1,
++      responsible_events: 1,
++      milestones: 1,
++      quality_issues: 0,
++    });
++  });
++});

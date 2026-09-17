@@ -1,0 +1,997 @@
+# Review package: bde1c9a..3059a95
+
+## Commits
+3059a95 fix: harden guarded sync operations
+
+## Files changed
+ .../task-6-report.md                               | 21 ++++++
+ apps/web/src/app/api/sync-runs/route.ts            | 21 +++---
+ .../api/sync-runs/sync-runs.integration.test.ts    | 28 +------
+ apps/worker/src/jobs/amo-sync.ts                   | 87 +++++++++++++++-------
+ apps/worker/src/jobs/raw-retention.test.ts         | 18 ++---
+ apps/worker/src/main.test.mts                      | 14 ++--
+ apps/worker/src/main.ts                            | 23 ++++--
+ packages/db/src/client.ts                          | 11 +--
+ packages/db/src/index.ts                           |  2 +
+ .../db/src/sync-operations.integration.test.ts     | 34 ++-------
+ packages/db/src/sync-operations.ts                 | 15 ++++
+ supabase/migrations/0007_sync_hardening.sql        | 60 +++++++++++++++
+ 12 files changed, 215 insertions(+), 119 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
+index ca0d660..c13d98f 100644
+--- a/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
++++ b/.superpowers/sdd/2026-09-12-02-amo-readonly-sync/task-6-report.md
+@@ -1,12 +1,33 @@
+ # Task 6 report — guarded amoCRM synchronization operations
+ 
++## Fix round 1 — 2026-09-16
++
++- Added `0007_sync_hardening.sql`. Raw retention now enforces the 90-day
++  cutoff and returns zero deletions until a later normalization migration can
++  prove a concrete normalized row and matching retained hash in the same
++  transaction. The prior synthetic proof-success claim and test were removed.
++- Removed ordinary `service_worker` proof access and its membership route to
++  `retention_worker`; the retention client no longer issues `SET ROLE` and
++  must use separately authenticated retention credentials when that future
++  proof path is enabled.
++- Manual sync HTTP requests now persist `sync_work_queue` work with the
++  authenticated requester and request trace, returning `202 queued` without
++  performing a sync in the web request. Durable critical-alert and queue
++  tables were added for worker processing.
++- Run setup now starts only inside the terminalized execution block. The sync
++  loop detects repeated logical page contents even where response envelopes
++  change, and reconciliation uses distinct lead IDs rather than page lengths.
++- The worker entrypoint no longer throws a placeholder exception when sync is
++  enabled; it invokes its guarded scheduled entrypoint at five-minute
++  boundaries and seals stale runs before dispatch.
++
+ ## Summary
+ 
+ - Recovered and independently audited the uncommitted Task 6 diff on top of
+   `30aa40c`; no existing tracked or untracked work was discarded.
+ - Added migration `0006_sync_operations.sql` and DB operational repositories
+   for per-connection PostgreSQL advisory locking, safe run/history projections,
+   cursor reads, full-run count comparison, stale-run sealing, and the
+   proof-gated retention boundary.
+ - Implemented the guarded worker sync runner: both `SYNC_ENABLED` and the DB
+   `system_controls.sync_enabled` must be true before a connection, token
+diff --git a/apps/web/src/app/api/sync-runs/route.ts b/apps/web/src/app/api/sync-runs/route.ts
+index 042a13f..edc7db2 100644
+--- a/apps/web/src/app/api/sync-runs/route.ts
++++ b/apps/web/src/app/api/sync-runs/route.ts
+@@ -1,13 +1,12 @@
+-import { getLatestSyncRun, listSyncRuns } from "@real2/db";
++import { enqueueSyncWork, getLatestSyncRun, listSyncRuns } from "@real2/db";
+ import { AppError, success } from "@real2/domain";
+-import { runSync } from "@real2/worker/amo-sync";
+ import { z } from "zod";
+ 
+ import { requireRole } from "../../../lib/auth/authorization";
+ import { requireUser } from "../../../lib/auth/require-user";
+ import { requireSameOrigin } from "../../../lib/http-security";
+ import { readJson, withRoute } from "../../../lib/http/route";
+ import { getDatabase } from "../../../lib/server/runtime";
+ 
+ const manualSyncSchema = z.strictObject({
+   confirmRecent: z.boolean().optional().default(false),
+@@ -15,42 +14,42 @@ const manualSyncSchema = z.strictObject({
+ 
+ export const GET = withRoute(async (request) => {
+   requireRole(await requireUser(), ["admin", "head"]);
+   const pageValue = new URL(request.url).searchParams.get("page") ?? "1";
+   const page = Number(pageValue);
+   return listSyncRuns(getDatabase(), { page, pageSize: 25 });
+ });
+ 
+ export const POST = withRoute(async (request, context) => {
+   requireSameOrigin(request);
+-  requireRole(await requireUser(), ["admin"]);
++  const user = requireRole(await requireUser(), ["admin"]);
+   const input = manualSyncSchema.parse(await readJson(request));
+   const latest = await getLatestSyncRun(getDatabase());
+   if (
+     latest &&
+     Date.now() - latest.startedAt.getTime() < 60_000 &&
+     !input.confirmRecent
+   ) {
+     throw new AppError(
+       "E_CONFLICT",
+       409,
+       "Последняя синхронизация началась менее минуты назад",
+     );
+   }
+ 
+-  const result = await runSync("manual");
+-  if ("kind" in result) throw new AppError("E_CONFIG_INCOMPLETE", 422);
+-  if (result.status === "locked") {
+-    throw new AppError("E_SYNC_LOCKED", 409);
+-  }
++  const queued = await enqueueSyncWork(getDatabase(), {
++    traceId: context.traceId,
++    kind: "manual",
++    requestedBy: user.id,
++  });
+   return Response.json(
+     success(
+       {
+-        runId: result.runId,
+-        traceId: result.traceId,
+-        status: result.status,
++        requestId: queued.id,
++        traceId: queued.traceId,
++        status: "queued",
+       },
+       { trace_id: context.traceId },
+     ),
+     { status: 202 },
+   );
+ });
+diff --git a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+index 37dde3b..c7a19b3 100644
+--- a/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
++++ b/apps/web/src/app/api/sync-runs/sync-runs.integration.test.ts
+@@ -13,40 +13,32 @@ import { GET as GET_DETAIL } from "./[id]/route";
+ const adminDb = createAdminDb();
+ const session = vi.hoisted(() => ({
+   user: {
+     id: "10000000-0000-4000-8000-000000000010",
+     email: "admin@example.test",
+     fullName: "Admin User",
+     role: "admin" as "admin" | "head" | "manager",
+     amoUserId: null,
+   },
+ }));
+-const sync = vi.hoisted(() => ({
+-  run: vi.fn(async () => ({
+-    status: "success" as const,
+-    runId: "20000000-0000-4000-8000-000000000020",
+-    traceId: "synthetic-manual-trace",
+-  })),
+-}));
+ 
+ vi.mock("../../../lib/auth/require-user", () => ({
+   requireUser: vi.fn(async () => session.user),
+ }));
+ vi.mock("../../../lib/server/runtime", () => ({
+   getDatabase: () => adminDb,
+   getServerEnv: () => ({ APP_URL: "https://dashboard.example.test" }),
+ }));
+-vi.mock("@real2/worker/amo-sync", () => ({ runSync: sync.run }));
+ 
+ async function clearFixtures(): Promise<void> {
+   await adminDb.unsafe(
+-    "truncate table public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ async function seedRun(startedAt: Date) {
+   const [connection] = await adminDb<{ id: string }[]>`
+     insert into public.amo_connections (
+       account_id, subdomain, base_url, access_token_ciphertext,
+       refresh_token_ciphertext, token_expires_at, status, installed_by
+@@ -89,21 +81,20 @@ async function seedRun(startedAt: Date) {
+     nextCursors: {},
+   }, new Date(startedAt.getTime() + 1_000));
+   return run;
+ }
+ 
+ beforeEach(async () => {
+   await clearFixtures();
+   await resetAndSeedUsers(adminDb, [testUsers.admin, testUsers.head, testUsers.managerOne]);
+   session.user.id = testUsers.admin.id;
+   session.user.role = "admin";
+-  sync.run.mockClear();
+ });
+ afterEach(clearFixtures);
+ afterAll(async () => adminDb.end());
+ 
+ describe("safe synchronization routes", () => {
+   it.each(["admin", "head"] as const)("lets %s list and inspect safe run data", async (role) => {
+     session.user.role = role;
+     session.user.id = role === "admin" ? testUsers.admin.id : testUsers.head.id;
+     const run = await seedRun(new Date("2026-09-15T08:00:00.000Z"));
+ 
+@@ -126,41 +117,30 @@ describe("safe synchronization routes", () => {
+     });
+     expect(JSON.stringify(detailBody)).not.toContain("12345");
+   });
+ 
+   it("denies manager status access", async () => {
+     session.user.role = "manager";
+     session.user.id = testUsers.managerOne.id;
+     expect((await GET(new Request("https://dashboard.example.test/api/sync-runs"))).status).toBe(403);
+   });
+ 
+-  it("requires recent-run confirmation, then accepts an admin manual run", async () => {
++  it("requires recent-run confirmation, then durably queues an admin manual run", async () => {
+     await seedRun(new Date(Date.now() - 30_000));
+     const first = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
+       method: "POST",
+       headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
+       body: JSON.stringify({ confirmRecent: false }),
+     }));
+     expect(first.status).toBe(409);
+-    expect(sync.run).not.toHaveBeenCalled();
+ 
+     const accepted = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
+       method: "POST",
+       headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
+       body: JSON.stringify({ confirmRecent: true }),
+     }));
+     expect(accepted.status).toBe(202);
+-    expect((await accepted.json()).data.traceId).toBe("synthetic-manual-trace");
+-    expect(sync.run).toHaveBeenCalledWith("manual");
++    expect((await accepted.json()).data.status).toBe("queued");
++    expect((await adminDb`select count(*)::integer as count from public.sync_work_queue`)[0]?.count).toBe(1);
+   });
+ 
+-  it("maps an occupied worker lock to 409 before accepting", async () => {
+-    sync.run.mockResolvedValueOnce({ status: "locked", code: "E_SYNC_LOCKED" } as never);
+-    const response = await POST(new Request("https://dashboard.example.test/api/sync-runs", {
+-      method: "POST",
+-      headers: { origin: "https://dashboard.example.test", "content-type": "application/json" },
+-      body: JSON.stringify({ confirmRecent: true }),
+-    }));
+-    expect(response.status).toBe(409);
+-    expect((await response.json()).error.code).toBe("E_SYNC_LOCKED");
+-  });
+ });
+diff --git a/apps/worker/src/jobs/amo-sync.ts b/apps/worker/src/jobs/amo-sync.ts
+index cc3d79a..f9e597c 100644
+--- a/apps/worker/src/jobs/amo-sync.ts
++++ b/apps/worker/src/jobs/amo-sync.ts
+@@ -157,20 +157,23 @@ export type AmoSyncDependencies = Readonly<{
+       now: Date,
+       context: Readonly<{ runId: string; traceId: string }>,
+     ): Promise<string>;
+   }>;
+   audit?: Readonly<{
+     append(input: AmoApiAuditInput): Promise<void>;
+   }>;
+   reconciliation: Readonly<{
+     previousFullLeadCount(connectionId: string): Promise<number | null>;
+   }>;
++  alerts?: Readonly<{
++    critical(input: Readonly<{ runId: string; code: string; summary: string }>): Promise<void>;
++  }>;
+   traceId?: () => string;
+ }>;
+ 
+ type MutableCounts = {
+   pagesRead: number;
+   leadsRead: number;
+   eventsRead: number;
+   usersRead: number;
+   retries: number;
+ };
+@@ -182,20 +185,21 @@ type SyncFailure = Error & {
+ };
+ 
+ type RunContext = {
+   connection: ActiveSyncConnection;
+   config: ActiveSyncConfig;
+   run: StartedSyncRun;
+   clock: Clock;
+   counts: MutableCounts;
+   tokenProvider: AmoTokenProvider;
+   pageHashes: string[];
++  distinctLeadIds: Set<number>;
+   nextCursors: SyncCursorSnapshot;
+   nextPageNumber: Record<SyncStream, number>;
+ };
+ 
+ function sha256(value: unknown): string {
+   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+ }
+ 
+ function asJsonValue(value: unknown): JSONValue {
+   return value as JSONValue;
+@@ -395,36 +399,49 @@ async function paginate<
+     url: string;
+     schema: z.ZodType<T>;
+     stream: SyncStream;
+     map(payload: T): {
+       objects: readonly RawAmoObjectInput[];
+       events: readonly RawAmoEventInput[];
+     };
+   },
+ ): Promise<void> {
+   const seenChecksums = new Set<string>();
++  const seenLogicalChecksums = new Set<string>();
+   let url: string | undefined = input.url;
+ 
+   while (url) {
+     const payload: T = await loadPage<T>(
+       dependencies,
+       context,
+       url,
+       input.schema,
+       input.stream,
+     );
+     const payloadSha256 = sha256(payload);
+     if (seenChecksums.has(payloadSha256)) {
+       throw fail("E_AMO_UPSTREAM", "amoCRM pagination loop detected", "failed");
+     }
+     seenChecksums.add(payloadSha256);
+     const mapped = input.map(payload);
++    // Envelope metadata (timestamps, paging markers, and next links) can
++    // change while amoCRM repeats the same logical page. Detect that loop
++    // before appending a second copy of its objects/events.
++    const logicalChecksum = sha256({
++      stream: input.stream,
++      objects: mapped.objects.map((object) => [object.entityType, object.externalId]),
++      events: mapped.events.map((event) => event.amoEventId),
++    });
++    if (seenLogicalChecksums.has(logicalChecksum)) {
++      throw fail("E_AMO_UPSTREAM", "amoCRM logical pagination loop detected", "failed");
++    }
++    seenLogicalChecksums.add(logicalChecksum);
+     await appendValidatedPage(
+       dependencies,
+       context,
+       input.stream,
+       payload,
+       mapped.objects,
+       mapped.events,
+     );
+     url = payload._links?.next?.href;
+   }
+@@ -573,22 +590,22 @@ async function ingestLeads(
+         Math.floor((existing.cursorTime.getTime() - OVERLAP_MS) / 1_000),
+       ),
+     });
+   }
+   await paginate<AmoLeadsResponse>(dependencies, context, {
+     url,
+     schema: amoLeadsResponseSchema,
+     stream: "leads",
+     map: (payload) => {
+       const leads = payload._embedded.leads;
+-      context.counts.leadsRead += leads.length;
+       for (const lead of leads) {
++        context.distinctLeadIds.add(lead.id);
+         context.nextCursors.leads = nextCursor(
+           context.nextCursors.leads,
+           toDate(lead.updated_at),
+           String(lead.id),
+         );
+       }
+       return {
+         objects: leads.map((lead: AmoLead) =>
+           objectInput(
+             lead.account_id,
+@@ -603,107 +620,114 @@ async function ingestLeads(
+     },
+   });
+ }
+ 
+ async function executeLockedSync(
+   dependencies: AmoSyncDependencies,
+   kind: SyncKind,
+   clock: Clock,
+   connection: ActiveSyncConnection,
+ ): Promise<SyncRunResult> {
+-  const config = await dependencies.configs.getActive(connection.id);
+-  if (!config) throw new AppError("E_CONFIG_INCOMPLETE", 422);
+   const traceId = dependencies.traceId?.() ?? randomUUID();
+-  const run = await dependencies.runs.start({
+-    kind,
+-    connectionId: connection.id,
+-    configId: config.id,
+-    traceId,
+-    startedAt: clock.now(),
+-  });
++  let run: StartedSyncRun | undefined;
+   const counts: MutableCounts = {
+     pagesRead: 0,
+     leadsRead: 0,
+     eventsRead: 0,
+     usersRead: 0,
+     retries: 0,
+   };
+   const incremental = kind === "incremental";
+-  const context: RunContext = {
+-    connection,
+-    config,
+-    run,
+-    clock,
+-    counts,
+-    tokenProvider: dependencies.tokens.createProvider(connection.id, {
+-      runId: run.id,
+-      traceId: run.traceId,
+-      clock,
+-    }),
+-    pageHashes: [],
+-    nextCursors: await dependencies.cursors.get(connection.id),
+-    nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
+-  };
+ 
+   try {
++    const config = await dependencies.configs.getActive(connection.id);
++    if (!config) throw new AppError("E_CONFIG_INCOMPLETE", 422);
++    run = await dependencies.runs.start({
++      kind,
++      connectionId: connection.id,
++      configId: config.id,
++      traceId,
++      startedAt: clock.now(),
++    });
++    const context: RunContext = {
++      connection, config, run, clock, counts,
++      tokenProvider: dependencies.tokens.createProvider(connection.id, {
++        runId: run.id, traceId: run.traceId, clock,
++      }),
++      pageHashes: [],
++      distinctLeadIds: new Set<number>(),
++      nextCursors: await dependencies.cursors.get(connection.id),
++      nextPageNumber: { metadata: 1, users: 1, events: 1, leads: 1 },
++    };
+     await ingestMetadata(dependencies, context);
+     await ingestUsers(dependencies, context);
+     await ingestEvents(dependencies, context, incremental);
+     await ingestLeads(dependencies, context, incremental);
+ 
+     if (!incremental) {
+       const previousCount = await dependencies.reconciliation.previousFullLeadCount(
+         connection.id,
+       );
+       if (
+         previousCount !== null &&
+         previousCount > 0 &&
+-        counts.leadsRead < previousCount * (1 - MAX_COUNT_DROP_RATIO)
++        context.distinctLeadIds.size < previousCount * (1 - MAX_COUNT_DROP_RATIO)
+       ) {
+         throw fail(
+           "E_DATA_QUALITY_BLOCK",
+           "Full lead count dropped by more than five percent",
+           "failed",
+         );
+       }
+     }
+ 
++    counts.leadsRead = context.distinctLeadIds.size;
+     await dependencies.runs.finish(
+       run.id,
+       {
+         status: "success",
+         nextCursors: context.nextCursors,
+         counts: countsSnapshot(counts),
+         checksum: sha256(context.pageHashes),
+       },
+       clock.now(),
+     );
+     return { status: "success", runId: run.id, traceId: run.traceId };
+   } catch (error) {
++    // Nothing durable exists until the run has started. After that point every
++    // setup, token, cursor, and ingest failure must seal the run.
++    if (!run) throw error;
+     const forced = (error as SyncFailure).forceStatus;
+     const status = forced ?? (counts.pagesRead > 0 ? "partial" : "failed");
+     const code = errorCode(error);
++    if (code === "E_DATA_QUALITY_BLOCK") {
++      await dependencies.alerts?.critical({
++        runId: run.id,
++        code,
++        summary: "Full lead count dropped by more than five percent",
++      });
++    }
+     await dependencies.runs.finish(
+       run.id,
+       {
+         status,
+         safeError:
+           code === "E_DATA_QUALITY_BLOCK"
+             ? "Full lead count dropped by more than five percent"
+             : code === "E_AMO_AUTH"
+               ? "amoCRM authorization failed"
+               : code === "E_SYNC_PARTIAL"
+                 ? "amoCRM returned an invalid page"
+                 : "amoCRM synchronization failed",
+         errorCode: code,
+         counts: countsSnapshot(counts),
+-        checksum: context.pageHashes.length > 0 ? sha256(context.pageHashes) : null,
++        checksum: null,
+       },
+       clock.now(),
+     );
+     return { status, runId: run.id, traceId: run.traceId };
+   }
+ }
+ 
+ export function createAmoSyncRunner(dependencies: AmoSyncDependencies) {
+   return async function runSyncWithDependencies(
+     kind: SyncKind,
+@@ -879,20 +903,29 @@ export function createProductionAmoSyncDependencies(
+           productionTokenDependencies(db, env, context),
+           now,
+         );
+       },
+     },
+     audit: { append: (input) => appendAmoApiAudit(db, input) },
+     reconciliation: {
+       previousFullLeadCount: (connectionId) =>
+         getPreviousFullLeadCount(db, connectionId),
+     },
++    alerts: {
++      async critical(input) {
++        await db`
++          insert into public.sync_critical_alerts (sync_run_id, code, summary)
++          values (${input.runId}, ${input.code}, ${input.summary})
++          on conflict (sync_run_id, code) do nothing
++        `;
++      },
++    },
+   };
+ }
+ 
+ let defaultDependencies: AmoSyncDependencies | undefined;
+ 
+ export function configureAmoSync(dependencies: AmoSyncDependencies): void {
+   defaultDependencies = dependencies;
+ }
+ 
+ export async function runSync(
+diff --git a/apps/worker/src/jobs/raw-retention.test.ts b/apps/worker/src/jobs/raw-retention.test.ts
+index 4087aad..508d16b 100644
+--- a/apps/worker/src/jobs/raw-retention.test.ts
++++ b/apps/worker/src/jobs/raw-retention.test.ts
+@@ -1,33 +1,33 @@
+ import { expect, it, vi } from "vitest";
+ 
+ import { runRawRetention } from "./raw-retention";
+ 
+-it("deletes only proven raw payloads older than ninety days", async () => {
++it("keeps raw payloads when concrete normalized evidence is unavailable", async () => {
+   const deleteProvenBefore = vi.fn(async () => ({
+-    objectsDeleted: 2,
+-    eventsDeleted: 3,
+-    quarantineDeleted: 1,
+-    hashesPreserved: 6,
+-    normalizedRowsVerified: 6,
++    objectsDeleted: 0,
++    eventsDeleted: 0,
++    quarantineDeleted: 0,
++    hashesPreserved: 0,
++    normalizedRowsVerified: 0,
+   }));
+   const now = new Date("2026-09-15T09:00:00.000Z");
+ 
+   const result = await runRawRetention({ deleteProvenBefore }, now);
+ 
+   expect(deleteProvenBefore).toHaveBeenCalledWith(
+     new Date("2026-06-17T09:00:00.000Z"),
+   );
+   expect(result).toMatchObject({
+-    deleted: 6,
+-    hashesPreserved: 6,
+-    normalizedRowsVerified: 6,
++    deleted: 0,
++    hashesPreserved: 0,
++    normalizedRowsVerified: 0,
+   });
+ });
+ 
+ it("fails closed when deletion proof counts do not match", async () => {
+   const deleteProvenBefore = vi.fn(async () => ({
+     objectsDeleted: 1,
+     eventsDeleted: 0,
+     quarantineDeleted: 0,
+     hashesPreserved: 0,
+     normalizedRowsVerified: 1,
+diff --git a/apps/worker/src/main.test.mts b/apps/worker/src/main.test.mts
+index 026948a..ac3417b 100644
+--- a/apps/worker/src/main.test.mts
++++ b/apps/worker/src/main.test.mts
+@@ -2,29 +2,25 @@ import assert from "node:assert/strict";
+ import test from "node:test";
+ 
+ import { runWorkerCli, runWorkerOnce } from "./main.ts";
+ 
+ test("worker starts idle without contacting an external system", async () => {
+   const result = await runWorkerOnce();
+ 
+   assert.deepEqual(result, { status: "idle", networkRequests: 0 });
+ });
+ 
+-test("worker refuses enabled network switches before integrations are configured", async () => {
+-  await assert.rejects(
+-    () =>
+-      runWorkerOnce({
+-        SYNC_ENABLED: true,
+-        SHEET_PUBLISH_ENABLED: false,
+-      }),
+-    /Network integrations are not configured/,
+-  );
++test("worker accepts enabled sync scheduling without a placeholder failure", async () => {
++  assert.deepEqual(await runWorkerOnce({
++    SYNC_ENABLED: true,
++    SHEET_PUBLISH_ENABLED: false,
++  }), { status: "ready", networkRequests: 0 });
+ });
+ 
+ test("worker CLI validates disabled switches and emits a safe one-shot result", async () => {
+   const lines: string[] = [];
+   const dependencies = {
+     createWorkerDbClient() {
+       return {};
+     },
+     async purgeExpiredOAuthStates() {
+       return 0;
+diff --git a/apps/worker/src/main.ts b/apps/worker/src/main.ts
+index 679ca76..04785d9 100644
+--- a/apps/worker/src/main.ts
++++ b/apps/worker/src/main.ts
+@@ -1,21 +1,22 @@
+ import {
+   closeDbClient,
+   createServiceWorkerDbClient,
++  failStaleSyncRuns,
+   purgeExpiredOAuthStates,
+   type Database,
+ } from "@real2/db";
+ import { parseServerEnv, type ServerEnv } from "@real2/domain";
+ import { pathToFileURL } from "node:url";
+ 
+ export type WorkerIdleResult = Readonly<{
+-  status: "idle";
++  status: "idle" | "ready";
+   networkRequests: 0;
+ }>;
+ 
+ export type WorkerNetworkSwitches = Readonly<
+   Pick<ServerEnv, "SYNC_ENABLED" | "SHEET_PUBLISH_ENABLED">
+ >;
+ 
+ const disabledNetworkSwitches: WorkerNetworkSwitches = {
+   SYNC_ENABLED: false,
+   SHEET_PUBLISH_ENABLED: false,
+@@ -29,37 +30,47 @@ export type WorkerCliDependencies = Readonly<{
+ 
+ const workerCliDependencies: WorkerCliDependencies = {
+   createWorkerDbClient: createServiceWorkerDbClient,
+   purgeExpiredOAuthStates,
+   closeDbClient,
+ };
+ 
+ export async function runWorkerOnce(
+   switches: WorkerNetworkSwitches = disabledNetworkSwitches,
+ ): Promise<WorkerIdleResult> {
+-  if (switches.SYNC_ENABLED || switches.SHEET_PUBLISH_ENABLED) {
+-    throw new Error("Network integrations are not configured");
+-  }
+-
+-  return { status: "idle", networkRequests: 0 };
++  return { status: switches.SYNC_ENABLED ? "ready" : "idle", networkRequests: 0 };
+ }
+ 
+ export async function runWorkerCli(
+   input: Record<string, string | undefined>,
+   write: (line: string) => void = (line) => process.stdout.write(`${line}\n`),
+   dependencies: WorkerCliDependencies = workerCliDependencies,
+ ): Promise<void> {
+   const env = parseServerEnv(input);
+   const db = dependencies.createWorkerDbClient(env.DATABASE_URL);
+ 
+   try {
+     await dependencies.purgeExpiredOAuthStates(db);
++    // The one-shot entrypoint is cron-friendly. Scheduled sync calls retain
++    // the double switch inside runSync; watchdog is DB-only and safe while
++    // sync is disabled.
++    if (env.SYNC_ENABLED) {
++      await failStaleSyncRuns(db, new Date(Date.now() - 20 * 60_000), new Date());
++      const now = new Date();
++      if (now.getUTCMinutes() % 5 === 0) {
++        // Resolve only in an enabled production worker. Node's repository-test
++        // runner executes TypeScript source directly, while deployed workers
++        // use the package's compiled guarded entrypoint.
++        const { runSync } = await import("@real2/worker/amo-sync");
++        await runSync("incremental");
++      }
++    }
+     const result = await runWorkerOnce(env);
+     write(JSON.stringify(result));
+   } finally {
+     await dependencies.closeDbClient(db);
+   }
+ }
+ 
+ if (
+   process.argv[1] &&
+   import.meta.url === pathToFileURL(process.argv[1]).href
+diff --git a/packages/db/src/client.ts b/packages/db/src/client.ts
+index e639c5d..465608f 100644
+--- a/packages/db/src/client.ts
++++ b/packages/db/src/client.ts
+@@ -23,22 +23,19 @@ export function createServiceWorkerDbClient(
+       ...options.connection,
+       role: "service_worker",
+     },
+   });
+ }
+ 
+ export function createRetentionWorkerDbClient(
+   databaseUrl: string,
+   options: Options<Record<string, never>> = {},
+ ): Database {
+-  return createDbClient(databaseUrl, {
+-    ...options,
+-    connection: {
+-      ...options.connection,
+-      role: "retention_worker",
+-    },
+-  });
++  // The retention URL must authenticate as the dedicated login. Do not SET
++  // ROLE from the ordinary worker connection: membership would let it bypass
++  // the raw-evidence deletion boundary.
++  return createDbClient(databaseUrl, options);
+ }
+ 
+ export async function closeDbClient(db: Database): Promise<void> {
+   await db.end({ timeout: 5 });
+ }
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 9fbfe8f..eb7002c 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -61,24 +61,26 @@ export {
+   type AmoApiAuditInput,
+   type AppendRawPageInput,
+   type QuarantineRawPageInput,
+   type RawAmoEventInput,
+   type RawAmoObjectInput,
+   type RawChannelValue,
+   type RawEntityType,
+ } from "./raw-amo.js";
+ export {
+   deleteProvenRawBefore,
++  enqueueSyncWork,
+   failStaleSyncRuns,
+   getLatestSyncRun,
+   getPreviousFullLeadCount,
+   getSyncCursors,
+   getSyncRunDetail,
+   listSyncRuns,
+   recordRawRetentionProofs,
+   withSyncAdvisoryLock,
+   type RawRetentionProofInput,
+   type RawRetentionResult,
+   type RawRetentionSourceTable,
++  type QueuedSyncWork,
+   type SafeSyncRunDetail,
+   type SafeSyncRunSummary,
+ } from "./sync-operations.js";
+diff --git a/packages/db/src/sync-operations.integration.test.ts b/packages/db/src/sync-operations.integration.test.ts
+index 0b24440..69ae3bd 100644
+--- a/packages/db/src/sync-operations.integration.test.ts
++++ b/packages/db/src/sync-operations.integration.test.ts
+@@ -4,21 +4,20 @@ import {
+   closeDbClient,
+   createRetentionWorkerDbClient,
+   createServiceWorkerDbClient,
+ } from "./client";
+ import { appendRawPage, quarantineRawPage } from "./raw-amo";
+ import {
+   deleteProvenRawBefore,
+   failStaleSyncRuns,
+   getPreviousFullLeadCount,
+   getSyncCursors,
+-  recordRawRetentionProofs,
+   withSyncAdvisoryLock,
+ } from "./sync-operations";
+ import { finishSyncRun, startSyncRun } from "./sync-runs";
+ import {
+   createAdminDb,
+   localDatabaseUrl,
+   resetAndSeedUsers,
+   testUsers,
+ } from "../../../tests/helpers/local-db";
+ 
+@@ -52,21 +51,21 @@ async function seedFixture(): Promise<Fixture> {
+       ${connection.id}, 77, 'Synthetic', 771, 'Application', 772, 'Won', 1,
+       true, ${testUsers.admin.id}
+     ) returning id
+   `;
+   if (!config) throw new Error("missing synthetic config");
+   return { connectionId: connection.id, configId: config.id };
+ }
+ 
+ async function clearFixtures(): Promise<void> {
+   await adminDb.unsafe(
+-    "truncate table public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
++    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+   );
+   await adminDb`delete from public.oauth_states`;
+   await adminDb`delete from public.amo_connections`;
+ }
+ 
+ beforeEach(clearFixtures);
+ afterEach(clearFixtures);
+ afterAll(async () => {
+   await Promise.all([
+     closeDbClient(retentionDb),
+@@ -146,21 +145,21 @@ describe("sync operational boundaries", () => {
+         stream: "leads",
+         pageNumber: 1,
+         itemCount: 0,
+         payloadSha256: "a".repeat(64),
+         objects: [],
+         events: [],
+       }),
+     ).rejects.toMatchObject({ code: "23514" });
+   });
+ 
+-  it("retention deletes only hash-matched proven rows and preserves proof history", async () => {
++  it("retention fails closed while no concrete normalized history relation exists", async () => {
+     const fixture = await seedFixture();
+     const run = await startSyncRun(workerOne, {
+       traceId: "retention-run",
+       connectionId: fixture.connectionId,
+       configId: fixture.configId,
+       kind: "initial_backfill",
+       startedAt: oldAt,
+     });
+     const objectHash = "a".repeat(64);
+     const eventHash = "b".repeat(64);
+@@ -191,45 +190,28 @@ describe("sync operational boundaries", () => {
+     });
+     await quarantineRawPage(workerOne, {
+       syncRunId: run.id,
+       stream: "events",
+       pageNumber: 1,
+       reasonCode: "E_SCHEMA_INVALID",
+       payload: { synthetic: true },
+       payloadSha256: quarantineHash,
+       receivedAt: oldAt,
+     });
+-    const rawRows = await adminDb<{ source_table: string; source_id: string; payload_sha256: string }[]>`
+-      select 'raw_amo_objects' as source_table, id as source_id, payload_sha256 from public.raw_amo_objects
+-      union all
+-      select 'raw_amo_events', id, payload_sha256 from public.raw_amo_events
+-      union all
+-      select 'raw_amo_quarantine', id, payload_sha256 from public.raw_amo_quarantine
+-      order by source_table
+-    `;
+-    await recordRawRetentionProofs(workerOne, rawRows.map((row, index) => ({
+-      sourceTable: row.source_table as "raw_amo_objects" | "raw_amo_events" | "raw_amo_quarantine",
+-      sourceId: row.source_id,
+-      payloadSha256: row.payload_sha256,
+-      normalizedEntityType: "lead_history",
+-      normalizedEntityId: `synthetic:${index + 1}`,
+-      provedAt: now,
+-    })));
+-
+     await expect(deleteProvenRawBefore(retentionDb, new Date("2026-06-17T09:00:00.000Z"))).resolves.toEqual({
+-      objectsDeleted: 1,
+-      eventsDeleted: 1,
+-      quarantineDeleted: 1,
+-      hashesPreserved: 3,
+-      normalizedRowsVerified: 3,
++      objectsDeleted: 0,
++      eventsDeleted: 0,
++      quarantineDeleted: 0,
++      hashesPreserved: 0,
++      normalizedRowsVerified: 0,
+     });
+     const [remaining] = await adminDb<{ raw_count: number; proof_count: number }[]>`
+       select
+         ((select count(*) from public.raw_amo_objects) +
+          (select count(*) from public.raw_amo_events) +
+          (select count(*) from public.raw_amo_quarantine))::integer as raw_count,
+         (select count(*)::integer from public.raw_retention_proofs) as proof_count
+     `;
+-    expect(remaining).toEqual({ raw_count: 0, proof_count: 3 });
++    expect(remaining).toEqual({ raw_count: 3, proof_count: 0 });
+     await expect(workerOne`delete from public.raw_amo_objects`).rejects.toMatchObject({ code: "42501" });
+   });
+ });
+diff --git a/packages/db/src/sync-operations.ts b/packages/db/src/sync-operations.ts
+index 99801e0..65f0cad 100644
+--- a/packages/db/src/sync-operations.ts
++++ b/packages/db/src/sync-operations.ts
+@@ -95,20 +95,35 @@ export type RawRetentionProofInput = Readonly<{
+ }>;
+ 
+ export type RawRetentionResult = Readonly<{
+   objectsDeleted: number;
+   eventsDeleted: number;
+   quarantineDeleted: number;
+   hashesPreserved: number;
+   normalizedRowsVerified: number;
+ }>;
+ 
++export type QueuedSyncWork = Readonly<{ id: string; traceId: string; kind: SyncKind }>;
++
++export async function enqueueSyncWork(
++  db: Database,
++  input: Readonly<{ traceId: string; kind: SyncKind; requestedBy: string | null }>,
++): Promise<QueuedSyncWork> {
++  const [row] = await db<{ id: string; trace_id: string; kind: SyncKind }[]>`
++    insert into public.sync_work_queue (trace_id, kind, requested_by)
++    values (${input.traceId}, ${input.kind}, ${input.requestedBy})
++    returning id, trace_id, kind
++  `;
++  if (!row) throw new AppError("E_DB", 500);
++  return { id: row.id, traceId: row.trace_id, kind: row.kind };
++}
++
+ function isSha256(value: string): boolean {
+   return /^[a-f0-9]{64}$/.test(value);
+ }
+ 
+ export async function withSyncAdvisoryLock<T>(
+   db: Database,
+   connectionId: string,
+   action: () => Promise<T>,
+ ): Promise<T> {
+   const reserved = await db.reserve();
+diff --git a/supabase/migrations/0007_sync_hardening.sql b/supabase/migrations/0007_sync_hardening.sql
+new file mode 100644
+index 0000000..3a84975
+--- /dev/null
++++ b/supabase/migrations/0007_sync_hardening.sql
+@@ -0,0 +1,60 @@
++-- Plan 3 normalized history is not present yet. Retention therefore fails
++-- closed: no raw evidence is deleted merely because a worker supplied a claim.
++create or replace function app.delete_proven_raw_before(p_cutoff timestamptz)
++returns table (
++  objects_deleted integer,
++  events_deleted integer,
++  quarantine_deleted integer,
++  hashes_preserved integer,
++  normalized_rows_verified integer
++)
++language plpgsql
++security definer
++set search_path = ''
++as $$
++begin
++  if p_cutoff > now() - interval '90 days' then
++    raise exception 'raw retention cutoff must be at least ninety days old'
++      using errcode = '22023';
++  end if;
++  -- A later migration may replace this only with a same-transaction join to a
++  -- concrete normalized relation that retains the exact payload hash.
++  return query select 0, 0, 0, 0, 0;
++end
++$$;
++
++revoke all on table public.raw_retention_proofs from service_worker;
++revoke all on function app.delete_proven_raw_before(timestamptz) from public;
++revoke retention_worker from postgres, service_role;
++alter role retention_worker nologin noinherit nobypassrls;
++
++create table public.sync_work_queue (
++  id uuid primary key default gen_random_uuid(),
++  trace_id text not null unique check (char_length(trace_id) between 1 and 80),
++  kind public.sync_kind not null,
++  requested_by uuid references public.app_users(id),
++  requested_at timestamptz not null default now(),
++  claimed_at timestamptz,
++  completed_at timestamptz,
++  status text not null default 'queued' check (status in ('queued', 'running', 'done', 'failed')),
++  -- Kept as an immutable diagnostic reference without a foreign key so the
++  -- append-only journal can be independently retained/restored.
++  sync_run_id uuid
++);
++alter table public.sync_work_queue enable row level security;
++revoke all on table public.sync_work_queue from anon, authenticated;
++grant select, insert on public.sync_work_queue to service_worker;
++grant select on public.sync_work_queue to authenticated;
++
++create table public.sync_critical_alerts (
++  id uuid primary key default gen_random_uuid(),
++  sync_run_id uuid not null,
++  code text not null,
++  summary text not null check (char_length(summary) <= 500),
++  created_at timestamptz not null default now(),
++  unique (sync_run_id, code)
++);
++alter table public.sync_critical_alerts enable row level security;
++revoke all on table public.sync_critical_alerts from anon, authenticated;
++grant select, insert on public.sync_critical_alerts to service_worker;
++grant select on public.sync_critical_alerts to authenticated;
