@@ -102,6 +102,12 @@ describe("normalizeLead", () => {
       ["Мария Иванова заказ кухни +7 000 111-22-33", "Мария Иванова заказ кухни *** ***-**-33"],
       ["Кухня, звонить 8 (000) 111 22 44 после 18:00", "Кухня, звонить *** ***-**-44 после 18:00"],
       ["Шкаф 80001112255 и 80001112266, доставка по городу после обеда", "Шкаф *** ***-**-55 и *** ***-**-66, доставка по городу после обеда"],
+      ["Заказ кухни, тел. +7 000–111–22–55 вечером", "Заказ кухни, тел. *** ***-**-55 вечером"],
+      ["Заказ кухни, тел. +7\u2011000\u2011111\u201122\u201156 вечером", "Заказ кухни, тел. *** ***-**-56 вечером"],
+      ["Заказ кухни, тел. 8/000/111/22/57 вечером", "Заказ кухни, тел. *** ***-**-57 вечером"],
+      ["Заказ кухни, тел. 8_000_111_22_58 вечером", "Заказ кухни, тел. *** ***-**-58 вечером"],
+      ["Заказ кухни, тел. 8 000 111\u200b22 59 вечером", "Заказ кухни, тел. *** ***-**-59 вечером"],
+      ["Заказ кухни, тел. 8\u2212000\u2212111\u221222\u221260 вечером", "Заказ кухни, тел. *** ***-**-60 вечером"],
     ])("masks a phone number inside a longer name %j", (name, displayName) => {
       const result = normalizeLead(buildRawLead({ name }), context);
       expect(result.lead?.name).toBe(name);
@@ -463,6 +469,8 @@ describe("normalizeLead", () => {
       ["config", { config: { id: SYNTHETIC_CONFIG_ID, pipelineId: -1, wonStatusId: 772, sourceFieldId: null } }],
       ["config", { config: { id: SYNTHETIC_CONFIG_ID, pipelineId: 77, wonStatusId: 772, sourceFieldId: 0 } }],
       ["pipelineStatusIds", { pipelineStatusIds: [0] }],
+      ["channelRules", { channelRules: [{ id: "x", priority: 1, matchType: "source_field_exact", matchValue: "\u0000non_text", normalizedChannel: "site", isActive: true }] }],
+      ["channelRules", { channelRules: [{ id: "x", priority: 1, matchType: "tag_exact", matchValue: "", normalizedChannel: "site", isActive: true }] }],
       ["channelRules", { channelRules: [{ id: "x", priority: 1, matchType: "name_contains", matchValue: "a", normalizedChannel: "site", isActive: true }] }],
       ["channelRules", { channelRules: [{ id: "x", priority: 1, matchType: "tag_exact", matchValue: "a", normalizedChannel: "vk", isActive: true }] }],
     ])("throws a validation error for an invalid %s", (_field, override) => {
@@ -495,7 +503,10 @@ describe("normalizeLead", () => {
     });
 
     it("keeps arbitrary Unicode names stable and never displays phone-like text", () => {
-      const phoneish = fc.stringMatching(/^\+?[78]?[ (]?\d{3}[) -]?\d{3}[ -]?\d{2}[ -]?\d{2}$/);
+      const separator = fc.constantFrom("", " ", "-", "–", "—", "\u2011", "\u2212", "/", "_", ",", ":", ".", "\u00a0", "\u200b", "(", ")");
+      const phoneish = fc
+        .tuple(fc.constantFrom("+7", "8", "7", ""), fc.array(fc.tuple(separator, fc.integer({ min: 0, max: 9 })), { minLength: 10, maxLength: 11 }))
+        .map(([prefix, parts]) => `${prefix}${parts.map(([sep, digit]) => `${sep}${digit}`).join("")}`);
       const nameArbitrary = fc
         .tuple(fc.string({ unit: "grapheme", maxLength: 24 }), fc.option(phoneish), fc.string({ unit: "grapheme", maxLength: 24 }))
         .map(([before, phone, after]) => `${before}${phone ?? ""}${after}`);
@@ -508,7 +519,7 @@ describe("normalizeLead", () => {
           expect(lead.name.length).toBeGreaterThan(0);
           expect([name, "Сделка #101"]).toContain(lead.name);
           expect(normalizeLead(buildRawLead({ name }), context)).toEqual(result);
-          const digitRun = /\p{Nd}(?:[\s().+-]*\p{Nd}){9}/u;
+          const digitRun = /\p{Nd}(?:[\s\p{Pd}\p{Cf}\u2212().+/_,:]*\p{Nd}){9}/u;
           expect(digitRun.test(lead.displayName)).toBe(false);
         }),
       );

@@ -121,7 +121,8 @@ const contextSchema = z.object({
       id: z.string().min(1),
       priority: z.number().int(),
       matchType: channelMatchTypeSchema,
-      matchValue: z.string(),
+      // Stored rule values are non-empty PostgreSQL text, which cannot hold NUL.
+      matchValue: z.string().min(1).refine((value) => !value.includes("\u0000")),
       normalizedChannel: normalizedChannelSchema,
       isActive: z.boolean(),
     }),
@@ -144,8 +145,12 @@ function fallbackName(amoLeadId: number): string {
   return `Сделка #${amoLeadId}`;
 }
 
-/** A digit run joined by phone separators, e.g. `+7 (000) 111-22-33`. */
-const DIGIT_RUN = /\+?\p{Nd}(?:[\s().+-]*\p{Nd})*/gu;
+/**
+ * A digit run joined by phone separators, e.g. `+7 (000) 111-22-33`:
+ * whitespace, any dash, invisible format characters, minus sign and
+ * `( ) . + / _ , :`.
+ */
+const DIGIT_RUN = /\+?\p{Nd}(?:[\s\p{Pd}\p{Cf}\u2212().+/_,:]*\p{Nd})*/gu;
 const MIN_PHONE_DIGITS = 10;
 
 function hasVisibleText(name: string): boolean {
