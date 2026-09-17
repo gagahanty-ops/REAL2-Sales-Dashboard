@@ -47,6 +47,10 @@
 - The current sync worker does not request `with=source`, so `integration_source_exact` rules have no input until an approved worker change adds it.
 - Open owner question: METRICS_CATALOG §7 / SPEC M3.5 wording could state explicitly that a filled but unmapped source field yields `unknown` (ruling R1, confirmed by review) and that conflicts are evaluated within one source kind.
 
+## Окружение для DB-gate (2026-09-17, вечер)
+
+Supabase CLI 2.117.0, docker CLI 29.8.1, colima 0.10.3 и lima 2.2.0 установлены вручную в `~/.local`. Docker-движок не запущен: `colima start` на диске с 3 ГБ свободного места заполнил диск полностью (runbook требует 10 ГБ). Данные VM удалены, репозиторий проверен `git fsck` — повреждений нет. Запускать VM повторно только после освобождения 10+ ГБ.
+
 ## Блокер доступа к GitHub (2026-09-17)
 
 Push с машины `ishop` отклонён: `Permission to sarrinoj-glitch/REAL2-Sales-Dashboard.git denied to gagahanty-ops` (HTTP 403). И HTTPS-токен, и SSH-ключ на этой машине принадлежат аккаунту `gagahanty-ops`, у которого права `pull: true, push: false`.
