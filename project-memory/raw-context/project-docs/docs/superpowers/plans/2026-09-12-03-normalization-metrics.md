@@ -205,7 +205,7 @@ git commit -m "feat: add normalized lead history schema"
 - Consumes: `RawAmoLead`, `PipelineConfig`, `ChannelRule[]`, `configId`, and normalization time.
 - Produces: `toMoscowDate(instant): YYYY-MM-DD`, `Rubles`, `matchChannel(input, rules): ChannelMatch`, `normalizeLead(input): NormalizedLeadResult`, and ordered quality issue candidates.
 
-- [ ] **Step 1: Write failing boundary and no-guessing tests**
+- [x] **Step 1: Write failing boundary and no-guessing tests**
 
 ```ts
 it.each([
@@ -222,13 +222,13 @@ it("does not infer Instagram from a deal name", () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and verify missing functions**
+- [x] **Step 2: Run focused tests and verify missing functions**
 
 Run: `pnpm vitest run packages/domain/src/leads/normalize-lead.test.ts packages/domain/src/leads/channel.test.ts`
 
 Expected: FAIL on missing normalization modules.
 
-- [ ] **Step 3: Implement deterministic normalization**
+- [x] **Step 3: Implement deterministic normalization**
 
 ```ts
 export function matchChannel(input: ChannelInput, rules: readonly ChannelRule[]): ChannelMatch {
@@ -275,13 +275,15 @@ export function normalizeLead(input: NormalizeLeadInput): NormalizedLeadResult {
 
 `parseAmoRubles` returns a decimal string with two digits or a typed invalid result; phone-like names become `Сделка #<amoLeadId>` in outward responses.
 
-- [ ] **Step 4: Run example and property tests**
+Implementation rulings (Task 2 review, 2026-09-17): the pseudocode above is illustrative. Channel attribution follows `METRICS_CATALOG.md` section 7 literally: a filled source field decides on its own (an unmapped or non-text value yields `unknown` with `unknown_channel`), and tag and integration-source kinds are consulted only when the source field is empty and only through a matching active rule. Different channels within one source kind yield `unknown` with `channel_rule_conflict`. Excluded/rejected results carry no lead row, so Task 3 must decide what happens to an already stored row whose lead left the pipeline. Outward `displayName` replaces predominantly-phone names with `Сделка #<amoLeadId>` and masks any other run of ten or more digits as `*** ***-**-NN`.
+
+- [x] **Step 4: Run example and property tests**
 
 Run: `pnpm vitest run packages/domain/src/leads && pnpm test:contracts`
 
 Expected: PASS for Moscow midnight, invalid/negative/zero price policy, channel priority, stable empty names, and arbitrary Unicode input.
 
-- [ ] **Step 5: Commit deterministic lead normalization**
+- [x] **Step 5: Commit deterministic lead normalization**
 
 ```bash
 git add packages/domain/src/time packages/domain/src/money packages/domain/src/leads packages/testkit/src/lead-builders.ts

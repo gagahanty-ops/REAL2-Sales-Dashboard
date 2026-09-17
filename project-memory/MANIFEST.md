@@ -5,7 +5,9 @@ Generated: 2026-09-16. Updated: 2026-09-17.
 ## Location
 
 ```text
-/Users/arlandorizzi/Desktop/REAL2-Sales-Dashboard/project-memory
+<repository>/project-memory
+(machine arlandorizzi: /Users/arlandorizzi/Desktop/REAL2-Sales-Dashboard/project-memory;
+ machine ishop: /Users/ishop/Desktop/REAL2-Sales-Dashboard.nosync/project-memory)
 ```
 
 ## Purpose
@@ -51,7 +53,7 @@ feat/foundation-access
 Latest verified and pushed commit:
 
 ```text
-2e6f30f docs: checkpoint normalized schema task
+docs: checkpoint deterministic normalization task (after 4c46499; verify with git ls-remote)
 ```
 
 Clone the primary repository to obtain code and memory together. Local `.env` variants, generated dependencies, nested repositories, snapshots, and bundles are excluded.
@@ -77,4 +79,5 @@ Clone the primary repository to obtain code and memory together. Local `.env` va
 - Do not modify amoCRM business data.
 - Do not write to source Google Sheet `123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks`.
 - Do not store real secrets in this vault.
-- Plan 2 Task 7 and Plan 3 Task 1 are complete; continue from Plan 3 Task 2.
+- Plan 2 Task 7 and Plan 3 Task 1 are complete. Plan 3 Task 2 code is complete and review-approved; its DB-backed gate is pending. Run the full gate on a host with local Supabase, then continue with Plan 3 Task 3.
+- On macOS with iCloud Desktop sync, keep the working copy in a `.nosync` folder.
