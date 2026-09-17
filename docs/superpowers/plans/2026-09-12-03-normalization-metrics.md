@@ -36,7 +36,7 @@
 - Consumes: successful `sync_run_id`, active `config_id`, and parsed raw objects/events.
 - Produces: repositories for `amo_users`, `pipeline_statuses`, `leads`, `lead_stage_events`, `lead_responsible_events`, `lead_milestones`, and `data_quality_issues`.
 
-- [ ] **Step 1: Write failing database invariant tests**
+- [x] **Step 1: Write failing database invariant tests**
 
 ```ts
 it("rejects a stage event for a lead in another amo account", async () => {
@@ -56,13 +56,13 @@ it("allows only one open quality issue per lead and code", async () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify missing relation failures**
+- [x] **Step 2: Run tests and verify missing relation failures**
 
 Run: `pnpm test:integration -- packages/db/src/leads.integration.test.ts`
 
 Expected: FAIL because normalized relations do not exist.
 
-- [ ] **Step 3: Add exact keys, constraints, indexes, and RLS**
+- [x] **Step 3: Add exact keys, constraints, indexes, and RLS**
 
 ```sql
 create table amo_users (
@@ -177,13 +177,13 @@ create index quality_status_idx on data_quality_issues(status, severity, code);
 
 RLS lets admin/head read all normalized rows. A manager reads only `leads` whose `current_responsible_user_id` equals the active user's `amo_user_id`, plus related stage/responsible/milestone rows through an `exists` subquery on that permitted lead. Raw payload columns and raw-table relations are not exposed through manager-facing repositories or policies.
 
-- [ ] **Step 4: Apply migration and verify constraints/RLS**
+- [x] **Step 4: Apply migration and verify constraints/RLS**
 
 Run: `supabase db reset && pnpm test:integration -- packages/db/src/leads.integration.test.ts && pnpm test:security -- tests/security/rls.security.test.ts`
 
 Expected: PASS for composite ownership, duplicate event denial, partial-open issue index, and role scopes.
 
-- [ ] **Step 5: Commit the normalized schema**
+- [x] **Step 5: Commit the normalized schema**
 
 ```bash
 git add supabase/migrations/0010_normalized_leads.sql packages/db tests/security/rls.security.test.ts
