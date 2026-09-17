@@ -630,7 +630,7 @@ git commit -m "feat: sync amoCRM through guarded read-only worker"
 - Consumes: repository source tree and mock request ledger.
 - Produces: CI-enforced proof that no alternate amoCRM client or forbidden method exists; owner-facing installation and shutdown procedures.
 
-- [ ] **Step 1: Write the failing static import test**
+- [x] **Step 1: Write the failing static import test**
 
 ```ts
 it("keeps amoCRM networking inside the guarded transport", async () => {
@@ -644,13 +644,13 @@ it("keeps amoCRM networking inside the guarded transport", async () => {
 });
 ```
 
-- [ ] **Step 2: Run security tests and verify the testkit helper is missing**
+- [x] **Step 2: Run security tests and verify the testkit helper is missing**
 
 Run: `pnpm test:security -- tests/security/amo-imports.security.test.ts tests/security/amo-methods.security.test.ts`
 
 Expected: FAIL because the source-scanning helper does not exist.
 
-- [ ] **Step 3: Implement source scanning and exact runbooks**
+- [x] **Step 3: Implement source scanning and exact runbooks**
 
 The installation runbook requires external integration registration, exact HTTPS redirect URI, minimum access, account-host verification, switches disabled, and written support confirmation. The shutdown runbook starts with environment and DB disablement, then token revocation/rotation and evidence capture.
 
@@ -673,13 +673,13 @@ export async function findForbiddenPatterns(
 }
 ```
 
-- [ ] **Step 4: Run the complete amoCRM gate**
+- [x] **Step 4: Run the complete amoCRM gate**
 
 Run: `pnpm lint && pnpm typecheck && pnpm test && pnpm test:contracts && pnpm test:integration && pnpm test:security && pnpm build`
 
 Expected: all checks pass; the request ledger contains only allowlisted GETs and OAuth token POSTs; no live credential is required.
 
-- [ ] **Step 5: Commit the amoCRM safety gate**
+- [x] **Step 5: Commit the amoCRM safety gate**
 
 ```bash
 git add tests/security docs/runbooks/amo-oauth-installation.md docs/runbooks/amo-sync-disable.md packages/testkit
