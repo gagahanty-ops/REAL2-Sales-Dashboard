@@ -6,7 +6,7 @@
 
 **Architecture:** Pure Zod-validated transformations produce normalized rows from append-only raw input. Milestones and responsibility/stage timelines are derived in stable event order, quality issues remain attached to source identities, and metric snapshots are built as candidates before transactional approval. Dashboard consumers never query mutable source tables directly.
 
-**Tech Stack:** TypeScript 5.9, Zod 4, PostgreSQL 16 numeric/date types, Vitest, PGlite, fast-check, decimal.js.
+**Tech Stack:** TypeScript 5.9, Zod 4, PostgreSQL 17 numeric/date types, Vitest, PGlite, fast-check, decimal.js.
 
 **Spec:** `SPEC.md` modules M5–M7 plus scenarios S1–S5; complete `METRICS_CATALOG.md`.
 
@@ -27,7 +27,7 @@
 ### Task 1: Create normalized lead, history, milestone, and quality schema
 
 **Files:**
-- Create: `supabase/migrations/0005_normalized_leads.sql`
+- Create: `supabase/migrations/0010_normalized_leads.sql`
 - Create: `packages/db/src/leads.ts`
 - Create: `packages/db/src/quality.ts`
 - Test: `packages/db/src/leads.integration.test.ts`
@@ -186,7 +186,7 @@ Expected: PASS for composite ownership, duplicate event denial, partial-open iss
 - [ ] **Step 5: Commit the normalized schema**
 
 ```bash
-git add supabase/migrations/0005_normalized_leads.sql packages/db tests/security/rls.security.test.ts
+git add supabase/migrations/0010_normalized_leads.sql packages/db tests/security/rls.security.test.ts
 git commit -m "feat: add normalized lead history schema"
 ```
 
