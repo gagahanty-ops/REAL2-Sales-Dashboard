@@ -1,4 +1,9 @@
+import { AppError } from "@real2/domain";
+import type { TransactionSql } from "postgres";
+
 import type { Database } from "./client.js";
+
+export type NormalizedLeadDb = Database | TransactionSql;
 
 export type NormalizedLeadKey = Readonly<{
   accountId: number;
@@ -32,7 +37,7 @@ export type UpsertLeadInput = Readonly<{
   currentStatusId: number;
   currentResponsibleUserId: number | null;
   name: string;
-  priceRub: number | null;
+  priceRub: string | null;
   createdAt: Date;
   createdDate: string;
   sourceUpdatedAt: Date;
@@ -82,11 +87,37 @@ export type NormalizedLeadRepository = Readonly<{
   upsertMilestone(input: UpsertLeadMilestoneInput): Promise<void>;
 }>;
 
+function isPositiveSafeInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function validateIdentity(value: number | null, required = false): void {
+  if ((value === null && required) || (value !== null && !isPositiveSafeInteger(value))) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+}
+
+function validateLeadInput(input: UpsertLeadInput): void {
+  validateIdentity(input.accountId, true);
+  validateIdentity(input.amoLeadId, true);
+  validateIdentity(input.pipelineId, true);
+  validateIdentity(input.currentStatusId, true);
+  validateIdentity(input.currentResponsibleUserId);
+  if (
+    input.priceRub !== null
+    && !/^(?:0|[1-9]\d{0,11})\.\d{2}$/.test(input.priceRub)
+  ) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+}
+
 export function createNormalizedLeadRepository(
-  db: Database,
+  db: NormalizedLeadDb,
 ): NormalizedLeadRepository {
   return {
     async upsertAmoUser(input) {
+      validateIdentity(input.accountId, true);
+      validateIdentity(input.amoUserId, true);
       await db`
         insert into public.amo_users (
           account_id, amo_user_id, name, email, is_active, source_updated_at
@@ -104,6 +135,10 @@ export function createNormalizedLeadRepository(
     },
 
     async upsertPipelineStatus(input) {
+      validateIdentity(input.accountId, true);
+      validateIdentity(input.pipelineId, true);
+      validateIdentity(input.statusId, true);
+      if (!Number.isSafeInteger(input.sortOrder)) throw new AppError("E_VALIDATION", 422);
       await db`
         insert into public.pipeline_statuses (
           account_id, pipeline_id, status_id, name, sort_order, is_closed,
@@ -123,6 +158,7 @@ export function createNormalizedLeadRepository(
     },
 
     async upsertLead(input) {
+      validateLeadInput(input);
       await db`
         insert into public.leads (
           account_id, amo_lead_id, pipeline_id, current_status_id,
@@ -155,6 +191,11 @@ export function createNormalizedLeadRepository(
     },
 
     async appendStageEvent(input) {
+      validateIdentity(input.accountId, true);
+      validateIdentity(input.amoLeadId, true);
+      validateIdentity(input.fromStatusId);
+      validateIdentity(input.toStatusId, true);
+      validateIdentity(input.responsibleUserId);
       await db`
         insert into public.lead_stage_events (
           account_id, amo_event_id, amo_lead_id, from_status_id, to_status_id,
@@ -169,6 +210,10 @@ export function createNormalizedLeadRepository(
     },
 
     async appendResponsibleEvent(input) {
+      validateIdentity(input.accountId, true);
+      validateIdentity(input.amoLeadId, true);
+      validateIdentity(input.fromUserId);
+      validateIdentity(input.toUserId);
       await db`
         insert into public.lead_responsible_events (
           account_id, amo_event_id, amo_lead_id, from_user_id, to_user_id,
@@ -182,6 +227,10 @@ export function createNormalizedLeadRepository(
     },
 
     async upsertMilestone(input) {
+      validateIdentity(input.accountId, true);
+      validateIdentity(input.amoLeadId, true);
+      validateIdentity(input.applicationResponsibleUserId);
+      validateIdentity(input.wonResponsibleUserId);
       await db`
         insert into public.lead_milestones (
           account_id, amo_lead_id, application_at, application_responsible_user_id,

@@ -225,5 +225,6 @@ to authenticated
 using ((select app.current_role()) in ('admin', 'head'));
 
 grant select, insert, update on table public.amo_users, public.pipeline_statuses,
-  public.leads, public.lead_stage_events, public.lead_responsible_events,
-  public.lead_milestones, public.data_quality_issues to service_worker;
+  public.leads, public.lead_milestones, public.data_quality_issues to service_worker;
+grant select, insert on table public.lead_stage_events,
+  public.lead_responsible_events to service_worker;

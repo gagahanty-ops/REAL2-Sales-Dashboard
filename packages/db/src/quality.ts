@@ -1,7 +1,7 @@
 import type { JSONValue } from "postgres";
+import { AppError } from "@real2/domain";
 
-import type { NormalizedLeadKey } from "./leads.js";
-import type { Database } from "./client.js";
+import type { NormalizedLeadDb } from "./leads.js";
 
 export type QualitySeverity = "info" | "warning" | "blocking";
 export type QualityStatus = "open" | "resolved" | "accepted";
@@ -26,6 +26,11 @@ export type QualityIssue = Readonly<{
   lastSeenAt: Date;
 }>;
 
+export type QualityLeadKey = Readonly<{
+  accountId: number;
+  amoLeadId: number | null;
+}>;
+
 type QualityIssueRow = {
   id: string;
   account_id: string;
@@ -39,14 +44,29 @@ type QualityIssueRow = {
 
 export type QualityRepository = Readonly<{
   open(input: OpenQualityIssueInput): Promise<QualityIssue>;
-  countOpen(leadKey: Readonly<Pick<NormalizedLeadKey, "accountId" | "amoLeadId">>, code: string): Promise<number>;
+  countOpen(leadKey: QualityLeadKey, code: string): Promise<number>;
 }>;
+
+function safePositiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new AppError("E_DB", 500);
+  return parsed;
+}
+
+function validateIdentity(value: number | null, required = false): void {
+  if (
+    (value === null && required)
+    || (value !== null && (!Number.isSafeInteger(value) || value <= 0))
+  ) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+}
 
 function mapQualityIssue(row: QualityIssueRow): QualityIssue {
   return {
     id: row.id,
-    accountId: Number(row.account_id),
-    amoLeadId: row.amo_lead_id === null ? null : Number(row.amo_lead_id),
+    accountId: safePositiveInteger(row.account_id),
+    amoLeadId: row.amo_lead_id === null ? null : safePositiveInteger(row.amo_lead_id),
     code: row.code,
     severity: row.severity,
     status: row.status,
@@ -55,9 +75,13 @@ function mapQualityIssue(row: QualityIssueRow): QualityIssue {
   };
 }
 
-export function createQualityRepository(db: Database): QualityRepository {
+export function createQualityRepository(
+  db: NormalizedLeadDb,
+): QualityRepository {
   return {
     async open(input) {
+      validateIdentity(input.accountId, true);
+      validateIdentity(input.amoLeadId);
       const [row] = await db<QualityIssueRow[]>`
         insert into public.data_quality_issues (
           account_id, amo_lead_id, sync_run_id, code, severity, safe_details
@@ -80,11 +104,13 @@ export function createQualityRepository(db: Database): QualityRepository {
     },
 
     async countOpen(leadKey, code) {
+      validateIdentity(leadKey.accountId, true);
+      validateIdentity(leadKey.amoLeadId);
       const [row] = await db<{ count: number }[]>`
         select count(*)::integer as count
         from public.data_quality_issues
         where account_id = ${leadKey.accountId}
-          and amo_lead_id = ${leadKey.amoLeadId}
+          and amo_lead_id is not distinct from ${leadKey.amoLeadId}
           and code = ${code}
           and status = 'open'
       `;

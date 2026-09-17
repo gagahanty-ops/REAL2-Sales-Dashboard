@@ -616,4 +616,24 @@ describe("normalized lead RLS", () => {
       quality_issues: 0,
     });
   });
+
+  it("does not let the worker rewrite append-only normalized history", async () => {
+    await seedNormalizedLeads();
+    const workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl);
+
+    try {
+      await expect(workerDb`
+        update public.lead_stage_events
+        set to_status_id = 999
+        where account_id = 555151 and amo_event_id = 'stage-7001'
+      `).rejects.toMatchObject({ code: "42501" });
+      await expect(workerDb`
+        update public.lead_responsible_events
+        set to_user_id = 999
+        where account_id = 555151 and amo_event_id = 'responsible-7001'
+      `).rejects.toMatchObject({ code: "42501" });
+    } finally {
+      await closeDbClient(workerDb);
+    }
+  });
 });

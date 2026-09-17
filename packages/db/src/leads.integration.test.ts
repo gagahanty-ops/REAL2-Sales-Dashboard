@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import { createNormalizedLeadRepository } from "./leads";
 import { createQualityRepository } from "./quality";
+import { AppError } from "@real2/domain";
 import {
   createAdminDb,
   ensureRestrictedTestLogins,
@@ -170,7 +171,7 @@ describe("normalized lead database invariants", () => {
       currentStatusId: 20,
       currentResponsibleUserId: 101,
       name: "Synthetic lead",
-      priceRub: 5000,
+      priceRub: "5000.00",
       createdAt: new Date("2026-09-15T09:00:00.000Z"),
       createdDate: "2026-09-15",
       sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
@@ -238,5 +239,96 @@ describe("normalized lead database invariants", () => {
     }]);
     await expect(quality.countOpen({ accountId: 1, amoLeadId: 55 }, "missing_responsible"))
       .resolves.toBe(1);
+  });
+
+  it("preserves exact decimal prices and rejects malformed money and unsafe IDs", async () => {
+    const configId = await seedNormalizedLead();
+    const leads = createNormalizedLeadRepository(adminDb);
+    const quality = createQualityRepository(adminDb);
+    const leadInput = {
+      accountId: 1,
+      amoLeadId: 55,
+      pipelineId: 10,
+      currentStatusId: 20,
+      currentResponsibleUserId: 101,
+      name: "Synthetic lead",
+      createdAt: new Date("2026-09-15T09:00:00.000Z"),
+      createdDate: "2026-09-15",
+      sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
+      normalizedChannel: "site",
+      channelRuleId: null,
+      normalizationConfigId: configId,
+      amoUrl: "https://555151.amocrm.ru/leads/55",
+      isDeleted: false,
+    };
+
+    await leads.upsertLead({ ...leadInput, priceRub: "999999999999.99" });
+    await expect(adminDb<{ price_rub: string }[]>`
+      select price_rub::text from public.leads where account_id = 1 and amo_lead_id = 55
+    `).resolves.toEqual([{ price_rub: "999999999999.99" }]);
+    await expect(
+      leads.upsertLead({ ...leadInput, priceRub: "100.1" }),
+    ).rejects.toBeInstanceOf(AppError);
+    await expect(quality.open({
+      accountId: Number.MAX_SAFE_INTEGER + 1,
+      amoLeadId: 55,
+      code: "unsafe_id",
+      severity: "blocking",
+    })).rejects.toBeInstanceOf(AppError);
+  });
+
+  it("counts a single account-level quality issue with a null lead key", async () => {
+    const quality = createQualityRepository(adminDb);
+    const issue = {
+      accountId: 1,
+      amoLeadId: null,
+      code: "account_scope",
+      severity: "warning" as const,
+    };
+
+    const first = await quality.open(issue);
+    const second = await quality.open(issue);
+
+    expect(second.id).toBe(first.id);
+    await expect(quality.countOpen({ accountId: 1, amoLeadId: null }, "account_scope"))
+      .resolves.toBe(1);
+  });
+
+  it("rolls normalized writes back when repositories share a transaction", async () => {
+    const configId = await seedNormalizedLead();
+
+    await expect(adminDb.begin(async (transaction) => {
+      const leads = createNormalizedLeadRepository(transaction);
+      const quality = createQualityRepository(transaction);
+      await leads.upsertLead({
+        accountId: 1,
+        amoLeadId: 56,
+        pipelineId: 10,
+        currentStatusId: 20,
+        currentResponsibleUserId: 101,
+        name: "Rolled back lead",
+        priceRub: "1.00",
+        createdAt: new Date("2026-09-15T09:00:00.000Z"),
+        createdDate: "2026-09-15",
+        sourceUpdatedAt: new Date("2026-09-15T09:01:00.000Z"),
+        normalizedChannel: "site",
+        channelRuleId: null,
+        normalizationConfigId: configId,
+        amoUrl: "https://555151.amocrm.ru/leads/56",
+        isDeleted: false,
+      });
+      await quality.open({
+        accountId: 1,
+        amoLeadId: 56,
+        code: "rolled_back",
+        severity: "warning",
+      });
+      throw new Error("abort normalized transaction");
+    })).rejects.toThrow("abort normalized transaction");
+    await expect(adminDb<{ leads: number; issues: number }[]>`
+      select
+        (select count(*)::integer from public.leads where amo_lead_id = 56) as leads,
+        (select count(*)::integer from public.data_quality_issues where code = 'rolled_back') as issues
+    `).resolves.toEqual([{ leads: 0, issues: 0 }]);
   });
 });
