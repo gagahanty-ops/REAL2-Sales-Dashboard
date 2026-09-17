@@ -91,3 +91,22 @@ export {
   type SafeSyncRunSummary,
   type SyncLockFence,
 } from "./sync-operations.js";
+export {
+  createNormalizedLeadRepository,
+  type AppendResponsibleEventInput,
+  type AppendStageEventInput,
+  type NormalizedLeadKey,
+  type NormalizedLeadRepository,
+  type UpsertAmoUserInput,
+  type UpsertLeadInput,
+  type UpsertLeadMilestoneInput,
+  type UpsertPipelineStatusInput,
+} from "./leads.js";
+export {
+  createQualityRepository,
+  type OpenQualityIssueInput,
+  type QualityIssue,
+  type QualityRepository,
+  type QualitySeverity,
+  type QualityStatus,
+} from "./quality.js";

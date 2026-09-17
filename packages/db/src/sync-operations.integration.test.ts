@@ -65,7 +65,7 @@ async function seedFixture(): Promise<Fixture> {
 
 async function clearFixtures(): Promise<void> {
   await adminDb.unsafe(
-    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
+    "truncate table public.sync_work_queue, public.sync_critical_alerts, public.raw_retention_proofs, public.data_quality_issues, public.lead_milestones, public.lead_responsible_events, public.lead_stage_events, public.leads, public.pipeline_statuses, public.amo_users, public.amo_api_audit, public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects, public.sync_pages, public.sync_cursors, public.sync_runs, public.config_recalculation_requests, public.config_validations, public.channel_rules, public.pipeline_configs",
   );
   await adminDb`delete from public.oauth_states`;
   await adminDb`delete from public.amo_connections`;
