@@ -114,9 +114,23 @@ function filledText(value: unknown): value is string {
 }
 
 /**
+ * Stands for a present source-field value that is not text. It fills the
+ * field (so the field decides) but can never equal a stored rule value,
+ * because PostgreSQL text cannot contain NUL.
+ */
+export const NON_TEXT_SOURCE_VALUE = "\u0000non_text";
+
+function sourceFieldValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") return filledText(value) ? value : null;
+  return NON_TEXT_SOURCE_VALUE;
+}
+
+/**
  * Collects exact channel evidence from an amoCRM API v4 lead payload:
  * the configured custom field, `_embedded.tags[].name` and
- * `_embedded.source.name`. Malformed shapes yield no values.
+ * `_embedded.source.name`. Malformed shapes yield no values; a present
+ * non-text source value yields {@link NON_TEXT_SOURCE_VALUE}.
  */
 export function extractChannelInput(
   raw: unknown,
@@ -131,8 +145,8 @@ export function extractChannelInput(
       : records(lead.custom_fields_values)
           .filter((field) => field.field_id === sourceFieldId)
           .flatMap((field) => records(field.values))
-          .map((item) => item.value)
-          .filter(filledText);
+          .map((item) => sourceFieldValue(item.value))
+          .filter((value) => value !== null);
 
   const tagValues = records(embedded.tags)
     .map((tag) => tag.name)

@@ -275,6 +275,8 @@ export function normalizeLead(input: NormalizeLeadInput): NormalizedLeadResult {
 
 `parseAmoRubles` returns a decimal string with two digits or a typed invalid result; phone-like names become `Сделка #<amoLeadId>` in outward responses.
 
+Implementation rulings (Task 2 review, 2026-09-17): the pseudocode above is illustrative. Channel attribution follows `METRICS_CATALOG.md` section 7 literally: a filled source field decides on its own (an unmapped or non-text value yields `unknown` with `unknown_channel`), and tag and integration-source kinds are consulted only when the source field is empty and only through a matching active rule. Different channels within one source kind yield `unknown` with `channel_rule_conflict`. Excluded/rejected results carry no lead row, so Task 3 must decide what happens to an already stored row whose lead left the pipeline. Outward `displayName` replaces predominantly-phone names with `Сделка #<amoLeadId>` and masks any other run of ten or more digits as `*** ***-**-NN`.
+
 - [ ] **Step 4: Run example and property tests**
 
 Run: `pnpm vitest run packages/domain/src/leads && pnpm test:contracts`

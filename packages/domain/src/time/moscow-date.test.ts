@@ -2,7 +2,7 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 
 import { AppError } from "../errors.js";
-import { toMoscowDate, unixSecondsToInstant } from "./moscow-date.js";
+import { parseIsoInstant, toMoscowDate, unixSecondsToInstant } from "./moscow-date.js";
 
 describe("toMoscowDate", () => {
   it.each([
@@ -38,10 +38,21 @@ describe("toMoscowDate", () => {
     "not a date",
     "１２３",
     "9999-12-31T21:00:00Z",
+    "0500-01-01T00:00:00Z",
+    "1969-12-31T23:59:59Z",
+    "2026-09-11T21:00:00+14:59",
+    "2026-09-11T21:00:00+03:07",
     "+010000-01-01T00:00:00Z",
   ])("rejects ambiguous or malformed instant %j", (instant) => {
     expect(() => toMoscowDate(instant)).toThrow(AppError);
   });
+
+  it.each(["2026-09-11T21:00:00+14:00", "2026-09-11T21:00:00+05:45", "2026-09-11T21:00:00-09:30"])(
+    "accepts a real-world UTC offset %s",
+    (instant) => {
+      expect(parseIsoInstant(instant)?.getTime()).toBe(new Date(instant).getTime());
+    },
+  );
 
   it("rejects an invalid Date object", () => {
     expect(() => toMoscowDate(new Date(Number.NaN))).toThrow(AppError);

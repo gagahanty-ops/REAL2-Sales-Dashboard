@@ -50,6 +50,7 @@ export function parseAmoRubles(raw: unknown): AmoRublesResult {
 
 /** Parses a plain decimal ruble string exactly; returns null when malformed. */
 export function parseRubleDecimal(text: string): Rubles | null {
+  if (typeof text !== "string") return null;
   const match = RUBLE_DECIMAL.exec(text);
   if (!match) return null;
   const [, integer, fraction = ""] = match;

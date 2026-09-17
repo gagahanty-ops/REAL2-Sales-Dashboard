@@ -98,6 +98,25 @@ describe("normalizeLead", () => {
       },
     );
 
+    it.each([
+      ["Мария Иванова заказ кухни +7 000 111-22-33", "Мария Иванова заказ кухни *** ***-**-33"],
+      ["Кухня, звонить 8 (000) 111 22 44 после 18:00", "Кухня, звонить *** ***-**-44 после 18:00"],
+      ["Шкаф 80001112255 и 80001112266, доставка по городу после обеда", "Шкаф *** ***-**-55 и *** ***-**-66, доставка по городу после обеда"],
+    ])("masks a phone number inside a longer name %j", (name, displayName) => {
+      const result = normalizeLead(buildRawLead({ name }), context);
+      expect(result.lead?.name).toBe(name);
+      expect(result.lead?.displayName).toBe(displayName);
+    });
+
+    it.each(["\u200b", "\u200b\u200e\u2066", "\u00ad"])(
+      "treats an invisible-only name %j as empty",
+      (name) => {
+        const result = normalizeLead(buildRawLead({ name }), context);
+        expect(result.lead?.name).toBe("Сделка #101");
+        expect(result.lead?.displayName).toBe("Сделка #101");
+      },
+    );
+
     it.each(["Заказ 12", "Кухня 2400x600", "Доставка 17.09 до 18:00", "Шкаф-купе 1234"])(
       "keeps an ordinary name with digits %j visible",
       (name) => {
@@ -290,6 +309,15 @@ describe("normalizeLead", () => {
     });
   });
 
+  it("excludes an out-of-scope lead even when its timestamps are malformed", () => {
+    const result = normalizeLead(
+      buildRawLead({ pipelineId: 78, omit: ["created_at", "updated_at"] }),
+      context,
+    );
+    expect(result.status).toBe("excluded");
+    expect(codes(result)).toEqual(["out_of_scope_pipeline"]);
+  });
+
   describe("rejections", () => {
     it.each([[undefined], [null], [0], [-1], [1.5], ["1789160400"], [253_402_290_000]])(
       "rejects created_at %j without guessing a date",
@@ -467,17 +495,21 @@ describe("normalizeLead", () => {
     });
 
     it("keeps arbitrary Unicode names stable and never displays phone-like text", () => {
+      const phoneish = fc.stringMatching(/^\+?[78]?[ (]?\d{3}[) -]?\d{3}[ -]?\d{2}[ -]?\d{2}$/);
+      const nameArbitrary = fc
+        .tuple(fc.string({ unit: "grapheme", maxLength: 24 }), fc.option(phoneish), fc.string({ unit: "grapheme", maxLength: 24 }))
+        .map(([before, phone, after]) => `${before}${phone ?? ""}${after}`);
       fc.assert(
-        fc.property(fc.string({ unit: "grapheme", maxLength: 64 }), (name) => {
+        fc.property(nameArbitrary, (name) => {
           const result = normalizeLead(buildRawLead({ name }), context);
           expect(result.status).toBe("normalized");
           expect(result.issues).toEqual([]);
           const lead = result.lead!;
           expect(lead.name.length).toBeGreaterThan(0);
           expect([name, "Сделка #101"]).toContain(lead.name);
-          expect([lead.name, "Сделка #101"]).toContain(lead.displayName);
-          const digits = lead.displayName.match(/\p{Nd}/gu)?.length ?? 0;
-          if (lead.displayName !== "Сделка #101") expect(digits < 10 || digits * 2 < [...lead.displayName.replace(/\s/gu, "")].length).toBe(true);
+          expect(normalizeLead(buildRawLead({ name }), context)).toEqual(result);
+          const digitRun = /\p{Nd}(?:[\s().+-]*\p{Nd}){9}/u;
+          expect(digitRun.test(lead.displayName)).toBe(false);
         }),
       );
     });

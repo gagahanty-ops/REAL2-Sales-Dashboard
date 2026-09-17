@@ -39,6 +39,7 @@ export {
   type Rubles,
 } from "./money/rubles.js";
 export {
+  NON_TEXT_SOURCE_VALUE,
   extractChannelInput,
   matchChannel,
   type ChannelInput,

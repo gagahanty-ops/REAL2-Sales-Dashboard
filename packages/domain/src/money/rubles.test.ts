@@ -87,6 +87,10 @@ describe("parseRubleDecimal", () => {
     expect(parseRubleDecimal(text)).toBeNull();
   });
 
+  it.each([[123], [null], [undefined], [{}]])("rejects non-string input %j at runtime", (value) => {
+    expect(parseRubleDecimal(value as unknown as string)).toBeNull();
+  });
+
   it("round-trips every kopeck amount without floating point", () => {
     fc.assert(
       fc.property(fc.bigInt({ min: 0n, max: 99_999_999_999_999n }), (kopecks) => {

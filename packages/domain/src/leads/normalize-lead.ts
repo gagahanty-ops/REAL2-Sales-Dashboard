@@ -80,7 +80,7 @@ export type NormalizedLead = Readonly<{
   currentResponsibleUserId: number | null;
   /** Protected stored name; may contain a phone number. */
   name: string;
-  /** Name safe for dashboard, CSV and Sheet output. */
+  /** Name safe for dashboard, CSV and Sheet output: phone numbers never appear. */
   displayName: string;
   priceRub: Rubles | null;
   createdAt: string;
@@ -144,11 +144,36 @@ function fallbackName(amoLeadId: number): string {
   return `Сделка #${amoLeadId}`;
 }
 
+/** A digit run joined by phone separators, e.g. `+7 (000) 111-22-33`. */
+const DIGIT_RUN = /\+?\p{Nd}(?:[\s().+-]*\p{Nd})*/gu;
+const MIN_PHONE_DIGITS = 10;
+
+function hasVisibleText(name: string): boolean {
+  return /[\p{L}\p{N}\p{P}\p{S}]/u.test(name);
+}
+
+function countDigits(text: string): number {
+  return text.match(/\p{Nd}/gu)?.length ?? 0;
+}
+
 /** SPEC M5.5: a name made up mainly of a phone number is never displayed. */
 function isPhoneLike(name: string): boolean {
-  const digits = name.match(/\p{Nd}/gu)?.length ?? 0;
+  const digits = countDigits(name);
   const visible = Array.from(name.replace(/\s/gu, "")).length;
-  return digits >= 10 && digits * 2 >= visible;
+  return digits >= MIN_PHONE_DIGITS && digits * 2 >= visible;
+}
+
+/** SECURITY_READ_ONLY section 7: phones inside a name are masked. */
+function maskPhones(name: string): string {
+  return name.replace(DIGIT_RUN, (run) =>
+    countDigits(run) >= MIN_PHONE_DIGITS
+      ? `*** ***-**-${(run.match(/\p{Nd}/gu) ?? []).slice(-2).join("")}`
+      : run,
+  );
+}
+
+function displayNameFor(name: string, amoLeadId: number): string {
+  return isPhoneLike(name) ? fallbackName(amoLeadId) : maskPhones(name);
 }
 
 function channelIssues(channel: ChannelMatch): Array<[LeadQualityCode, SafeDetails]> {
@@ -183,7 +208,8 @@ function toIssues(
 /**
  * Converts one raw amoCRM lead snapshot into a normalized lead plus quality
  * issue candidates. Pure and deterministic: it never throws for malformed
- * source data and never guesses missing values.
+ * JSON-shaped source data (as stored in raw JSONB) and never guesses missing
+ * values. Invalid context is a programming error and throws.
  */
 export function normalizeLead(
   raw: unknown,
@@ -216,14 +242,28 @@ export function normalizeLead(
     pipelineId === null ? "invalid_pipeline" : null,
     statusId === null ? "invalid_status" : null,
   ].filter((reason) => reason !== null);
+  const accountMismatch =
+    payloadAccountId !== null && payloadAccountId !== accountId;
+  const identityValid =
+    amoLeadId !== null && payloadAccountId !== null && pipelineId !== null;
+
+  // A lead of another pipeline is never reported on, so its remaining
+  // defects must not raise blocking issues for this configuration.
+  if (identityValid && !accountMismatch && pipelineId !== config.pipelineId) {
+    return {
+      status: "excluded",
+      lead: null,
+      issues: toIssues(accountId, amoLeadId, [
+        ["out_of_scope_pipeline", { pipelineId }],
+      ]),
+    };
+  }
 
   const rejections: Array<[LeadQualityCode, SafeDetails]> = [];
   if (malformed.length > 0) {
     rejections.push(["malformed_lead", { reasons: malformed.join(",") }]);
   }
-  if (payloadAccountId !== null && payloadAccountId !== accountId) {
-    rejections.push(["account_mismatch", {}]);
-  }
+  if (accountMismatch) rejections.push(["account_mismatch", {}]);
   if (createdAt === null) rejections.push(["invalid_created_at", {}]);
   if (sourceUpdatedAt === null) rejections.push(["invalid_updated_at", {}]);
 
@@ -239,16 +279,6 @@ export function normalizeLead(
       status: "rejected",
       lead: null,
       issues: toIssues(accountId, amoLeadId, rejections),
-    };
-  }
-
-  if (pipelineId !== config.pipelineId) {
-    return {
-      status: "excluded",
-      lead: null,
-      issues: toIssues(accountId, amoLeadId, [
-        ["out_of_scope_pipeline", { pipelineId }],
-      ]),
     };
   }
 
@@ -282,7 +312,7 @@ export function normalizeLead(
   issues.push(...channelIssues(channel));
 
   const name =
-    typeof raw.name === "string" && raw.name.trim() !== ""
+    typeof raw.name === "string" && hasVisibleText(raw.name)
       ? raw.name
       : fallbackName(amoLeadId);
 
@@ -293,7 +323,7 @@ export function normalizeLead(
     currentStatusId: statusId,
     currentResponsibleUserId: responsibleUserId,
     name,
-    displayName: isPhoneLike(name) ? fallbackName(amoLeadId) : name,
+    displayName: displayNameFor(name, amoLeadId),
     priceRub: price.value,
     createdAt,
     createdDate: toMoscowDate(createdAt),

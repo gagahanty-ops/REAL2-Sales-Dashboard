@@ -29,8 +29,8 @@ function isCalendarDate(year: number, month: number, day: number): boolean {
 
 /**
  * Parses an ISO 8601 instant with an explicit `Z` or `±HH:MM` offset.
- * Returns null for anything ambiguous (no zone), impossible (2026-02-30) or
- * outside the supported range.
+ * Returns null for anything ambiguous (no zone), impossible (2026-02-30,
+ * `+03:07`) or outside the supported range.
  */
 export function parseIsoInstant(value: string): Date | null {
   const match = ISO_INSTANT.exec(value);
@@ -38,15 +38,24 @@ export function parseIsoInstant(value: string): Date | null {
   const [, year, month, day, hour, minute, second, zone, , offsetHour, offsetMinute] = match;
   if (!isCalendarDate(Number(year), Number(month), Number(day))) return null;
   if (Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59) return null;
-  if (zone !== "Z" && (Number(offsetHour) > 14 || Number(offsetMinute) > 59)) return null;
+  if (zone !== "Z" && !isRealOffset(Number(offsetHour), Number(offsetMinute))) {
+    return null;
+  }
   const instant = new Date(value);
   return isSupportedInstant(instant) ? instant : null;
 }
 
+/** Real-world UTC offsets use quarter hours and never exceed 14:00. */
+function isRealOffset(hours: number, minutes: number): boolean {
+  return minutes % 15 === 0 && minutes < 60 && hours * 60 + minutes <= 14 * 60;
+}
+
+/** Supported instants: the unix epoch through 9999-12-31T20:59:59.999Z. */
 function isSupportedInstant(instant: Date): boolean {
   const milliseconds = instant.getTime();
   return (
     Number.isFinite(milliseconds)
+    && milliseconds >= 0
     && milliseconds <= (MAX_UNIX_SECONDS + 1) * 1_000 - 1
   );
 }
