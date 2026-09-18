@@ -63,6 +63,18 @@
   - `buildMetricSnapshot` is idempotent by checksum and refuses to rebuild a run whose data changed.
   - Gate: unit 409/409 plus repo/worker 16/16; contracts 10/10; integration 127/127; security 28/28; lint, typecheck, build, secret scan and `supabase db lint` clean.
 
+- Task 7: complete, Plan 3 completion gate passed on 2026-09-19. Report `task-7-report.md`.
+  - Golden dataset now exists as raw amoCRM payloads; one contract drives ingestion, normalization, snapshot building, a blocked approval, admin acceptance and approval, then compares stored evidence with the golden rows.
+  - Idempotency contract: same checksum, same rows, no extra records on a second execution.
+  - Catalogue coverage: twenty-five contract keys, each pointing at an existing test file.
+  - `docs/runbooks/metric-reconciliation.md` documents the manual reconciliation from a report number to one amoCRM lead.
+  - Two defects found by the contracts: the snapshot read the wall clock (fixed: age measured against source freshness), and the golden dataset held a kopeck price amoCRM cannot send (fixed: integer price, kopeck exactness kept where it can arise).
+  - Plan 3 gate: unit 409/409 plus repo/worker 16/16; contracts 19/19 twice; integration 127/127; security 28/28; lint, typecheck, build, secret scan, `supabase db lint` clean.
+
+## PLAN 3 COMPLETE
+
+All seven tasks are implemented, independently gated and committed. Nothing schedules normalization or snapshot building yet, and publication belongs to Plan 5.
+
 ## Handoff notes for Task 3/4 (from Task 2 review)
 
 - `NormalizedLead.createdAt`/`sourceUpdatedAt`/`normalizedAt` are ISO strings; `UpsertLeadInput` expects `Date` for `createdAt`/`sourceUpdatedAt` — convert in `normalizeSyncRun`. `priceRub` (`Rubles`) is assignable to the repository's decimal string.
