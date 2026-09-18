@@ -9,7 +9,11 @@ import {
   type UpsertLeadMilestoneInput,
   type UpsertPipelineStatusInput,
 } from "./leads.js";
-import { createQualityRepository, type OpenQualityIssueInput } from "./quality.js";
+import {
+  createQualityRepository,
+  type OpenQualityIssueInput,
+  type ResolveAbsentIssuesInput,
+} from "./quality.js";
 import type { SyncStatus } from "./sync-runs.js";
 
 export type NormalizationRun = Readonly<{
@@ -54,6 +58,8 @@ export type NormalizationWritePlan = Readonly<{
   pipelineStatuses: readonly UpsertPipelineStatusInput[];
   leads: readonly NormalizedLeadWrite[];
   issues: readonly OpenQualityIssueInput[];
+  /** Issues of observed leads that stopped appearing are resolved, not deleted. */
+  issueLifecycle: ResolveAbsentIssuesInput | null;
 }>;
 
 export type NormalizationWriteResult = Readonly<{
@@ -62,6 +68,7 @@ export type NormalizationWriteResult = Readonly<{
   responsibleEventsWritten: number;
   milestonesWritten: number;
   issuesOpened: number;
+  issuesResolved: number;
 }>;
 
 export type NormalizeRunRepository = Readonly<{
@@ -234,6 +241,9 @@ export function createNormalizeRunRepository(db: Database): NormalizeRunReposito
         }
 
         for (const issue of plan.issues) await quality.open(issue);
+        const issuesResolved = plan.issueLifecycle
+          ? await quality.resolveAbsent(plan.issueLifecycle)
+          : 0;
 
         return {
           leadsWritten: plan.leads.length,
@@ -241,6 +251,7 @@ export function createNormalizeRunRepository(db: Database): NormalizeRunReposito
           responsibleEventsWritten,
           milestonesWritten: plan.leads.length,
           issuesOpened: plan.issues.length,
+          issuesResolved,
         };
       });
     },

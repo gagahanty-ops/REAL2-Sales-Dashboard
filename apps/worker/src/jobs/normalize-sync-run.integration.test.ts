@@ -570,6 +570,43 @@ describe("normalizeSyncRun", () => {
     expect(await readDerivedRows()).toEqual(before);
   });
 
+  it("resolves an issue that stopped appearing and keeps issues of other leads", async () => {
+    const fixture = await seedFixture();
+    await seedPipelineMetadata(fixture.syncRunId);
+    await insertRawObject(fixture.syncRunId, "lead", LEAD_ID,
+      buildRawLead({ statusId: SYNTHETIC_WON_STATUS_ID, responsibleUserId: FIRST_USER_ID }));
+    await finishRun(fixture.syncRunId);
+    await normalizeSyncRun(buildDeps(), fixture.syncRunId);
+    expect(await openIssueCodes()).toContain("missing_stage_history");
+
+    // An issue of a lead this run never observed must survive untouched.
+    await adminDb`
+      insert into public.data_quality_issues (
+        account_id, amo_lead_id, code, severity, status
+      ) values (${ACCOUNT_ID}, ${LEAD_ID + 50}, 'unknown_channel', 'warning', 'open')
+    `;
+
+    await reopenRun(fixture.syncRunId);
+    await insertRawEvent(fixture.syncRunId, "evt-1", "lead_status_changed",
+      "2026-09-08T09:00:00Z",
+      stagePayload(SYNTHETIC_APPLICATION_STATUS_ID, SYNTHETIC_OPEN_STATUS_ID));
+    await insertRawEvent(fixture.syncRunId, "evt-2", "lead_status_changed",
+      "2026-09-09T09:00:00Z",
+      stagePayload(SYNTHETIC_WON_STATUS_ID, SYNTHETIC_APPLICATION_STATUS_ID));
+    await finishRun(fixture.syncRunId);
+    const result = await normalizeSyncRun(buildDeps(), fixture.syncRunId);
+
+    expect(result.issuesResolved).toBe(1);
+    const rows = await adminDb<{ amo_lead_id: string; code: string; status: string }[]>`
+      select amo_lead_id, code, status from public.data_quality_issues
+      order by amo_lead_id
+    `;
+    expect(rows).toEqual([
+      { amo_lead_id: String(LEAD_ID), code: "missing_stage_history", status: "resolved" },
+      { amo_lead_id: String(LEAD_ID + 50), code: "unknown_channel", status: "open" },
+    ]);
+  });
+
   it("refuses to normalize a run that did not succeed", async () => {
     const fixture = await seedFixture();
     await adminDb`

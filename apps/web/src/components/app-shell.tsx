@@ -31,7 +31,8 @@ export function AppShell({
           ) : null}
           {user.role === "admin" || user.role === "head" ? (
             <>
-              <Link href="/quality/config">Качество</Link>
+              <Link href="/quality">Качество данных</Link>
+              <Link href="/quality/config">Конфигурация</Link>
               <Link href="/sync">Синхронизации</Link>
             </>
           ) : null}

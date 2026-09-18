@@ -16,10 +16,17 @@ import type {
 import {
   AppError,
   HISTORY_ISSUE_SEVERITY,
+  LEAD_ISSUE_SEVERITY,
   buildLeadHistory,
   extractHistoryEvent,
   normalizeLead,
 } from "@real2/domain";
+
+/** Codes this job owns; operational codes raised elsewhere are left alone. */
+const NORMALIZATION_OWNED_CODES = [
+  ...Object.keys(LEAD_ISSUE_SEVERITY),
+  ...Object.keys(HISTORY_ISSUE_SEVERITY),
+].sort();
 
 export type NormalizeSyncRunDeps = Readonly<{
   repository: NormalizeRunRepository;
@@ -37,6 +44,7 @@ export type NormalizeRunResult = Readonly<{
   stageEventsWritten: number;
   responsibleEventsWritten: number;
   issuesOpened: number;
+  issuesResolved: number;
   malformedEvents: number;
 }>;
 
@@ -337,11 +345,21 @@ export async function normalizeSyncRun(
     });
   }
 
+  const observedLeadIds = rawLeads.map((rawLead) => rawLead.amoLeadId);
   const written = await deps.repository.apply({
     amoUsers: planAmoUsers(run.accountId, userSnapshots),
     pipelineStatuses: statuses.upserts,
     leads: leadWrites,
     issues,
+    issueLifecycle: {
+      accountId: run.accountId,
+      amoLeadIds: observedLeadIds,
+      codes: NORMALIZATION_OWNED_CODES,
+      observed: issues
+        .filter((issue) => issue.amoLeadId !== null)
+        .map((issue) => `${issue.amoLeadId}:${issue.code}`),
+      resolvedAt: now,
+    },
   });
 
   return {
@@ -353,6 +371,7 @@ export async function normalizeSyncRun(
     stageEventsWritten: written.stageEventsWritten,
     responsibleEventsWritten: written.responsibleEventsWritten,
     issuesOpened: written.issuesOpened,
+    issuesResolved: written.issuesResolved,
     malformedEvents,
   };
 }

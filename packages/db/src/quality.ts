@@ -1,5 +1,5 @@
 import type { JSONValue } from "postgres";
-import { AppError } from "@real2/domain";
+import { AppError, isAcceptableQualityCode } from "@real2/domain";
 
 import type { NormalizedLeadDb } from "./leads.js";
 
@@ -42,10 +42,47 @@ type QualityIssueRow = {
   last_seen_at: Date;
 };
 
+export type QualityIssueFilter = Readonly<{
+  code?: string | undefined;
+  severity?: QualitySeverity | undefined;
+  status?: QualityStatus | undefined;
+  /** Opaque keyset cursor from a previous page. */
+  cursor?: string | null | undefined;
+  pageSize?: number | undefined;
+}>;
+
+export type QualityIssuePage = Readonly<{
+  items: readonly QualityIssue[];
+  nextCursor: string | null;
+}>;
+
+export type AcceptQualityIssueInput = Readonly<{
+  issueId: string;
+  actorId: string;
+  reason: string;
+  acceptedAt?: Date;
+}>;
+
+export type ResolveAbsentIssuesInput = Readonly<{
+  accountId: number;
+  /** Leads observed by this run; other leads keep their issues untouched. */
+  amoLeadIds: readonly number[];
+  /** Codes this run owns; operational codes raised elsewhere are left alone. */
+  codes: readonly string[];
+  /** `${amoLeadId}:${code}` pairs seen again in this run. */
+  observed: readonly string[];
+  resolvedAt?: Date;
+}>;
+
 export type QualityRepository = Readonly<{
   open(input: OpenQualityIssueInput): Promise<QualityIssue>;
   countOpen(leadKey: QualityLeadKey, code: string): Promise<number>;
+  resolveAbsent(input: ResolveAbsentIssuesInput): Promise<number>;
 }>;
+
+const MAX_QUALITY_PAGE_SIZE = 100;
+const ACCEPTANCE_REASON_MIN = 10;
+const ACCEPTANCE_REASON_MAX = 500;
 
 function safePositiveInteger(value: string): number {
   const parsed = Number(value);
@@ -103,6 +140,28 @@ export function createQualityRepository(
       return mapQualityIssue(row);
     },
 
+    async resolveAbsent(input) {
+      validateIdentity(input.accountId, true);
+      if (input.amoLeadIds.length === 0 || input.codes.length === 0) return 0;
+      if (input.amoLeadIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+        throw new AppError("E_VALIDATION", 422);
+      }
+      const observed = [...input.observed];
+      const rows = await db<{ id: string }[]>`
+        update public.data_quality_issues set
+          status = 'resolved',
+          resolved_at = ${input.resolvedAt ?? new Date()}
+        where account_id = ${input.accountId}
+          and status = 'open'
+          and amo_lead_id is not null
+          and amo_lead_id in ${db(input.amoLeadIds)}
+          and code in ${db(input.codes)}
+          and (amo_lead_id || ':' || code) <> all(${observed})
+        returning id
+      `;
+      return rows.length;
+    },
+
     async countOpen(leadKey, code) {
       validateIdentity(leadKey.accountId, true);
       validateIdentity(leadKey.amoLeadId);
@@ -118,4 +177,117 @@ export function createQualityRepository(
       return row.count;
     },
   };
+}
+
+function encodeCursor(issue: QualityIssue): string {
+  return Buffer.from(`${issue.lastSeenAt.toISOString()}|${issue.id}`).toString(
+    "base64url",
+  );
+}
+
+function decodeCursor(cursor: string): Readonly<{ lastSeenAt: Date; id: string }> {
+  const [seenAt, id] = Buffer.from(cursor, "base64url").toString("utf8").split("|");
+  const lastSeenAt = seenAt === undefined ? new Date(Number.NaN) : new Date(seenAt);
+  if (id === undefined || id === "" || Number.isNaN(lastSeenAt.getTime())) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  return { lastSeenAt, id };
+}
+
+/**
+ * Keyset page of quality issues, newest observation first. Payloads and source
+ * text never leave the raw layer: only safe columns are selected.
+ */
+export async function listQualityIssues(
+  db: NormalizedLeadDb,
+  filter: QualityIssueFilter = {},
+): Promise<QualityIssuePage> {
+  const pageSize = filter.pageSize ?? 25;
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_QUALITY_PAGE_SIZE) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  const after = filter.cursor ? decodeCursor(filter.cursor) : null;
+  const rows = await db<QualityIssueRow[]>`
+    select id, account_id, amo_lead_id, code, severity, status,
+      first_seen_at, last_seen_at
+    from public.data_quality_issues
+    where (${filter.code ?? null}::text is null or code = ${filter.code ?? null})
+      and (
+        ${filter.severity ?? null}::public.quality_severity is null
+        or severity = ${filter.severity ?? null}::public.quality_severity
+      )
+      and (
+        ${filter.status ?? null}::public.quality_status is null
+        or status = ${filter.status ?? null}::public.quality_status
+      )
+      and (
+        ${after?.lastSeenAt ?? null}::timestamptz is null
+        or (last_seen_at, id) < (${after?.lastSeenAt ?? null}, ${after?.id ?? null}::uuid)
+      )
+    order by last_seen_at desc, id desc
+    limit ${pageSize + 1}
+  `;
+  const page = rows.slice(0, pageSize).map(mapQualityIssue);
+  const last = page.at(-1);
+  return {
+    items: page,
+    nextCursor: rows.length > pageSize && last ? encodeCursor(last) : null,
+  };
+}
+
+/**
+ * Admin acceptance of a known exception (SPEC M5.3). The reason and the actor
+ * are stored as evidence; amoCRM and the raw journal are never touched, and a
+ * code the policy forbids can never be accepted.
+ */
+export async function acceptQualityIssue(
+  db: NormalizedLeadDb,
+  input: AcceptQualityIssueInput,
+): Promise<QualityIssue> {
+  const reason = input.reason.trim();
+  if (
+    reason.length < ACCEPTANCE_REASON_MIN
+    || reason.length > ACCEPTANCE_REASON_MAX
+  ) {
+    throw new AppError("E_VALIDATION", 422);
+  }
+  const [existing] = await db<{ code: string }[]>`
+    select code from public.data_quality_issues where id = ${input.issueId}
+  `;
+  if (!existing) throw new AppError("E_NOT_FOUND", 404);
+  if (!isAcceptableQualityCode(existing.code)) throw new AppError("E_CONFLICT", 409);
+
+  const acceptedAt = input.acceptedAt ?? new Date();
+  const [row] = await db<QualityIssueRow[]>`
+    update public.data_quality_issues set
+      status = 'accepted',
+      resolved_at = ${acceptedAt},
+      safe_details = safe_details || ${db.json({
+        acceptanceReason: reason,
+        acceptedBy: input.actorId,
+        acceptedAt: acceptedAt.toISOString(),
+      } as JSONValue)}
+    where id = ${input.issueId} and status = 'open'
+    returning id, account_id, amo_lead_id, code, severity, status,
+      first_seen_at, last_seen_at
+  `;
+  // No row means the issue was no longer open: the guarded update is what
+  // makes a second acceptance a conflict, including under a race.
+  if (!row) throw new AppError("E_CONFLICT", 409);
+  return mapQualityIssue(row);
+}
+
+/** Counters for the publication gate, keyed as `<code>_count`. */
+export async function summarizeOpenQualityIssues(
+  db: NormalizedLeadDb,
+): Promise<Readonly<Record<string, number>>> {
+  const rows = await db<{ code: string; count: number }[]>`
+    select code, count(*)::integer as count
+    from public.data_quality_issues
+    where status = 'open'
+    group by code
+  `;
+  const summary: Record<string, number> = {};
+  for (const row of rows) summary[`${row.code}_count`] = row.count;
+  return summary;
 }

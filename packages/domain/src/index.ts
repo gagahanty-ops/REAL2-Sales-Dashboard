@@ -50,6 +50,24 @@ export {
   type NormalizedChannel,
 } from "./leads/channel.js";
 export {
+  QUALITY_CODES,
+  QUALITY_CODE_POLICY,
+  isAcceptableQualityCode,
+  isQualityCode,
+  qualityCodeBlocks,
+  qualityCounterKey,
+  type QualityCode,
+  type QualityCodePolicy,
+  type QualityCounterKey,
+} from "./quality/codes.js";
+export {
+  emptyQualitySummary,
+  evaluateQualityGate,
+  type QualityGateOptions,
+  type QualityGateResult,
+  type QualitySummary,
+} from "./quality/gates.js";
+export {
   HISTORY_ISSUE_SEVERITY,
   buildLeadHistory,
   extractHistoryEvent,

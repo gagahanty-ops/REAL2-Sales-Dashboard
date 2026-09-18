@@ -114,10 +114,17 @@ export {
   type RawLeadSnapshot,
 } from "./normalize-run.js";
 export {
+  acceptQualityIssue,
   createQualityRepository,
+  listQualityIssues,
+  summarizeOpenQualityIssues,
+  type AcceptQualityIssueInput,
   type OpenQualityIssueInput,
   type QualityIssue,
+  type QualityIssueFilter,
+  type QualityIssuePage,
   type QualityRepository,
   type QualitySeverity,
   type QualityStatus,
+  type ResolveAbsentIssuesInput,
 } from "./quality.js";
