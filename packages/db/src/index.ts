@@ -116,6 +116,7 @@ export {
 export {
   approveSnapshot,
   createMetricSnapshot,
+  exportComparableRows,
   getCurrentSnapshot,
   getSnapshotByVersion,
   listSnapshotCells,
@@ -125,6 +126,8 @@ export {
   type MetricCellInput,
   type MetricLeadFactInput,
   type MetricSnapshot,
+  type ComparableMetricRow,
+  type ComparableSnapshotRows,
   type SnapshotCell,
   type SnapshotStatus,
   type SnapshotValidation,

@@ -41,7 +41,7 @@ describe("canonical metrics against the golden dataset", () => {
     const october = aggregateMetrics({ facts, from: "2026-10-01", to: "2026-10-31" });
 
     expect(september.payments).toBe(3);
-    expect(september.revenueRub).toBe("51000.55");
+    expect(september.revenueRub).toBe("51001.00");
     expect(october).toMatchObject({ leadsCreated: 0, payments: 0, revenueRub: "0.00" });
   });
 

@@ -19,7 +19,6 @@ import {
 
 export type BuildSnapshotDeps = Readonly<{
   db: Database;
-  now?(): Date;
 }>;
 
 const ALL = "all";
@@ -208,7 +207,6 @@ export async function buildMetricSnapshot(
   configId: string,
 ): Promise<MetricSnapshot> {
   const db = deps.db;
-  const now = deps.now?.() ?? new Date();
 
   const [run] = await db<{
     status: string;
@@ -232,6 +230,10 @@ export async function buildMetricSnapshot(
   `;
   if (!config) throw new AppError("E_NOT_FOUND", 404);
 
+  // Stage ages are measured against the instant the data was true, not the
+  // moment the builder happened to run: a snapshot must be a pure function of
+  // its input so an identical rebuild keeps the same checksum.
+  const sourceFreshAt = run.source_max_updated_at ?? run.finished_at ?? run.started_at;
   const accountId = safeInteger(run.account_id);
   const leadRows = await db<LeadRow[]>`
     select
@@ -337,7 +339,8 @@ export async function buildMetricSnapshot(
       const ages = rows
         .map((row) => row.last_stage_at)
         .filter((value): value is Date => value !== null)
-        .map((value) => Math.max(0, Math.round((now.getTime() - value.getTime()) / 1_000)));
+        .map((value) =>
+          Math.max(0, Math.round((sourceFreshAt.getTime() - value.getTime()) / 1_000)));
       return {
         statusId,
         statusName: statusNames.get(statusId) ?? `Статус ${statusId}`,
@@ -384,7 +387,7 @@ export async function buildMetricSnapshot(
   return createMetricSnapshot(db, {
     syncRunId,
     configId,
-    sourceFreshAt: run.source_max_updated_at ?? run.finished_at ?? run.started_at,
+    sourceFreshAt,
     checksum,
     qualitySummary,
     cells,

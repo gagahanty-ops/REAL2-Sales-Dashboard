@@ -470,3 +470,83 @@ export async function listSnapshotCells(
     revenue: row.revenue,
   }));
 }
+
+export type ComparableMetricRow = Readonly<{
+  key: string;
+  leadsCreated: number;
+  applications: number;
+  payments: number;
+  revenue: string;
+}>;
+
+export type ComparableSnapshotRows = Readonly<{
+  daily: readonly ComparableMetricRow[];
+  managers: readonly ComparableMetricRow[];
+  channels: readonly ComparableMetricRow[];
+}>;
+
+/**
+ * The stored evidence of one snapshot in a shape that can be compared with the
+ * golden expectations: integer counts and exact revenue, no derived ratios.
+ */
+export async function exportComparableRows(
+  db: Database,
+  snapshotId: string,
+): Promise<ComparableSnapshotRows> {
+  const rows = await db<CellRow[]>`
+    select report_date, manager_key, channel_key, leads_created, applications,
+      payments, revenue
+    from public.metric_cells
+    where snapshot_id = ${snapshotId}
+    order by report_date, manager_key, channel_key
+  `;
+
+  const daily = rows
+    .filter((row) => row.manager_key === "all" && row.channel_key === "all")
+    .map((row) => ({
+      key: dateKey(row.report_date),
+      leadsCreated: row.leads_created,
+      applications: row.applications,
+      payments: row.payments,
+      revenue: row.revenue,
+    }));
+
+  const fold = (
+    keyOf: (row: CellRow) => string,
+    include: (row: CellRow) => boolean,
+  ): readonly ComparableMetricRow[] => {
+    const totals = new Map<string, { leads: number; applications: number; payments: number; revenue: bigint }>();
+    for (const row of rows) {
+      if (!include(row)) continue;
+      const key = keyOf(row);
+      const sum = totals.get(key) ?? { leads: 0, applications: 0, payments: 0, revenue: 0n };
+      totals.set(key, {
+        leads: sum.leads + row.leads_created,
+        applications: sum.applications + row.applications,
+        payments: sum.payments + row.payments,
+        revenue: sum.revenue + kopecks(row.revenue),
+      });
+    }
+    return [...totals.entries()]
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, sum]) => ({
+        key,
+        leadsCreated: sum.leads,
+        applications: sum.applications,
+        payments: sum.payments,
+        revenue: `${sum.revenue / 100n}.${(sum.revenue % 100n).toString().padStart(2, "0")}`,
+      }));
+  };
+
+  return {
+    daily,
+    managers: fold(
+      (row) => row.manager_key,
+      (row) => row.channel_key === "all" && row.manager_key !== "all",
+    ),
+    channels: fold(
+      (row) => row.channel_key,
+      (row) => row.manager_key === "all" && row.channel_key !== "all",
+    ),
+  };
+}
