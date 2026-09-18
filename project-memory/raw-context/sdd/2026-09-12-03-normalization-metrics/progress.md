@@ -51,6 +51,12 @@
   - Quality API (list with gate, admin acceptance with evidence) and `/quality` page; `normalizeSyncRun` resolves issues that stopped appearing.
   - Gate: unit 384/384 plus repo/worker 16/16; integration 107/107; security 24/24; lint, typecheck, build, contracts, secret scan, `supabase db lint` clean.
 
+- Task 5: complete, full gate passed on 2026-09-19.
+  - Report `task-5-report.md`. Metric engine is pure: cohort by creation day, one lead once, payment needs current won status plus a confirmed won event, money in exact BigInt kopecks, ratios `null` on a zero base.
+  - Golden dataset covers all ten scenarios of METRICS_CATALOG section 13, including Moscow midnight and a repeated observation; ten contract checks assert month, daily, manager and channel rows.
+  - Seven injected mutations all detected.
+  - Gate: unit 409/409 plus repo/worker 16/16; contracts 10/10; integration 107/107; security 24/24; lint, typecheck, build and secret scan clean.
+
 ## Handoff notes for Task 3/4 (from Task 2 review)
 
 - `NormalizedLead.createdAt`/`sourceUpdatedAt`/`normalizedAt` are ISO strings; `UpsertLeadInput` expects `Date` for `createdAt`/`sourceUpdatedAt` — convert in `normalizeSyncRun`. `priceRub` (`Rubles`) is assignable to the repository's decimal string.
