@@ -47,9 +47,23 @@
 - The current sync worker does not request `with=source`, so `integration_source_exact` rules have no input until an approved worker change adds it.
 - Open owner question: METRICS_CATALOG §7 / SPEC M3.5 wording could state explicitly that a filled but unmapped source field yields `unknown` (ruling R1, confirmed by review) and that conflicts are evaluated within one source kind.
 
-## Окружение для DB-gate (2026-09-17, вечер)
+## Окружение для DB-gate (2026-09-17 → 2026-09-19)
 
-Supabase CLI 2.117.0, docker CLI 29.8.1, colima 0.10.3 и lima 2.2.0 установлены вручную в `~/.local`. Docker-движок не запущен: `colima start` на диске с 3 ГБ свободного места заполнил диск полностью (runbook требует 10 ГБ). Данные VM удалены, репозиторий проверен `git fsck` — повреждений нет. Запускать VM повторно только после освобождения 10+ ГБ.
+Supabase CLI 2.117.0, docker CLI 29.8.1, colima 0.10.3 и lima 2.2.0 установлены вручную в `~/.local`. Первая попытка запуска провалилась: `colima start` на диске с 3 ГБ свободного места заполнил диск полностью (runbook требует 10 ГБ). После освобождения восстановимых кэшей (12 ГБ свободно) VM и Supabase поднялись штатно.
+
+## DB-gate пройден (2026-09-19)
+
+`colima start --vm-type vz --cpu 2 --memory 3 --disk 12`, затем `supabase start`: все 10 миграций и сид применились без ошибок. Результаты на локальной БД:
+
+| Проверка | Результат |
+| --- | --- |
+| `pnpm test:integration` | 86/86, 9 файлов |
+| `pnpm test:security` | 24/24, 4 файла |
+| `pnpm test` | 333/333, 25 файлов |
+| `supabase db lint --fail-on error` | без ошибок схемы |
+| `pnpm lint`, `pnpm typecheck`, `pnpm build`, `pnpm test:contracts`, `pnpm check:secrets` | без замечаний |
+
+Ранее падавшие 16 тестов требовали только живую базу; после её появления они зелёные без единой правки кода. Задача 2 закрыта полным гейтом.
 
 ## Блокер доступа к GitHub (2026-09-17)
 
