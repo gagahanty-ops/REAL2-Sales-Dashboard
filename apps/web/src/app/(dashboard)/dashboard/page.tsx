@@ -16,12 +16,16 @@ import {
 } from "@real2/domain";
 
 import { AppShell } from "../../../components/app-shell";
+import { DailyTrend } from "../../../components/dashboard/daily-trend";
+import { KpiGrid } from "../../../components/dashboard/kpi-grid";
+import { PlanProgress } from "../../../components/dashboard/plan-progress";
 import { DataState } from "../../../components/data-state";
 import { FilterBar } from "../../../components/dashboard/filter-bar";
 import { FreshnessBanner } from "../../../components/dashboard/freshness-banner";
 import { requireRole } from "../../../lib/auth/authorization";
 import { requireUser } from "../../../lib/auth/require-user";
-import { dashboardHref } from "../../../lib/dashboard/filter-url";
+import { dashboardHref, filtersToSearchParams } from "../../../lib/dashboard/filter-url";
+import { formatPercent, formatRubles } from "../../../lib/dashboard/format";
 import { getDatabase } from "../../../lib/server/runtime";
 
 export const dynamic = "force-dynamic";
@@ -35,22 +39,6 @@ function toSearchParams(input: SearchParams): URLSearchParams {
     for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
   }
   return params;
-}
-
-function formatMoney(value: string): string {
-  const [whole, fraction = "00"] = value.split(".");
-  const grouped = (whole ?? "0").replace(/\B(?=(\d{3})+(?!\d))/gu, " ");
-  return `${grouped},${fraction} ₽`;
-}
-
-function formatRatio(value: number | null): string {
-  return value === null ? "—" : `${value.toString().replace(".", ",")} %`;
-}
-
-function formatDelta(value: number | null): string {
-  if (value === null) return "—";
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toString().replace(".", ",")} %`;
 }
 
 export default async function DashboardPage({
@@ -138,78 +126,29 @@ export default async function DashboardPage({
       >
         {overview ? (
           <>
-            <section className="kpi-grid">
-              {[
-                { label: "Лиды", value: String(overview.totals.leadsCreated), delta: overview.deltas?.leadsCreatedPct ?? null },
-                { label: "Заявки", value: String(overview.totals.applications), delta: overview.deltas?.applicationsPct ?? null },
-                { label: "Оплаты", value: String(overview.totals.payments), delta: overview.deltas?.paymentsPct ?? null },
-                { label: "Выручка", value: formatMoney(overview.totals.revenueRub), delta: overview.deltas?.revenuePct ?? null },
-              ].map((card) => (
-                <article className="kpi-card" key={card.label}>
-                  <h2>{card.label}</h2>
-                  <p className="kpi-value">{card.value}</p>
-                  <p className="kpi-delta">{formatDelta(card.delta)}</p>
-                </article>
-              ))}
-            </section>
+            <KpiGrid
+              totals={overview.totals}
+              deltas={overview.deltas}
+              drilldownHref={(metric) =>
+                `/drilldown?${filtersToSearchParams(filters).toString()}&metric=${metric}`}
+            />
 
-            <section>
+            <section aria-label="Конверсии">
               <h2>Конверсии</h2>
               <dl className="conversion-list">
                 <dt>Лид → заявка</dt>
-                <dd>{formatRatio(overview.totals.leadToApplicationPct)}</dd>
+                <dd>{formatPercent(overview.totals.leadToApplicationPct)}</dd>
                 <dt>Заявка → оплата</dt>
-                <dd>{formatRatio(overview.totals.applicationToPaymentPct)}</dd>
+                <dd>{formatPercent(overview.totals.applicationToPaymentPct)}</dd>
                 <dt>Лид → оплата</dt>
-                <dd>{formatRatio(overview.totals.leadToPaymentPct)}</dd>
+                <dd>{formatPercent(overview.totals.leadToPaymentPct)}</dd>
                 <dt>Средний чек</dt>
-                <dd>
-                  {overview.totals.averageOrderValueRub === null
-                    ? "—"
-                    : formatMoney(overview.totals.averageOrderValueRub)}
-                </dd>
+                <dd>{formatRubles(overview.totals.averageOrderValueRub)}</dd>
               </dl>
             </section>
 
-            {overview.plans.length > 0 ? (
-              <section>
-                <h2>План</h2>
-                <ul>
-                  {overview.plans.map((plan) => (
-                    <li key={plan.metricKey}>
-                      {plan.metricKey}: {plan.targetValue ?? "—"} (
-                      {formatRatio(plan.completionPct)})
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            ) : null}
-
-            <section>
-              <h2>По дням</h2>
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Дата</th>
-                    <th scope="col">Лиды</th>
-                    <th scope="col">Заявки</th>
-                    <th scope="col">Оплаты</th>
-                    <th scope="col">Выручка</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {overview.daily.map((point) => (
-                    <tr key={point.date}>
-                      <td>{point.date}</td>
-                      <td>{point.leadsCreated}</td>
-                      <td>{point.applications}</td>
-                      <td>{point.payments}</td>
-                      <td>{formatMoney(point.revenueRub)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </section>
+            <PlanProgress plans={overview.plans} />
+            <DailyTrend points={overview.daily} />
           </>
         ) : null}
       </DataState>
