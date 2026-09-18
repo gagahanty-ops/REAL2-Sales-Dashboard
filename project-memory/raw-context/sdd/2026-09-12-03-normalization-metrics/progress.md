@@ -57,6 +57,12 @@
   - Seven injected mutations all detected.
   - Gate: unit 409/409 plus repo/worker 16/16; contracts 10/10; integration 107/107; security 24/24; lint, typecheck, build and secret scan clean.
 
+- Task 6: complete, full gate passed on 2026-09-19. Report `task-6-report.md`.
+  - Migration `0011_metric_snapshots.sql` (not the plan's stale `0006`): snapshot content immutable by trigger, header limited to candidate→approved/rejected and approved→published, plan history never rewritten.
+  - `approveSnapshot` validates source run, active config, quality gate, funnel order and the cross-foot of every date in one transaction; a blocked candidate leaves the current pointer untouched.
+  - `buildMetricSnapshot` is idempotent by checksum and refuses to rebuild a run whose data changed.
+  - Gate: unit 409/409 plus repo/worker 16/16; contracts 10/10; integration 127/127; security 28/28; lint, typecheck, build, secret scan and `supabase db lint` clean.
+
 ## Handoff notes for Task 3/4 (from Task 2 review)
 
 - `NormalizedLead.createdAt`/`sourceUpdatedAt`/`normalizedAt` are ISO strings; `UpsertLeadInput` expects `Date` for `createdAt`/`sourceUpdatedAt` — convert in `normalizeSyncRun`. `priceRub` (`Rubles`) is assignable to the repository's decimal string.
