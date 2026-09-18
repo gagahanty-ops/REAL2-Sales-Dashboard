@@ -177,7 +177,12 @@ function maskPhones(name: string): string {
   );
 }
 
-function displayNameFor(name: string, amoLeadId: number): string {
+/**
+ * The name safe for dashboards, CSV, Sheets and immutable snapshots: a name
+ * that is mostly a phone number becomes the stable fallback, and any phone
+ * inside a longer name is masked.
+ */
+export function displayNameFor(name: string, amoLeadId: number): string {
   return isPhoneLike(name) ? fallbackName(amoLeadId) : maskPhones(name);
 }
 

@@ -27,6 +27,7 @@ export function AppShell({
               <Link href="/settings/channels">Каналы</Link>
               <Link href="/settings/integrations/amo">amoCRM</Link>
               <Link href="/settings/users">Пользователи</Link>
+              <Link href="/settings/plans">Планы</Link>
             </nav>
           ) : null}
           {user.role === "admin" || user.role === "head" ? (
@@ -34,6 +35,7 @@ export function AppShell({
               <Link href="/quality">Качество данных</Link>
               <Link href="/quality/config">Конфигурация</Link>
               <Link href="/sync">Синхронизации</Link>
+              <Link href="/snapshots/current">Снимок</Link>
             </>
           ) : null}
           <div className="user-identity">

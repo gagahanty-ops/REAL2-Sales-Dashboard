@@ -114,6 +114,31 @@ export {
   type RawLeadSnapshot,
 } from "./normalize-run.js";
 export {
+  approveSnapshot,
+  createMetricSnapshot,
+  getCurrentSnapshot,
+  getSnapshotByVersion,
+  listSnapshotCells,
+  rejectSnapshot,
+  validateSnapshot,
+  type CreateSnapshotInput,
+  type MetricCellInput,
+  type MetricLeadFactInput,
+  type MetricSnapshot,
+  type SnapshotCell,
+  type SnapshotStatus,
+  type SnapshotValidation,
+  type StageSnapshotRowInput,
+} from "./snapshots.js";
+export {
+  getCurrentSalesPlan,
+  listSalesPlans,
+  setSalesPlanTarget,
+  type PlanMetricKey,
+  type SalesPlan,
+  type SetSalesPlanInput,
+} from "./sales-plans.js";
+export {
   acceptQualityIssue,
   createQualityRepository,
   listQualityIssues,

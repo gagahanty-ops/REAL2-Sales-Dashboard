@@ -21,7 +21,9 @@ async function clearDatabaseFixtures(): Promise<void> {
     do $$
     begin
       if to_regclass('public.data_quality_issues') is not null then
-        execute 'truncate table public.data_quality_issues, public.lead_milestones,
+        execute 'truncate table public.current_snapshot, public.stage_snapshot_rows,
+          public.metric_lead_facts, public.metric_cells, public.metric_snapshots,
+          public.sales_plans, public.data_quality_issues, public.lead_milestones,
           public.lead_responsible_events, public.lead_stage_events, public.leads,
           public.pipeline_statuses, public.amo_users, public.amo_api_audit,
           public.raw_amo_quarantine, public.raw_amo_events, public.raw_amo_objects,
@@ -29,7 +31,9 @@ async function clearDatabaseFixtures(): Promise<void> {
           public.config_recalculation_requests, public.config_validations,
           public.channel_rules, public.pipeline_configs';
       else
-        execute 'truncate table public.amo_api_audit, public.raw_amo_quarantine,
+        execute 'truncate table public.current_snapshot, public.stage_snapshot_rows,
+          public.metric_lead_facts, public.metric_cells, public.metric_snapshots,
+          public.sales_plans, public.amo_api_audit, public.raw_amo_quarantine,
           public.raw_amo_events, public.raw_amo_objects, public.sync_pages,
           public.sync_cursors, public.sync_runs, public.config_recalculation_requests,
           public.config_validations, public.channel_rules, public.pipeline_configs';
@@ -631,6 +635,141 @@ describe("normalized lead RLS", () => {
         update public.lead_responsible_events
         set to_user_id = 999
         where account_id = 555151 and amo_event_id = 'responsible-7001'
+      `).rejects.toMatchObject({ code: "42501" });
+    } finally {
+      await closeDbClient(workerDb);
+    }
+  });
+});
+
+describe("metric snapshot and plan RLS", () => {
+  async function seedSnapshot(): Promise<string> {
+    const [connection] = await adminDb<{ id: string }[]>`
+      select id from public.amo_connections limit 1
+    `;
+    if (!connection) throw new Error("amoCRM fixture connection is missing");
+    const [config] = await adminDb<{ id: string }[]>`
+      insert into public.pipeline_configs (
+        amo_connection_id, pipeline_id, pipeline_name, application_status_id,
+        application_status_name, won_status_id, won_status_name, version,
+        is_active, confirmed_by
+      ) values (
+        ${connection.id}, 10, 'Pipeline', 20, 'Application', 30, 'Won', 1,
+        true, ${testUsers.admin.id}
+      ) returning id
+    `;
+    if (!config) throw new Error("pipeline configuration fixture is missing");
+    const [run] = await adminDb<{ id: string }[]>`
+      insert into public.sync_runs (
+        trace_id, connection_id, config_id, kind, status, started_at, finished_at
+      ) values (
+        ${`snapshot-rls-${Date.now()}`}, ${connection.id}, ${config.id},
+        'incremental', 'success', '2026-09-15T09:00:00Z', '2026-09-15T09:05:00Z'
+      ) returning id
+    `;
+    if (!run) throw new Error("sync run fixture is missing");
+    const [snapshot] = await adminDb<{ id: string }[]>`
+      insert into public.metric_snapshots (
+        sync_run_id, config_id, source_fresh_at, checksum, quality_summary
+      ) values (
+        ${run.id}, ${config.id}, '2026-09-15T09:00:00Z', ${"a".repeat(64)},
+        ${adminDb.json({})}
+      ) returning id
+    `;
+    if (!snapshot) throw new Error("snapshot fixture is missing");
+    await adminDb`
+      insert into public.metric_cells (
+        snapshot_id, report_date, manager_key, channel_key, leads_created,
+        applications, payments, revenue
+      ) values (${snapshot.id}, '2026-09-15', 'all', 'all', 2, 0, 0, 0)
+    `;
+    await adminDb`
+      insert into public.metric_lead_facts (
+        snapshot_id, account_id, amo_lead_id, display_name, report_date,
+        manager_key, manager_name, channel_key, current_status_id, currently_won,
+        amo_url
+      ) values
+        (${snapshot.id}, 555151, 7001, 'Сделка #7001', '2026-09-15', '101',
+          'Manager One', 'site', 20, false, 'https://555151.amocrm.ru/leads/7001'),
+        (${snapshot.id}, 555151, 7002, 'Сделка #7002', '2026-09-15', '102',
+          'Manager Two', 'site', 20, false, 'https://555151.amocrm.ru/leads/7002')
+    `;
+    await adminDb`
+      insert into public.sales_plans (
+        month, manager_key, metric_key, target_value, version, created_by
+      ) values
+        ('2026-09-01', '101', 'payments', 10, 1, ${testUsers.admin.id}),
+        ('2026-09-01', '102', 'payments', 12, 1, ${testUsers.admin.id})
+    `;
+    return snapshot.id;
+  }
+
+  async function visibleSnapshotCounts(authUserId: string) {
+    return adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role authenticated");
+      await transaction`
+        select set_config('request.jwt.claim.sub', ${authUserId}, true)
+      `;
+      const [counts] = await transaction<{
+        snapshots: number;
+        cells: number;
+        facts: number;
+        plans: number;
+      }[]>`
+        select
+          (select count(*)::integer from public.metric_snapshots) as snapshots,
+          (select count(*)::integer from public.metric_cells) as cells,
+          (select count(*)::integer from public.metric_lead_facts) as facts,
+          (select count(*)::integer from public.sales_plans) as plans
+      `;
+      if (!counts) throw new Error("snapshot counts are missing");
+      return counts;
+    });
+  }
+
+  it.each([testUsers.admin, testUsers.head])(
+    "$role reads every snapshot row",
+    async (user) => {
+      await seedSnapshot();
+      await expect(visibleSnapshotCounts(user.authUserId)).resolves.toEqual({
+        snapshots: 1,
+        cells: 1,
+        facts: 2,
+        plans: 2,
+      });
+    },
+  );
+
+  it("limits a manager to their own facts and plan and hides the snapshot header", async () => {
+    await seedSnapshot();
+    await expect(visibleSnapshotCounts(testUsers.managerOne.authUserId)).resolves.toEqual({
+      snapshots: 0,
+      cells: 0,
+      facts: 1,
+      plans: 1,
+    });
+  });
+
+  it("does not let the worker rewrite or delete snapshot evidence", async () => {
+    const snapshotId = await seedSnapshot();
+    const workerDb = createServiceWorkerDbClient(localServiceWorkerDatabaseUrl);
+
+    try {
+      await expect(workerDb`
+        update public.metric_cells set leads_created = 99
+        where snapshot_id = ${snapshotId}
+      `).rejects.toMatchObject({ code: "42501" });
+      await expect(workerDb`
+        delete from public.metric_lead_facts where snapshot_id = ${snapshotId}
+      `).rejects.toMatchObject({ code: "42501" });
+      await expect(workerDb`
+        update public.metric_snapshots set checksum = ${"b".repeat(64)}
+        where id = ${snapshotId}
+      `).rejects.toMatchObject({ code: "42501" });
+      await expect(workerDb`
+        insert into public.sales_plans (
+          month, manager_key, metric_key, target_value, version, created_by
+        ) values ('2026-10-01', 'all', 'payments', 5, 1, ${testUsers.admin.id})
       `).rejects.toMatchObject({ code: "42501" });
     } finally {
       await closeDbClient(workerDb);

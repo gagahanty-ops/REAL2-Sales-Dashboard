@@ -114,6 +114,7 @@ export {
 } from "./leads/build-history.js";
 export {
   LEAD_ISSUE_SEVERITY,
+  displayNameFor,
   normalizeLead,
   type LeadQualityCode,
   type LeadQualityIssueCandidate,
