@@ -50,6 +50,33 @@ export {
   type NormalizedChannel,
 } from "./leads/channel.js";
 export {
+  aggregateByChannel,
+  aggregateByManager,
+  aggregateDaily,
+  aggregateMetrics,
+  conversion,
+  deltaPct,
+  moneyAverage,
+  planCompletion,
+} from "./metrics/aggregate.js";
+export {
+  dateRangeLength,
+  eachDate,
+  formatDate,
+  isDateInRange,
+  previousPeriod,
+} from "./metrics/periods.js";
+export type {
+  AggregateInput,
+  ChannelMetricRow,
+  DailyMetricRow,
+  ManagerMetricRow,
+  MetricAggregate,
+  MetricDateRange,
+  MetricFilters,
+  MetricLeadFact,
+} from "./metrics/types.js";
+export {
   QUALITY_CODES,
   QUALITY_CODE_POLICY,
   isAcceptableQualityCode,

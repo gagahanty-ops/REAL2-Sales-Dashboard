@@ -24,3 +24,14 @@ export {
   buildRawLead,
   type RawLeadOverrides,
 } from "./lead-builders.js";
+export {
+  GOLDEN_DAILY_RANGE,
+  GOLDEN_RANGE,
+  goldenLeadFacts,
+} from "./golden/real2-golden.js";
+export {
+  goldenChannelRows,
+  goldenDailyRows,
+  goldenManagerRows,
+  goldenMonthTotals,
+} from "./golden/real2-golden.expected.js";
