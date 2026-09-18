@@ -103,6 +103,17 @@ export {
   type UpsertPipelineStatusInput,
 } from "./leads.js";
 export {
+  createNormalizeRunRepository,
+  type NormalizationRun,
+  type NormalizationWritePlan,
+  type NormalizationWriteResult,
+  type NormalizeRunRepository,
+  type NormalizedLeadWrite,
+  type RawEntitySnapshot,
+  type RawHistoryEventRow,
+  type RawLeadSnapshot,
+} from "./normalize-run.js";
+export {
   createQualityRepository,
   type OpenQualityIssueInput,
   type QualityIssue,

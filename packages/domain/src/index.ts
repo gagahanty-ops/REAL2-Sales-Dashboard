@@ -50,6 +50,24 @@ export {
   type NormalizedChannel,
 } from "./leads/channel.js";
 export {
+  HISTORY_ISSUE_SEVERITY,
+  buildLeadHistory,
+  extractHistoryEvent,
+  type BuildLeadHistoryInput,
+  type HistoryEventExtraction,
+  type LeadHistoryEvent,
+  type LeadHistoryIssueCandidate,
+  type LeadHistoryIssueCode,
+  type LeadHistoryResult,
+  type LeadMilestones,
+  type LeadResponsibility,
+  type LeadResponsibleEventRecord,
+  type LeadStageEventRecord,
+  type LeadStageStay,
+  type PipelineStatusOrder,
+  type RawHistoryEvent,
+} from "./leads/build-history.js";
+export {
   LEAD_ISSUE_SEVERITY,
   normalizeLead,
   type LeadQualityCode,
