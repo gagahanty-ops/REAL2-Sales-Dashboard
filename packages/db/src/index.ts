@@ -114,6 +114,34 @@ export {
   type RawLeadSnapshot,
 } from "./normalize-run.js";
 export {
+  withCurrentSnapshot,
+  type SnapshotMeta,
+} from "./dashboard/with-snapshot.js";
+export {
+  type DashboardQueryFilters,
+  type DashboardQueryScope,
+} from "./dashboard/cells.js";
+export {
+  getOverview,
+  type DashboardOverviewData,
+  type OverviewInput,
+} from "./dashboard/overview.js";
+export {
+  getManagerMetrics,
+  type ManagerMetricRow,
+  type ManagerMetrics,
+} from "./dashboard/managers.js";
+export {
+  getChannelMetrics,
+  type ChannelMetricRow as DashboardChannelRow,
+  type ChannelMetrics,
+} from "./dashboard/channels.js";
+export {
+  getFunnelMetrics,
+  type FunnelMetrics,
+  type FunnelStage,
+} from "./dashboard/funnel.js";
+export {
   approveSnapshot,
   createMetricSnapshot,
   exportComparableRows,
