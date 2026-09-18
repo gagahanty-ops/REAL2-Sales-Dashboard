@@ -44,6 +44,13 @@
   - Gate: lint, typecheck, build, contracts, secret scan, `supabase db lint` clean; `pnpm test` 366/366 plus repo/worker 16/16; integration 96/96; security 24/24.
   - Not wired into the schedule yet: no caller invokes `normalizeSyncRun`.
 
+- Task 4: complete, full gate passed on 2026-09-19.
+  - Brief `task-4-brief.md` (RQ1–RQ6), report `task-4-report.md`.
+  - `QUALITY_CODE_POLICY` unions all snapshot, timeline and operational codes; `evaluateQualityGate` blocks only policy-blocking codes and honours acceptance only for acceptable ones.
+  - SPEC M5.3 overrides the plan's pseudocode: `missing_stage_history` cannot be accepted.
+  - Quality API (list with gate, admin acceptance with evidence) and `/quality` page; `normalizeSyncRun` resolves issues that stopped appearing.
+  - Gate: unit 384/384 plus repo/worker 16/16; integration 107/107; security 24/24; lint, typecheck, build, contracts, secret scan, `supabase db lint` clean.
+
 ## Handoff notes for Task 3/4 (from Task 2 review)
 
 - `NormalizedLead.createdAt`/`sourceUpdatedAt`/`normalizedAt` are ISO strings; `UpsertLeadInput` expects `Date` for `createdAt`/`sourceUpdatedAt` — convert in `normalizeSyncRun`. `priceRub` (`Rubles`) is assignable to the repository's decimal string.
