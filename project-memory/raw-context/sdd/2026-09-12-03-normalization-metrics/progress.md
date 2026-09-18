@@ -36,6 +36,14 @@
   - Controller gate on 2026-09-17, Node v22.23.2, HEAD `4c46499`: lint, build, typecheck, contracts, tracked-secret scan and `git diff --check` passed. `pnpm test`: repo/worker 16/16, unit 317/333 (all domain/testkit/web/worker files green; the 16 failures are the DB-backed `packages/integrations/src/amo/oauth.test.ts`). `pnpm test:integration`: 12/86 run green (`transport.integration.test.ts`), the eight DB-backed files fail with `ECONNREFUSED 127.0.0.1:54322`. `pnpm test:security`: 5/24 green (static read-only import/method gates and log redaction), `rls.security.test.ts` fails on the same missing database.
   - Gate on 2026-09-17 was incomplete: `supabase db reset` and the DB-backed integration/security/unit suites cannot run on this host — no Docker runtime or Supabase CLI; Homebrew refuses installs until the owner updates the Xcode Command Line Tools (needs sudo); only ~2 GB disk is free and swap is exhausted. Task 2 touched no SQL, repository, integration, worker or web code, and the full gate was re-run successfully on 2026-09-19 (see below) before Task 3 started.
 
+- Task 3: complete, full gate passed on 2026-09-19 at `05958bb`.
+  - Brief `task-3-brief.md` (rulings R1–R14, R10 reversed and R13a added during implementation); report `task-3-report.md`.
+  - Domain `buildLeadHistory` + `extractHistoryEvent`: 33 new tests, seven injected mutations all detected.
+  - `packages/db/src/normalize-run.ts` and `apps/worker/src/jobs/normalize-sync-run.ts`: 10 integration tests on the live database, seven injected mutations all detected.
+  - Derived history stays append-only and nothing is deleted from the normalized layer; a stored lead that left the pipeline gets a blocking `out_of_scope_pipeline` issue instead.
+  - Gate: lint, typecheck, build, contracts, secret scan, `supabase db lint` clean; `pnpm test` 366/366 plus repo/worker 16/16; integration 96/96; security 24/24.
+  - Not wired into the schedule yet: no caller invokes `normalizeSyncRun`.
+
 ## Handoff notes for Task 3/4 (from Task 2 review)
 
 - `NormalizedLead.createdAt`/`sourceUpdatedAt`/`normalizedAt` are ISO strings; `UpsertLeadInput` expects `Date` for `createdAt`/`sourceUpdatedAt` — convert in `normalizeSyncRun`. `priceRub` (`Rubles`) is assignable to the repository's decimal string.
