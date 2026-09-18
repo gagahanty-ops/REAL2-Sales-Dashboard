@@ -23,3 +23,5 @@ supabase/.temp/
 *.key
 *service-account*.json
 *oauth*.json
+test-results/
+tests/e2e/.auth/
