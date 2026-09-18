@@ -21,6 +21,7 @@ export function AppShell({
           РЕАЛ ДВА
         </Link>
         <div className="header-actions">
+          <Link href="/dashboard">Обзор</Link>
           {user.role === "admin" ? (
             <nav className="app-nav" aria-label="Администрирование">
               <Link href="/settings/pipeline">Воронка</Link>
