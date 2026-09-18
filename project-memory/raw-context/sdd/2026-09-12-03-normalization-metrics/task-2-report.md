@@ -52,4 +52,17 @@
 | `pnpm check:secrets` | passed |
 | `git diff --check` | passed |
 
-The database part of the gate (reset + 86 integration + 24 security + 16 DB-backed unit tests) must be re-run on a host with Docker and the Supabase CLI before Task 3.
+## Completed controller gate (HEAD `1e4f22a`, 2026-09-19)
+
+The host now runs colima 0.10.3 (`--vm-type vz --cpu 2 --memory 3 --disk 12`) and Supabase CLI 2.117.0, so the database part of the gate ran in full.
+
+| Check | Result |
+|---|---|
+| `supabase start` | all ten migrations plus the seed applied |
+| `supabase db lint --fail-on error` | no schema errors |
+| `pnpm test:integration` | 86/86 in 9 files |
+| `pnpm test:security` | 24/24 in 4 files |
+| `pnpm test` | 333/333 in 25 files |
+| `pnpm lint`, `pnpm typecheck`, `pnpm build`, `pnpm test:contracts`, `pnpm check:secrets`, `git diff --check` | passed |
+
+The sixteen `oauth.test.ts` failures were missing-database failures only: they turned green with no code change. Task 2 is closed by a complete gate, and Task 3 may start.

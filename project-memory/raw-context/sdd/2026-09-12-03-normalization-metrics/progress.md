@@ -22,7 +22,7 @@
   - Fix round 1: `0ae530f65a02059a4535f628fd19daf1fe15c70f` (`fix: harden normalized lead repositories`).
   - Scoped re-review approved all five fixes with no remaining blocker.
   - Controller gate on 2026-09-17: database reset passed; integration 86/86; security 24/24; repo/worker 16/16; unit 110/110; lint, typecheck, production build, tracked-secret scan, and diff check passed.
-- Task 2: code complete, independently approved after two fix rounds; DB-backed controller gate pending on a capable host (started 2026-09-17).
+- Task 2: complete, independently approved after two fix rounds, full controller gate passed on 2026-09-19.
   - Actual start: clean `feat/foundation-access` at `2f50f23bbc67056c58c79a6eeb8a150ac23988d1` (`docs: embed complete project memory in source repository`); local HEAD, tracking ref and GitHub remote agreed.
   - Workspace moved to a new host: `/Users/ishop/Desktop/REAL2-Sales-Dashboard.nosync` (`~/Desktop/REAL2-Sales-Dashboard` is a symlink to it). The Desktop is synced by iCloud and, with the disk nearly full, macOS evicted repository, `.git` and `node_modules` files (`dataless`), which made lint/module loading fail at random. The `.nosync` suffix keeps the working copy local; the evicted clone had no unique work and was replaced.
   - Node `v22.23.2` from the official tarball at `~/.local/node22/bin` (Homebrew could not install `node@22` on this host); pnpm `10.34.5`.
@@ -34,7 +34,7 @@
   - Fix round 2: `4c46499` (`fix: mask phones with any common separator in lead names`) — N1 and N3. Scoped re-review: both verdicts APPROVED, no remaining findings.
   - Plan Task 2 Steps 1–5 marked complete after a fresh `pnpm vitest run packages/domain/src/leads` (127/127) and `pnpm test:contracts` (no contract files yet, exit 0).
   - Controller gate on 2026-09-17, Node v22.23.2, HEAD `4c46499`: lint, build, typecheck, contracts, tracked-secret scan and `git diff --check` passed. `pnpm test`: repo/worker 16/16, unit 317/333 (all domain/testkit/web/worker files green; the 16 failures are the DB-backed `packages/integrations/src/amo/oauth.test.ts`). `pnpm test:integration`: 12/86 run green (`transport.integration.test.ts`), the eight DB-backed files fail with `ECONNREFUSED 127.0.0.1:54322`. `pnpm test:security`: 5/24 green (static read-only import/method gates and log redaction), `rls.security.test.ts` fails on the same missing database.
-  - GATE NOT COMPLETE: `supabase db reset` and the DB-backed integration/security/unit suites cannot run on this host — no Docker runtime or Supabase CLI; Homebrew refuses installs until the owner updates the Xcode Command Line Tools (needs sudo); only ~2 GB disk is free and swap is exhausted. Task 2 touched no SQL, repository, integration, worker or web code, but the full gate must be re-run on a host with local Supabase before Task 3 starts.
+  - Gate on 2026-09-17 was incomplete: `supabase db reset` and the DB-backed integration/security/unit suites cannot run on this host — no Docker runtime or Supabase CLI; Homebrew refuses installs until the owner updates the Xcode Command Line Tools (needs sudo); only ~2 GB disk is free and swap is exhausted. Task 2 touched no SQL, repository, integration, worker or web code, and the full gate was re-run successfully on 2026-09-19 (see below) before Task 3 started.
 
 ## Handoff notes for Task 3/4 (from Task 2 review)
 
