@@ -137,6 +137,22 @@ export {
   type ChannelMetrics,
 } from "./dashboard/channels.js";
 export {
+  getDrilldown,
+  type DrilldownInput,
+  type DrilldownPosition,
+  type DrilldownResult,
+} from "./dashboard/drilldown.js";
+export {
+  getLeadDetail,
+  type LeadDetail,
+  type LeadDetailViewer,
+  type LeadStageHistoryEntry,
+} from "./dashboard/lead-detail.js";
+export {
+  getAttention,
+  type AttentionResult,
+} from "./dashboard/attention.js";
+export {
   getFunnelMetrics,
   type FunnelMetrics,
   type FunnelStage,

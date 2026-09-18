@@ -11,6 +11,10 @@ import { GET as GET_OVERVIEW } from "./overview/route";
 import { GET as GET_MANAGERS } from "./managers/route";
 import { GET as GET_CHANNELS } from "./channels/route";
 import { GET as GET_FUNNEL } from "./funnel/route";
+import { GET as GET_DRILLDOWN } from "./drilldown/route";
+import { GET as GET_ATTENTION } from "./attention/route";
+import { GET as GET_EXPORT } from "./export.csv/route";
+import { GET as GET_LEAD } from "../leads/[amoLeadId]/route";
 
 const adminDb = createAdminDb();
 const session = vi.hoisted(() => ({
@@ -28,7 +32,10 @@ vi.mock("../../../lib/auth/require-user", () => ({
 }));
 vi.mock("../../../lib/server/runtime", () => ({
   getDatabase: () => adminDb,
-  getServerEnv: () => ({ APP_URL: "https://dashboard.example.test" }),
+  getServerEnv: () => ({
+    APP_URL: "https://dashboard.example.test",
+    TOKEN_ENCRYPTION_KEY: "Xk0NO7yPo9bcFHK1ScxNu0dYfUkAsK0hZ0FLDlYA5Ss=",
+  }),
 }));
 
 const ORIGIN = "https://dashboard.example.test";
@@ -247,6 +254,96 @@ describe("dashboard API", () => {
 
     expect(response.status).toBe(503);
     expect(body.error?.code).toBe("E_CONFIG_INCOMPLETE");
+  });
+
+  it("pages the drill-down with a cursor bound to this snapshot and slice", async () => {
+    await seedApprovedSnapshot();
+
+    const first = await payload(
+      await GET_DRILLDOWN(request("drilldown", `${RANGE}&metric=payments&limit=1`)),
+    );
+    const data = first.data as never as { rows: unknown[]; nextCursor: string | null };
+    expect(data.rows).toHaveLength(1);
+    expect(data.nextCursor).toBeNull();
+
+    // A cursor minted for another slice must not silently move the page.
+    const foreign = await GET_DRILLDOWN(
+      request("drilldown", `${RANGE}&metric=payments&cursor=YWJj.ZGVm`),
+    );
+    expect(foreign.status).toBe(422);
+  });
+
+  it("refuses an unknown drill-down metric", async () => {
+    await seedApprovedSnapshot();
+
+    expect((await GET_DRILLDOWN(request("drilldown", `${RANGE}&metric=guesswork`))).status)
+      .toBe(422);
+  });
+
+  it("lists leads that need attention with their codes", async () => {
+    await seedApprovedSnapshot();
+    const body = await payload(await GET_ATTENTION(request("attention", RANGE)));
+
+    expect(body.ok).toBe(true);
+    expect(body.data).toMatchObject({ counters: {}, rows: [] });
+  });
+
+  it("exports the current slice as a semicolon CSV with a byte order mark", async () => {
+    await seedApprovedSnapshot();
+
+    const response = await GET_EXPORT(request("export.csv", RANGE));
+    const bytes = new Uint8Array(await response.clone().arrayBuffer());
+    const text = await response.text();
+
+    expect(response.headers.get("content-type")).toContain("text/csv");
+    expect(response.headers.get("content-disposition")).toContain("attachment");
+    expect(response.headers.get("x-snapshot-version")).toMatch(/^\d+$/);
+    // `Response.text()` strips the byte order mark, so the bytes are checked.
+    expect([...bytes.slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+    expect(text).toContain("Сделка #101");
+  });
+
+  it("exports only the manager's own leads", async () => {
+    await seedApprovedSnapshot();
+    session.user.role = "manager";
+    session.user.id = testUsers.managerOne.id;
+    session.user.amoUserId = MANAGER_TWO;
+
+    const text = await (await GET_EXPORT(request("export.csv", RANGE))).text();
+
+    expect(text).not.toContain("Сделка #101");
+  });
+
+  it("opens a lead card without raw payload and hides another manager's lead", async () => {
+    await seedApprovedSnapshot();
+    await adminDb`
+      insert into public.leads (
+        account_id, amo_lead_id, pipeline_id, current_status_id,
+        current_responsible_user_id, name, price_rub, created_at, created_date,
+        source_updated_at, normalized_channel, normalization_config_id, amo_url
+      )
+      select ${ACCOUNT_ID}, 101, 77, 772, ${MANAGER_ONE}, '+7 900 000-00-11', 1000,
+        '2026-09-05T09:00:00Z', '2026-09-05', '2026-09-05T09:30:00Z', 'site',
+        id, 'https://555151.amocrm.ru/leads/detail/101'
+      from public.pipeline_configs limit 1
+    `;
+
+    const leadContext = { params: Promise.resolve({ amoLeadId: "101" }) };
+    const card = await payload(await GET_LEAD(request("", ""), leadContext));
+    expect(card.data).toMatchObject({
+      amoLeadId: 101,
+      displayName: "Сделка #101",
+      amoUrl: "https://555151.amocrm.ru/leads/detail/101",
+    });
+    expect(JSON.stringify(card.data)).not.toContain("900 000-00-11");
+
+    session.user.role = "manager";
+    session.user.id = testUsers.managerOne.id;
+    session.user.amoUserId = MANAGER_TWO;
+    const hidden = await GET_LEAD(request("", ""), {
+      params: Promise.resolve({ amoLeadId: "101" }),
+    });
+    expect(hidden.status).toBe(404);
   });
 
   it("requires a session", async () => {
