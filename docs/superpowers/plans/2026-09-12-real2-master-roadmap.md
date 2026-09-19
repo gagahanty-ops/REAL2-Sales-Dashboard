@@ -63,6 +63,20 @@ Plans are executed in order. Within a plan, task order is normative because each
 5. **Publication gate:** protected ID, layout drift, checksum, and kill-switch tests pass before sharing a Google copy.
 6. **Production gate:** 7–14 complete shadow days reconcile with the manual report and have written owner approval.
 
+## Состояние на 2026-09-19
+
+Все пять планов реализованы и закрыты гейтами на локальном окружении. Открыт
+один шаг — теневая сверка плана 5: она требует установки интеграции amoCRM
+владельцем, боевых выгрузок ручного отчёта и 7–14 календарных дней, поэтому
+агент-исполнитель её не выполняет.
+
+Миграции пронумерованы подряд `0001`–`0012`; имена `0003_amo_configuration.sql`
+и `0004_raw_sync.sql` из плана 2 соответствуют файлам `0004_amo_configuration.sql`
+и `0005_raw_sync.sql`: порядок применения важнее иллюстративных имён.
+
+Оба внешних переключателя остаются `false`. Их включение — ручное решение
+владельца по `docs/runbooks/production-go-live.md`.
+
 ## Required evidence at completion
 
 - immutable commit SHA and lockfile hash;

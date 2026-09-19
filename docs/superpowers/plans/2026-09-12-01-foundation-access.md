@@ -66,7 +66,7 @@
 - Consumes: repository layout from the master roadmap.
 - Produces: root commands `lint`, `typecheck`, `test`, `test:contracts`, `test:integration`, `test:security`, `test:e2e`, and `build`; workspace package names `@real2/domain`, `@real2/db`, `@real2/integrations`, `@real2/testkit`.
 
-- [ ] **Step 1: Write the failing workspace test**
+- [x] **Step 1: Write the failing workspace test**
 
 ```js
 // tests/repo/workspace.test.mjs
@@ -88,13 +88,13 @@ test("pnpm discovers both apps and every shared package", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test and verify the missing root package failure**
+- [x] **Step 2: Run the test and verify the missing root package failure**
 
 Run: `npx --yes -p node@22.23.2 -p pnpm@10.34.5 node --test tests/repo/workspace.test.mjs`
 
 Expected: FAIL because pnpm cannot discover the seven expected workspace projects.
 
-- [ ] **Step 3: Create the workspace manifests and minimal processes**
+- [x] **Step 3: Create the workspace manifests and minimal processes**
 
 ```json
 {
@@ -132,13 +132,13 @@ packages:
 
 The web root renders `РЕАЛ ДВА — дашборд отдела продаж`; the worker `main.ts` exports `runWorkerOnce()` and performs no network call.
 
-- [ ] **Step 4: Install, test, typecheck, and build**
+- [x] **Step 4: Install, test, typecheck, and build**
 
 Run: `npx --yes -p node@22.23.2 -p pnpm@10.34.5 sh -c 'pnpm install && node --test tests/repo/workspace.test.mjs && pnpm typecheck && pnpm build'`
 
 Expected: every command exits 0 and `pnpm-lock.yaml` is created.
 
-- [ ] **Step 5: Commit the scaffold**
+- [x] **Step 5: Commit the scaffold**
 
 ```bash
 git add .nvmrc package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json vitest.config.ts apps packages tests/repo
@@ -161,7 +161,7 @@ git commit -m "build: scaffold REAL2 workspace"
 - Consumes: process environment as `Record<string, string | undefined>`.
 - Produces: `parseServerEnv(input): ServerEnv`, `ServerEnv`, and booleans `SYNC_ENABLED`, `SHEET_PUBLISH_ENABLED`.
 
-- [ ] **Step 1: Write failing environment tests**
+- [x] **Step 1: Write failing environment tests**
 
 ```ts
 import { describe, expect, it } from "vitest";
@@ -188,13 +188,13 @@ describe("parseServerEnv", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify missing implementation**
+- [x] **Step 2: Run the focused test and verify missing implementation**
 
 Run: `pnpm vitest run packages/domain/src/env.test.ts`
 
 Expected: FAIL because `./env` does not exist.
 
-- [ ] **Step 3: Implement the exact Zod contract**
+- [x] **Step 3: Implement the exact Zod contract**
 
 ```ts
 import { z } from "zod";
@@ -220,13 +220,13 @@ export function parseServerEnv(input: Record<string, string | undefined>): Serve
 
 `.env.example` contains key names and safe local examples only; amoCRM and Google secrets are absent until their plans.
 
-- [ ] **Step 4: Run contract checks**
+- [x] **Step 4: Run contract checks**
 
 Run: `pnpm vitest run packages/domain/src/env.test.ts && pnpm typecheck`
 
 Expected: PASS; malformed input error names the field but does not contain `secret-value` in application logs.
 
-- [ ] **Step 5: Commit configuration validation**
+- [x] **Step 5: Commit configuration validation**
 
 ```bash
 git add .env.example packages/domain apps/web/src/app/page.tsx apps/worker/src/main.ts
@@ -251,7 +251,7 @@ git commit -m "feat: validate server configuration"
 - Consumes: Supabase JWT `sub`; service DB URL.
 - Produces: `AppRole`, `AppUser`, `findAppUserByAuthId(authUserId)`, `requireActiveAppUser(authUserId)`, and `getSystemControl(key)`.
 
-- [ ] **Step 1: Write the failing RLS test against local Supabase**
+- [x] **Step 1: Write the failing RLS test against local Supabase**
 
 ```ts
 it("manager cannot read another manager row that already exists", async () => {
@@ -263,13 +263,13 @@ it("manager cannot read another manager row that already exists", async () => {
 });
 ```
 
-- [ ] **Step 2: Run the test and verify the missing relation failure**
+- [x] **Step 2: Run the test and verify the missing relation failure**
 
 Run: `pnpm test:integration -- packages/db/src/identity.integration.test.ts`
 
 Expected: FAIL with relation `app_users` missing.
 
-- [ ] **Step 3: Add the migration with explicit controls and RLS**
+- [x] **Step 3: Add the migration with explicit controls and RLS**
 
 ```sql
 create extension if not exists pgcrypto;
@@ -320,13 +320,13 @@ using (app.current_role() in ('admin', 'head'));
 
 Application roles receive no direct insert/update/delete policy. Administrative mutations use reviewed server functions with the service credential.
 
-- [ ] **Step 4: Implement repository functions and verify positive and negative access**
+- [x] **Step 4: Implement repository functions and verify positive and negative access**
 
 Run: `supabase db reset && pnpm test:integration -- packages/db/src/identity.integration.test.ts && pnpm test:security -- tests/security/rls.security.test.ts`
 
 Expected: admin/head read all permitted rows; manager reads only self; inactive and anonymous identities read none.
 
-- [ ] **Step 5: Commit identity schema and RLS**
+- [x] **Step 5: Commit identity schema and RLS**
 
 ```bash
 git add supabase/migrations/0001_identity_and_controls.sql packages/db tests/security/rls.security.test.ts
@@ -356,7 +356,7 @@ git commit -m "feat: add identity schema and deny-by-default RLS"
 - Consumes: `requireActiveAppUser(authUserId)` from Task 3.
 - Produces: `SessionUser = { id; email; fullName; role; amoUserId }`, `requireUser()`, `requireRole(...roles)`, login/logout/me endpoints, and `updatedAt`-checked user administration.
 
-- [ ] **Step 1: Write failing authorization tests**
+- [x] **Step 1: Write failing authorization tests**
 
 ```ts
 describe("requireRole", () => {
@@ -371,13 +371,13 @@ describe("requireRole", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify missing exports**
+- [x] **Step 2: Run the focused test and verify missing exports**
 
 Run: `pnpm vitest run apps/web/src/lib/auth/authorization.test.ts`
 
 Expected: FAIL because `requireRole` is not defined.
 
-- [ ] **Step 3: Implement server-derived authorization**
+- [x] **Step 3: Implement server-derived authorization**
 
 ```ts
 export function requireRole<R extends AppRole>(
@@ -399,13 +399,13 @@ export const loginRatePolicy = {
 
 The login handler checks the rate policy, passes email/password to Supabase server-side, then requires an active `app_users` row. All authentication failures return the same Russian message. User creation is admin-only, creates the Supabase identity and application row in compensating steps, and removes the auth identity if the application insert fails. Role/deactivation changes revoke all active sessions. The update transaction rejects deactivation/demotion of the last active admin and compares `expectedUpdatedAt` with the stored timestamp. `scripts/bootstrap-admin.ts` runs server-side once for normalized `BOOTSTRAP_ADMIN_EMAIL` and refuses to run after any admin exists. The users screen implements the four global states and changes its table to cards on mobile.
 
-- [ ] **Step 4: Test inactive, anonymous, manager, head, and admin flows**
+- [x] **Step 4: Test inactive, anonymous, manager, head, and admin flows**
 
 Run: `pnpm vitest run apps/web/src/lib/auth/authorization.test.ts apps/web/src/lib/auth/login-rate-limit.test.ts && pnpm test:integration -- apps/web/src/app/api/admin/users/users.integration.test.ts`
 
 Expected: PASS; fifth failed login blocks that email+IP for 15 minutes; manager receives 403 on admin routes; stale `expectedUpdatedAt` receives 409; the final admin cannot demote/deactivate self; role changes revoke prior sessions; no response exposes Supabase internals.
 
-- [ ] **Step 5: Commit authentication and authorization**
+- [x] **Step 5: Commit authentication and authorization**
 
 ```bash
 git add apps/web packages/domain packages/db
@@ -427,7 +427,7 @@ git commit -m "feat: add private role-scoped access"
 - Consumes: any authenticated route handler.
 - Produces: `AppError(code, status, safeMessage?)`, `withRoute(handler)`, `success(data, meta)`, `safeLogger`, and ULID `trace_id` propagation.
 
-- [ ] **Step 1: Write failing envelope and redaction tests**
+- [x] **Step 1: Write failing envelope and redaction tests**
 
 ```ts
 it("maps unknown failures without SQL or token leakage", async () => {
@@ -442,13 +442,13 @@ it("maps unknown failures without SQL or token leakage", async () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused tests and verify missing wrapper failure**
+- [x] **Step 2: Run the focused tests and verify missing wrapper failure**
 
 Run: `pnpm vitest run apps/web/src/lib/http/route.test.ts tests/security/log-redaction.security.test.ts`
 
 Expected: FAIL because `withRoute` and `safeLogger` do not exist.
 
-- [ ] **Step 3: Implement allowlisted structured logging**
+- [x] **Step 3: Implement allowlisted structured logging**
 
 ```ts
 const allowedLogKeys = new Set([
@@ -463,13 +463,13 @@ export function sanitizeLog(input: Record<string, unknown>) {
 
 `withRoute` creates or validates an incoming trace ID, catches `AppError`, maps unknown errors to `E_INTERNAL`, and always returns the exact envelopes in SPEC 0.4.
 
-- [ ] **Step 4: Run focused and repository tests**
+- [x] **Step 4: Run focused and repository tests**
 
 Run: `pnpm vitest run apps/web/src/lib/http/route.test.ts tests/security/log-redaction.security.test.ts && pnpm test && pnpm typecheck`
 
 Expected: PASS; captured logs contain no synthetic token, phone, full name, SQL text, query value, or raw payload.
 
-- [ ] **Step 5: Commit safe API infrastructure**
+- [x] **Step 5: Commit safe API infrastructure**
 
 ```bash
 git add packages/domain packages/testkit apps/web/src/lib tests/security
@@ -491,7 +491,7 @@ git commit -m "feat: add safe API envelopes and trace logging"
 - Consumes: root quality commands and validated env.
 - Produces: containers `web` and `worker`, public process-liveness endpoint, and CI artifact checks.
 
-- [ ] **Step 1: Write the failing liveness route test**
+- [x] **Step 1: Write the failing liveness route test**
 
 ```ts
 it("returns process liveness without dependency or secret details", async () => {
@@ -501,13 +501,13 @@ it("returns process liveness without dependency or secret details", async () => 
 });
 ```
 
-- [ ] **Step 2: Run the test and verify the route is missing**
+- [x] **Step 2: Run the test and verify the route is missing**
 
 Run: `pnpm vitest run apps/web/src/app/api/health/live/route.test.ts`
 
 Expected: FAIL because the route module does not exist.
 
-- [ ] **Step 3: Implement liveness, images, Compose, and CI**
+- [x] **Step 3: Implement liveness, images, Compose, and CI**
 
 ```yaml
 # docker-compose.yml
@@ -527,13 +527,13 @@ services:
 
 CI uses Node 22, Corepack, `pnpm install --frozen-lockfile`, lint, typecheck, test, security test, and build. It rejects tracked `.env`, PEM, OAuth JSON, or service-account JSON files.
 
-- [ ] **Step 4: Verify clean containers and CI-equivalent checks**
+- [x] **Step 4: Verify clean containers and CI-equivalent checks**
 
 Run: `pnpm lint && pnpm typecheck && pnpm test && pnpm test:security && pnpm build && docker compose config`
 
 Expected: all commands exit 0; resolved Compose keeps both switches false and contains no production secret.
 
-- [ ] **Step 5: Commit the foundation delivery**
+- [x] **Step 5: Commit the foundation delivery**
 
 ```bash
 git add Dockerfile.web Dockerfile.worker docker-compose.yml .github apps/web/src/app/api/health docs/runbooks/local-development.md

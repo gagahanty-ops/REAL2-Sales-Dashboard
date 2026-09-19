@@ -37,7 +37,7 @@
 - Consumes: `AmoTokenProvider.getAccessToken()` and an injected `fetchFn`.
 - Produces: `assertAmoRequestAllowed(input): NormalizedAmoRequest`, `amoFetch<T>(request): Promise<T>`, `AmoAuditSink.record(entry)`, and errors `E_AMO_METHOD_DENIED`, `E_AMO_PATH_DENIED`.
 
-- [ ] **Step 1: Write failing policy tests for allowed and forbidden requests**
+- [x] **Step 1: Write failing policy tests for allowed and forbidden requests**
 
 ```ts
 it.each([
@@ -65,13 +65,13 @@ it("denies an attacker-controlled host", () => {
 });
 ```
 
-- [ ] **Step 2: Run the policy test and verify the missing module failure**
+- [x] **Step 2: Run the policy test and verify the missing module failure**
 
 Run: `pnpm vitest run packages/integrations/src/amo/policy.test.ts`
 
 Expected: FAIL because `assertAmoRequestAllowed` does not exist.
 
-- [ ] **Step 3: Implement a closed allowlist and guarded transport**
+- [x] **Step 3: Implement a closed allowlist and guarded transport**
 
 ```ts
 const AMO_HOST = "555151.amocrm.ru";
@@ -103,13 +103,13 @@ export function assertAmoRequestAllowed(input: { method: string; url: string }):
 
 `amoFetch` calls this function before resolving a token or invoking `fetchFn`, sets `redirect: "error"`, validates JSON through a caller-supplied Zod schema, and writes only the safe audit fields.
 
-- [ ] **Step 4: Prove forbidden calls never reach the mock server**
+- [x] **Step 4: Prove forbidden calls never reach the mock server**
 
 Run: `pnpm vitest run packages/integrations/src/amo/policy.test.ts packages/integrations/src/amo/transport.integration.test.ts`
 
 Expected: PASS; mock ledger length remains 0 for forbidden method, path, host, protocol, and redirect cases.
 
-- [ ] **Step 5: Commit the guarded transport**
+- [x] **Step 5: Commit the guarded transport**
 
 ```bash
 git add packages/integrations
@@ -132,7 +132,7 @@ git commit -m "feat: enforce amoCRM read-only transport"
 - Consumes: `AMO_CLIENT_ID`, `AMO_CLIENT_SECRET`, `AMO_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`.
 - Produces: `createOAuthState(adminUserId)`, `consumeOAuthState(state)`, `exchangeAuthorizationCode(code)`, `refreshConnection(connectionId)`, `refreshDueConnections(now)`, and `AmoTokenProvider`.
 
-- [ ] **Step 1: Write failing single-use and redaction tests**
+- [x] **Step 1: Write failing single-use and redaction tests**
 
 ```ts
 it("consumes an OAuth state exactly once within ten minutes", async () => {
@@ -147,13 +147,13 @@ it("never serializes decrypted tokens", async () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify the storage functions are missing**
+- [x] **Step 2: Run tests and verify the storage functions are missing**
 
 Run: `pnpm vitest run packages/integrations/src/amo/oauth.test.ts`
 
 Expected: FAIL on missing OAuth modules.
 
-- [ ] **Step 3: Add OAuth tables and application encryption**
+- [x] **Step 3: Add OAuth tables and application encryption**
 
 ```sql
 create type connection_status as enum ('pending', 'active', 'reauth_required', 'disabled');
@@ -189,13 +189,13 @@ alter table amo_connections enable row level security;
 
 AES-256-GCM encrypts each token with a 32-byte key supplied by the secret store; each ciphertext blob includes its own random IV and authentication tag. The refresh transaction locks the connection row, exchanges the current refresh token, encrypts the new pair, updates `token_expires_at` and `refreshed_at`, and commits before returning an access token to server code. `refreshDueConnections(now)` selects active connections expiring within ten minutes and refreshes each under the same lock. A refresh failure sets `reauth_required` and prevents new sync runs. Disabled connections overwrite both ciphertext columns with cryptographically random bytes and set `disabled_at`; expired OAuth states are purged 24 hours after expiry.
 
-- [ ] **Step 4: Verify expiry, replay, rotation, concurrency, and log redaction**
+- [x] **Step 4: Verify expiry, replay, rotation, concurrency, and log redaction**
 
 Run: `supabase db reset && pnpm vitest run packages/integrations/src/amo/oauth.test.ts && pnpm test:security`
 
 Expected: PASS; expired/replayed states fail; proactive refresh starts at the ten-minute boundary; concurrent refresh makes one upstream POST; refresh failure sets `reauth_required`; logs contain no code or token.
 
-- [ ] **Step 5: Commit OAuth persistence**
+- [x] **Step 5: Commit OAuth persistence**
 
 ```bash
 git add supabase/migrations/0002_amo_oauth.sql packages/integrations packages/db packages/domain/src/env.ts apps/worker/src/jobs/refresh-amo-token.ts .env.example
@@ -217,7 +217,7 @@ git commit -m "feat: secure amoCRM OAuth credentials"
 - Consumes: OAuth functions from Task 2 and `requireRole(user, ['admin'])`.
 - Produces: M2.3 endpoints and a status page showing account ID, subdomain, connection status, and token expiry only.
 
-- [ ] **Step 1: Write a failing callback test for account binding**
+- [x] **Step 1: Write a failing callback test for account binding**
 
 ```ts
 it("rejects an OAuth result bound to a different account", async () => {
@@ -229,13 +229,13 @@ it("rejects an OAuth result bound to a different account", async () => {
 });
 ```
 
-- [ ] **Step 2: Run the integration test and verify routes are missing**
+- [x] **Step 2: Run the integration test and verify routes are missing**
 
 Run: `pnpm test:integration -- apps/web/src/app/api/integrations/amo/oauth.integration.test.ts`
 
 Expected: FAIL on missing callback route.
 
-- [ ] **Step 3: Implement exact routes and safe status UI**
+- [x] **Step 3: Implement exact routes and safe status UI**
 
 The callback performs, in order: active admin check, state consumption, code exchange, GET `/api/v4/account`, exact host/subdomain verification, encrypted save, and safe redirect. Disconnect changes only the local connection status and performs no amoCRM business request.
 
@@ -248,13 +248,13 @@ export const POST = withRoute(async (request) => {
 });
 ```
 
-- [ ] **Step 4: Verify auth, replay, wrong account, refresh, and disconnect**
+- [x] **Step 4: Verify auth, replay, wrong account, refresh, and disconnect**
 
 Run: `pnpm test:integration -- apps/web/src/app/api/integrations/amo/oauth.integration.test.ts && pnpm test:security`
 
 Expected: PASS; non-admin receives 403; credentials never appear in body, HTML, redirect, or captured logs.
 
-- [ ] **Step 5: Commit the OAuth administration flow**
+- [x] **Step 5: Commit the OAuth administration flow**
 
 ```bash
 git add apps/web/src/app/api/integrations apps/web/src/app/settings/integrations
@@ -282,7 +282,7 @@ git commit -m "feat: add external amoCRM OAuth administration"
 - Consumes: guarded GETs for pipelines, statuses, users, and lead custom fields.
 - Produces: `PipelineConfigCandidate`, `validatePipelineConfig(candidate, discovery)`, `validateChannelRules(rules)`, `activatePipelineConfig(candidate, actorId)`, and an active immutable `pipeline_configs.version`.
 
-- [ ] **Step 1: Write failing validation tests using the known candidate values**
+- [x] **Step 1: Write failing validation tests using the known candidate values**
 
 ```ts
 it("accepts only status IDs belonging to the selected pipeline", () => {
@@ -293,13 +293,13 @@ it("accepts only status IDs belonging to the selected pipeline", () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify missing configuration contract**
+- [x] **Step 2: Run tests and verify missing configuration contract**
 
 Run: `pnpm vitest run packages/domain/src/amo/config.test.ts`
 
 Expected: FAIL because config schemas/functions do not exist.
 
-- [ ] **Step 3: Add immutable config tables and deterministic rules**
+- [x] **Step 3: Add immutable config tables and deterministic rules**
 
 ```sql
 create table pipeline_configs (
@@ -368,13 +368,13 @@ export function validateChannelRules(rules: readonly ChannelRuleCandidate[]): vo
 }
 ```
 
-- [ ] **Step 4: Verify discovery uses only allowed GETs and activation is atomic**
+- [x] **Step 4: Verify discovery uses only allowed GETs and activation is atomic**
 
 Run: `supabase db reset && pnpm vitest run packages/domain/src/amo/config.test.ts && pnpm test:integration -- apps/web/src/app/api/config/config.integration.test.ts`
 
 Expected: PASS; ID/name mismatch returns `E_CONFIG_INCOMPLETE`; failed activation leaves the previous config active; no screenshot-derived ID is accepted without API confirmation.
 
-- [ ] **Step 5: Commit versioned pipeline configuration**
+- [x] **Step 5: Commit versioned pipeline configuration**
 
 ```bash
 git add supabase/migrations/0003_amo_configuration.sql packages/domain packages/db apps/web/src/app/api/config apps/web/src/app/settings/pipeline apps/web/src/app/settings/channels apps/web/src/app/quality/config
@@ -394,7 +394,7 @@ git commit -m "feat: validate REAL2 pipeline configuration"
 - Consumes: validated amoCRM response pages and `trace_id`.
 - Produces: `startSyncRun(type)`, `appendRawPage(runId, page)`, `finishSyncRun(runId, outcome)`, `quarantineRawPage(runId, reason, payloadHash)`, and durable cursors.
 
-- [ ] **Step 1: Write a failing idempotency and immutability test**
+- [x] **Step 1: Write a failing idempotency and immutability test**
 
 ```ts
 it("stores a repeated event once and forbids raw updates", async () => {
@@ -404,13 +404,13 @@ it("stores a repeated event once and forbids raw updates", async () => {
 });
 ```
 
-- [ ] **Step 2: Run the integration test and verify missing raw relations**
+- [x] **Step 2: Run the integration test and verify missing raw relations**
 
 Run: `pnpm test:integration -- packages/db/src/raw-amo.integration.test.ts`
 
 Expected: FAIL with missing `sync_runs` relation.
 
-- [ ] **Step 3: Add the M4 append-only schema and repository transactions**
+- [x] **Step 3: Add the M4 append-only schema and repository transactions**
 
 ```sql
 create type sync_kind as enum ('initial_backfill', 'incremental', 'nightly_reconciliation', 'manual');
@@ -524,13 +524,13 @@ export async function finishSyncRun(runId: string, outcome: SyncOutcome): Promis
 }
 ```
 
-- [ ] **Step 4: Verify duplicates, partial cursor rollback, audit shape, and RLS**
+- [x] **Step 4: Verify duplicates, partial cursor rollback, audit shape, and RLS**
 
 Run: `supabase db reset && pnpm test:integration -- packages/db/src/raw-amo.integration.test.ts && pnpm test:security`
 
 Expected: PASS; repeated payload/event does not duplicate; partial run retains diagnostics but the previous cursor; audit has no query values or body.
 
-- [ ] **Step 5: Commit the raw synchronization journal**
+- [x] **Step 5: Commit the raw synchronization journal**
 
 ```bash
 git add supabase/migrations/0004_raw_sync.sql packages/db packages/integrations/src/amo/schemas.ts
@@ -556,7 +556,7 @@ git commit -m "feat: persist append-only amoCRM sync journal"
 - Consumes: active connection/config, DB/env controls, guarded transport, raw repositories.
 - Produces: `runSync(kind, clock): Promise<SyncRunResult>`, schedules every five minutes and 02:30 Moscow reconciliation, plus M4.3 endpoints.
 
-- [ ] **Step 1: Write failing worker tests for disabled, complete, and partial runs**
+- [x] **Step 1: Write failing worker tests for disabled, complete, and partial runs**
 
 ```ts
 it("does not acquire a token or call the network when either switch is false", async () => {
@@ -574,13 +574,13 @@ it("does not advance cursors when page three fails after five retries", async ()
 });
 ```
 
-- [ ] **Step 2: Run worker tests and verify `runSync` is missing**
+- [x] **Step 2: Run worker tests and verify `runSync` is missing**
 
 Run: `pnpm vitest run apps/worker/src/jobs/amo-sync.test.ts`
 
 Expected: FAIL on missing worker job.
 
-- [ ] **Step 3: Implement ordered sync with advisory lock and deterministic retry**
+- [x] **Step 3: Implement ordered sync with advisory lock and deterministic retry**
 
 ```ts
 export async function runSync(kind: SyncKind, clock: Clock): Promise<SyncRunResult> {
@@ -604,13 +604,13 @@ Follow `_links.next` until absent; reject repeated page checksums. Retry 401 onc
 
 `sync-watchdog` marks a `running` run failed after 20 minutes and relies on connection close to release its advisory lock. `raw-retention` deletes raw payload/quarantine rows older than 90 days only after verifying normalized rows and stored hashes exist; it never deletes normalized history. The manual HTTP trigger returns 409 before network when another run owns the lock and requires confirmation in UI when the prior run started less than one minute ago.
 
-- [ ] **Step 4: Verify schedules, overlaps, loops, concurrent runs, and count-drop blocking**
+- [x] **Step 4: Verify schedules, overlaps, loops, concurrent runs, and count-drop blocking**
 
 Run: `pnpm vitest run apps/worker/src/jobs/amo-sync.test.ts && pnpm test:integration && pnpm test:security`
 
 Expected: PASS; one concurrent run gets `E_SYNC_LOCKED`; pagination loop fails; a full-count drop above 5% is critical; watchdog closes a 20-minute run; retention preserves hashes/history; disabled paths produce zero network calls.
 
-- [ ] **Step 5: Commit the synchronization worker and safe status screens**
+- [x] **Step 5: Commit the synchronization worker and safe status screens**
 
 ```bash
 git add apps/worker apps/web/src/app/api/sync-runs apps/web/src/app/sync packages/testkit
