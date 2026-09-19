@@ -1,10 +1,24 @@
 import { describe, expect, it } from "vitest";
 
-import { formatCreatedBy, formatMoscowDateTime, syncHistoryPagination } from "./sync-ui";
+import {
+  formatCreatedBy,
+  formatMoscowDateTime,
+  formatMoscowDateTimeCompact,
+  syncHistoryPagination,
+} from "./sync-ui";
 
 describe("sync UI helpers", () => {
   it("formats synchronization dates in Europe/Moscow", () => {
     expect(formatMoscowDateTime(new Date("2026-09-14T23:30:00.000Z"))).toContain("02:30");
+  });
+
+  it("packs a table timestamp into numeric Moscow date and time", () => {
+    expect(formatMoscowDateTimeCompact(new Date("2026-09-14T23:30:00.000Z")))
+      .toBe("15.09.2026, 02:30");
+  });
+
+  it("says a run is still going instead of printing an empty timestamp", () => {
+    expect(formatMoscowDateTimeCompact(null)).toBe("выполняется");
   });
 
   it("builds bounded sync history pagination links", () => {

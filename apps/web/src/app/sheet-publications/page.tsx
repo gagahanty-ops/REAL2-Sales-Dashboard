@@ -35,27 +35,34 @@ export default async function SheetPublicationsPage() {
     <AppShell user={user}>
       <div className="page-heading">
         <div>
+          <p className="eyebrow">Публикация в таблицу</p>
           <h1>История публикаций</h1>
-          <p>
+          <p className="muted">
             Каждая попытка сохраняется целиком: контрольная сумма того, что
             отправляли, отпечаток раскладки и код ошибки. Записи неизменяемы.
           </p>
         </div>
       </div>
 
-      <section>
+      <section className="panel">
         <h2>Переключатель</h2>
         <p>
           Публикация сейчас{" "}
-          <strong>{control?.enabled ? "включена" : "выключена"}</strong>.
-          {control?.reason ? ` Причина: ${control.reason}` : ""}
+          <span
+            className={control?.enabled ? "status-chip" : "status-chip inactive"}
+          >
+            {control?.enabled ? "включена" : "выключена"}
+          </span>
         </p>
+        {control?.reason ? (
+          <p className="muted">Причина: {control.reason}</p>
+        ) : null}
       </section>
 
       <section>
         <h2>Попытки</h2>
         {publications.length === 0 ? (
-          <p>Публикаций ещё не было.</p>
+          <p className="muted">Публикаций ещё не было.</p>
         ) : (
           <div className="table-scroll">
             <table className="metric-table">

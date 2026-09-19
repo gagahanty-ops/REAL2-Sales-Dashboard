@@ -30,18 +30,23 @@ export function DailyTrend({ points }: DailyTrendProps) {
         <svg
           className="daily-trend"
           viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
-          preserveAspectRatio="xMidYMax meet"
+          // Bars are rectangles, so stretching the box keeps them honest and
+          // lets the chart line up with the table it summarises.
+          preserveAspectRatio="none"
           role="img"
           aria-label={`Лиды по дням, максимум ${maximum}`}
         >
           {points.map((point, index) => {
             const height = (point.leadsCreated / maximum) * CHART_HEIGHT;
+            // A capped bar is centred in its slot; otherwise a short period
+            // leaves the bars sitting off to one side of the day they mean.
+            const width = Math.min(barWidth * 0.7, 48);
             return (
               <rect
                 key={point.date}
-                x={index * barWidth + barWidth * 0.15}
+                x={index * barWidth + (barWidth - width) / 2}
                 y={CHART_HEIGHT - height}
-                width={Math.min(barWidth * 0.7, 48)}
+                width={width}
                 height={height}
                 fill="currentColor"
               />
@@ -50,7 +55,7 @@ export function DailyTrend({ points }: DailyTrendProps) {
         </svg>
       ) : null}
       <div className="table-scroll">
-        <table>
+        <table className="metric-table">
           <caption className="visually-hidden">
             Лиды, заявки, оплаты и выручка по дням
           </caption>

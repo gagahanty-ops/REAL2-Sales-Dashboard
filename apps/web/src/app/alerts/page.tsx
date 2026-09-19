@@ -4,10 +4,11 @@ import { listAlerts } from "@real2/db";
 
 import { AlertAcknowledgeButton } from "../../components/alert-acknowledge-button";
 import { AppShell } from "../../components/app-shell";
+import { alertCodeLabel, alertSourceLabel } from "../../lib/alerts/labels";
 import { requireRole } from "../../lib/auth/authorization";
 import { requireUser } from "../../lib/auth/require-user";
 import { getDatabase } from "../../lib/server/runtime";
-import { formatMoscowDateTime } from "../../lib/sync-ui";
+import { formatMoscowDateTimeCompact } from "../../lib/sync-ui";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +23,17 @@ const STATUS_LABEL = {
   acknowledged: "Принято к сведению",
   resolved: "Закрыто",
 } as const;
+
+const STATUS_FILTERS = [
+  { label: "Все", href: "/alerts", status: undefined },
+  { label: "Открытые", href: "/alerts?status=open", status: "open" },
+  {
+    label: "Принятые к сведению",
+    href: "/alerts?status=acknowledged",
+    status: "acknowledged",
+  },
+  { label: "Закрытые", href: "/alerts?status=resolved", status: "resolved" },
+] as const;
 
 export default async function AlertsPage({
   searchParams,
@@ -43,8 +55,9 @@ export default async function AlertsPage({
     <AppShell user={user}>
       <div className="page-heading">
         <div>
+          <p className="eyebrow">Дежурство</p>
           <h1>Оповещения</h1>
-          <p>
+          <p className="muted">
             Одно оповещение на источник и код: повтор увеличивает счётчик, а не
             плодит строки. Отметка «я увидел» фиксирует, кто посмотрел, и не
             закрывает причину.
@@ -52,24 +65,29 @@ export default async function AlertsPage({
         </div>
       </div>
 
-      <nav aria-label="Фильтр оповещений">
-        <a href="/alerts">Все</a> · <a href="/alerts?status=open">Открытые</a> ·{" "}
-        <a href="/alerts?status=acknowledged">Принятые к сведению</a> ·{" "}
-        <a href="/alerts?status=resolved">Закрытые</a>
+      <nav className="filter-links" aria-label="Фильтр оповещений">
+        {STATUS_FILTERS.map((filter) => (
+          <a
+            key={filter.label}
+            href={filter.href}
+            aria-current={filter.status === status ? "page" : undefined}
+          >
+            {filter.label}
+          </a>
+        ))}
       </nav>
 
       <section>
         <h2>Список</h2>
         {alerts.length === 0 ? (
-          <p>Оповещений нет.</p>
+          <p className="muted">Оповещений нет.</p>
         ) : (
           <div className="table-scroll">
             <table className="metric-table">
               <caption>Оповещения системы</caption>
               <thead>
                 <tr>
-                  <th scope="col">Код</th>
-                  <th scope="col">Источник</th>
+                  <th scope="col">Что случилось</th>
                   <th scope="col">Важность</th>
                   <th scope="col">Статус</th>
                   <th scope="col">Что произошло</th>
@@ -81,13 +99,15 @@ export default async function AlertsPage({
               <tbody>
                 {alerts.map((alert) => (
                   <tr key={alert.id}>
-                    <th scope="row">{alert.code}</th>
-                    <td>{alert.source}</td>
+                    <th className="wrap-cell" scope="row">
+                      {alertCodeLabel(alert.code)}
+                      <span className="cell-note">{alertSourceLabel(alert.source)}</span>
+                    </th>
                     <td>{SEVERITY_LABEL[alert.severity]}</td>
                     <td>{STATUS_LABEL[alert.status]}</td>
-                    <td>{alert.safeSummary}</td>
+                    <td className="wrap-cell">{alert.safeSummary}</td>
                     <td>{alert.occurrenceCount}</td>
-                    <td>{formatMoscowDateTime(alert.lastSeenAt)}</td>
+                    <td>{formatMoscowDateTimeCompact(alert.lastSeenAt)}</td>
                     <td>
                       <AlertAcknowledgeButton
                         alertId={alert.id}

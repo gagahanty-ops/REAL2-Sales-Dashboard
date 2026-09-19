@@ -29,7 +29,7 @@ export function PlanProgress({ plans }: Readonly<{ plans: readonly PlanProgressV
     <section aria-label="План">
       <h2>План и факт</h2>
       <div className="table-scroll">
-        <table>
+        <table className="metric-table">
           <thead>
             <tr>
               <th scope="col">Показатель</th>

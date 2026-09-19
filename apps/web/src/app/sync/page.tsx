@@ -64,7 +64,7 @@ export default async function SyncRunsPage({
         <h2>История</h2>
         <div className="config-table-wrap">
           <table className="config-table">
-            <thead><tr><th>Начало</th><th>Тип</th><th>Статус</th><th>Кем</th><th>Страницы</th><th>Лиды</th><th>События</th><th>Retries</th></tr></thead>
+            <thead><tr><th>Начало</th><th>Тип</th><th>Статус</th><th>Кем</th><th>Страницы</th><th>Лиды</th><th>События</th><th>Повторы</th></tr></thead>
             <tbody>
               {history.items.map((run) => (
                 <tr key={run.id}>

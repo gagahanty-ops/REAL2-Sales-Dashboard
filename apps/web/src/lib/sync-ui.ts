@@ -7,6 +7,22 @@ export function formatMoscowDateTime(value: Date | null): string {
   }).format(value);
 }
 
+/**
+ * A table row has to fit next to its action button, so the long month name is
+ * traded for digits; the spelled-out form stays for headings and cards.
+ */
+export function formatMoscowDateTimeCompact(value: Date | null): string {
+  if (!value) return "выполняется";
+  return new Intl.DateTimeFormat("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Europe/Moscow",
+  }).format(value);
+}
+
 export function formatCreatedBy(value: string | null): string {
   return value ? `ID ${value}` : "Система";
 }

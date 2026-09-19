@@ -834,3 +834,68 @@ p {
   border-radius: 0.5rem;
   padding: 0.6rem;
 }
+
+/*
+ * Every screen is built from sections inside .content, so the rhythm belongs
+ * here rather than in each page: a page that adds a section gets the spacing
+ * for free instead of shipping headings glued to their text.
+ */
+.content > section {
+  margin-bottom: 24px;
+}
+
+.content > section > h2 {
+  margin-top: 0;
+}
+
+.filter-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.filter-links a {
+  padding: 0.25rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.filter-links a:hover {
+  background: var(--panel-strong);
+}
+
+.filter-links a[aria-current="page"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/*
+ * One column carries a sentence; keeping it on a single line pushed the row's
+ * action button out of view, so the sentence wraps and the row still fits.
+ */
+.metric-table td.wrap-cell,
+.metric-table th.wrap-cell {
+  white-space: normal;
+  text-align: left;
+}
+
+.metric-table td.wrap-cell {
+  min-width: 11rem;
+  max-width: 17rem;
+}
+
+.metric-table th.wrap-cell {
+  max-width: 10rem;
+}
+
+.metric-table .cell-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 400;
+}

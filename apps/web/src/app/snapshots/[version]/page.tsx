@@ -8,8 +8,10 @@ import {
 } from "@real2/db";
 
 import { AppShell } from "../../../components/app-shell";
+import { qualityLabel } from "../../../components/dashboard/attention-panel";
 import { requireRole } from "../../../lib/auth/authorization";
 import { requireUser } from "../../../lib/auth/require-user";
+import { formatCount, formatDate, formatRubles } from "../../../lib/dashboard/format";
 import { getDatabase } from "../../../lib/server/runtime";
 import { formatMoscowDateTime } from "../../../lib/sync-ui";
 
@@ -53,42 +55,51 @@ export default async function SnapshotPage({
     <AppShell user={user}>
       <div className="page-heading">
         <div>
+          <p className="eyebrow">Снимок метрик</p>
           <h1>Снимок №{snapshot.version}</h1>
-          <p>
+          <p className="muted">
             {STATUS_LABEL[snapshot.status]}, собран{" "}
             {formatMoscowDateTime(snapshot.generatedAt)}
           </p>
         </div>
       </div>
 
-      <section>
+      <section className="panel">
         <h2>Неизменяемые реквизиты</h2>
-        <dl>
-          <dt>Контрольная сумма</dt>
-          <dd>{snapshot.checksum}</dd>
-          <dt>Исходный прогон</dt>
-          <dd>{snapshot.syncRunId}</dd>
-          <dt>Версия конфигурации</dt>
-          <dd>{snapshot.configId}</dd>
-          <dt>Свежесть источника</dt>
-          <dd>{formatMoscowDateTime(snapshot.sourceFreshAt)}</dd>
+        <dl className="quality-list">
+          <div className="checksum-row">
+            <dt>Контрольная сумма</dt>
+            <dd>{snapshot.checksum}</dd>
+          </div>
+          <div>
+            <dt>Исходный прогон</dt>
+            <dd>{snapshot.syncRunId}</dd>
+          </div>
+          <div>
+            <dt>Версия конфигурации</dt>
+            <dd>{snapshot.configId}</dd>
+          </div>
+          <div>
+            <dt>Свежесть источника</dt>
+            <dd>{formatMoscowDateTime(snapshot.sourceFreshAt)}</dd>
+          </div>
         </dl>
       </section>
 
-      <section>
+      <section className="panel">
         <h2>Проверка перед публикацией</h2>
-        <p>
+        <p className="muted">
           {validation.approved
             ? "Сведение сходится, блокирующих проблем нет."
             : `Не пройдена: ${validation.failures.join(", ")}`}
         </p>
         {openIssues.length === 0 ? (
-          <p>Открытых проблем качества нет.</p>
+          <p className="muted">Открытых проблем качества нет.</p>
         ) : (
-          <ul>
+          <ul className="quality-counters">
             {openIssues.map(([code, count]) => (
               <li key={code}>
-                {code}: {count}
+                {qualityLabel(code.replace(/_count$/u, ""))}: {formatCount(count)}
               </li>
             ))}
           </ul>
@@ -98,30 +109,33 @@ export default async function SnapshotPage({
       <section>
         <h2>Итоги по дням</h2>
         {totals.length === 0 ? (
-          <p>В снимке нет строк.</p>
+          <p className="muted">В снимке нет строк.</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th scope="col">Дата</th>
-                <th scope="col">Лиды</th>
-                <th scope="col">Заявки</th>
-                <th scope="col">Оплаты</th>
-                <th scope="col">Выручка</th>
-              </tr>
-            </thead>
-            <tbody>
-              {totals.map((cell) => (
-                <tr key={cell.reportDate}>
-                  <td>{cell.reportDate}</td>
-                  <td>{cell.leadsCreated}</td>
-                  <td>{cell.applications}</td>
-                  <td>{cell.payments}</td>
-                  <td>{cell.revenue}</td>
+          <div className="table-scroll">
+            <table className="metric-table">
+              <caption>Дневные итоги утверждённого снимка</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Дата</th>
+                  <th scope="col">Лиды</th>
+                  <th scope="col">Заявки</th>
+                  <th scope="col">Оплаты</th>
+                  <th scope="col">Выручка</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {totals.map((cell) => (
+                  <tr key={cell.reportDate}>
+                    <th scope="row">{formatDate(cell.reportDate)}</th>
+                    <td>{formatCount(cell.leadsCreated)}</td>
+                    <td>{formatCount(cell.applications)}</td>
+                    <td>{formatCount(cell.payments)}</td>
+                    <td>{formatRubles(cell.revenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </section>
     </AppShell>
