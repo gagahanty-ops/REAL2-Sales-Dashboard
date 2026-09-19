@@ -62,12 +62,15 @@
 | `pnpm test:e2e` | 22/22 |
 | `supabase db lint --fail-on error`, `git diff --check` | passed |
 
-## Known interference
+## Known interference (fixed on 2026-09-19)
 
-Running the unit suite while the Playwright web server is still up made the 16
-database-backed `oauth.test.ts` checks fail on connection pressure. Two clean
-runs afterwards passed 483/483. Run the browser gate separately from the unit
-gate, or stop the server first.
+Running the unit suite after the browser gate made the 16 database-backed
+`oauth.test.ts` checks fail: the gate left its fixtures in the shared local
+database, and the unit test's `delete from amo_connections` hit a foreign key
+from the leftover pipeline configuration. A Playwright teardown project now
+clears those fixtures after the dashboard suite, so suite order no longer
+matters. Verified by running the complete gate in one sequence: unit 557/557,
+contracts 24/24, integration 206/206, security 33/33, e2e 23/23.
 
 ## What Plan 4 does not include
 
