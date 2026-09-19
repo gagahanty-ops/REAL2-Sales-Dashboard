@@ -205,6 +205,43 @@ export async function activateSheetTarget(
   });
 }
 
+export async function listSheetTargets(db: Database): Promise<readonly SheetTarget[]> {
+  const rows = await db<TargetRow[]>`
+    select id, spreadsheet_id, expected_title, status, layout_fingerprint,
+      validated_at, activated_by, activated_at
+    from public.sheet_targets
+    order by created_at desc
+  `;
+  return rows.map(mapTarget);
+}
+
+export async function getSheetTarget(
+  db: Database,
+  targetId: string,
+): Promise<SheetTarget | null> {
+  const [row] = await db<TargetRow[]>`
+    select id, spreadsheet_id, expected_title, status, layout_fingerprint,
+      validated_at, activated_by, activated_at
+    from public.sheet_targets where id = ${targetId}
+  `;
+  return row ? mapTarget(row) : null;
+}
+
+/** A structural change disables the target: publication must never guess. */
+export async function disableSheetTarget(
+  db: Database,
+  targetId: string,
+): Promise<SheetTarget> {
+  const [row] = await db<TargetRow[]>`
+    update public.sheet_targets set status = 'disabled'
+    where id = ${targetId} and status <> 'disabled'
+    returning id, spreadsheet_id, expected_title, status, layout_fingerprint,
+      validated_at, activated_by, activated_at
+  `;
+  if (!row) throw new AppError("E_CONFLICT", 409);
+  return mapTarget(row);
+}
+
 export async function getActiveSheetTarget(db: Database): Promise<SheetTarget | null> {
   const [row] = await db<TargetRow[]>`
     select id, spreadsheet_id, expected_title, status, layout_fingerprint,
@@ -220,7 +257,7 @@ export type ReplaceLayoutMappingInput = Readonly<{
   sheetName: string;
   rangeA1: string;
   valueType: SheetValueType;
-  required?: boolean;
+  required?: boolean | undefined;
 }>;
 
 /** Mappings are explicit: a range outside this list is never written. */

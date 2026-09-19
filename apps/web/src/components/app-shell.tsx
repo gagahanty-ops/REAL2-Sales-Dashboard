@@ -35,6 +35,7 @@ export function AppShell({
               <Link href="/settings/integrations/amo">amoCRM</Link>
               <Link href="/settings/users">Пользователи</Link>
               <Link href="/settings/plans">Планы</Link>
+              <Link href="/settings/google-sheet">Публикация</Link>
             </nav>
           ) : null}
           {user.role === "admin" || user.role === "head" ? (

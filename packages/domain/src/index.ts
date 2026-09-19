@@ -50,6 +50,16 @@ export {
   type NormalizedChannel,
 } from "./leads/channel.js";
 export {
+  REQUIRED_MAPPING_FIELDS,
+  mappingIsComplete,
+  parseA1Range,
+  rangesOverlap,
+  validateMapping,
+  type A1Range,
+  type MappingCandidate,
+  type SheetGridLayout,
+} from "./sheets/mapping.js";
+export {
   DASHBOARD_DRILLDOWN_METRICS,
   attentionSchema,
   channelsTableSchema,

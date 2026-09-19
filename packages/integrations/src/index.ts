@@ -71,3 +71,10 @@ export {
   type CreateGoogleSheetClientOptions,
   type GoogleEndpoints,
 } from "./google/client.js";
+export {
+  computeLayoutFingerprint,
+  layoutMatchesFingerprint,
+  validateInitialLayout,
+  type LayoutExpectation,
+  type LayoutValidation,
+} from "./google/layout.js";
