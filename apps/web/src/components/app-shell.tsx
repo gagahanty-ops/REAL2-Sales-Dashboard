@@ -44,6 +44,7 @@ export function AppShell({
               <Link href="/quality/config">Конфигурация</Link>
               <Link href="/sync">Синхронизации</Link>
               <Link href="/snapshots/current">Снимок</Link>
+              <Link href="/system">Система</Link>
             </>
           ) : null}
           <div className="user-identity">

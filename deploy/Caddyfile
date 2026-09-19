@@ -1,0 +1,26 @@
+# Caddy terminates HTTPS and is the only entry point. It sets the headers the
+# application trusts and strips whatever a client tried to send in them.
+{$REAL2_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	# The application reads only these two; a client-supplied value never wins.
+	request_header -X-Real2-Proxy-Secret
+	request_header -X-Real-IP
+	request_header X-Real2-Proxy-Secret {$REAL2_PROXY_SECRET}
+	request_header X-Real-IP {remote_host}
+
+	reverse_proxy web:3000
+
+	log {
+		output stdout
+		format json
+	}
+}

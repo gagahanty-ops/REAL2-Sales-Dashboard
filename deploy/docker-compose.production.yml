@@ -1,0 +1,43 @@
+# Production deployment of REAL2. Both external switches stay unset here on
+# purpose: enabling synchronization or Sheet publication is a manual decision
+# made in the secret files and in the database, never in a deployment file.
+services:
+  web:
+    image: ${REAL2_WEB_IMAGE:?image digest required}
+    restart: unless-stopped
+    env_file: [/etc/real2/web.env]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp"]
+    expose: ["3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health/live').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on: []
+
+  worker:
+    image: ${REAL2_WORKER_IMAGE:?image digest required}
+    restart: unless-stopped
+    env_file: [/etc/real2/worker.env]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp"]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [web]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  caddy_data:
+  caddy_config:
