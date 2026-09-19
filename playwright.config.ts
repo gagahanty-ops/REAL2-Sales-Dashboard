@@ -27,10 +27,13 @@ export default defineConfig({
   },
   projects: [
     { name: "setup", testMatch: /auth\.setup\.ts/ },
+    { name: "cleanup", testMatch: /cleanup\.teardown\.ts/ },
     {
       name: "dashboard",
       testMatch: /.*\.spec\.ts/,
       dependencies: ["setup"],
+      // The shared local database is left as the run found it.
+      teardown: "cleanup",
     },
   ],
   webServer: {
