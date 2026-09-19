@@ -4,7 +4,7 @@ import { getDrilldown } from "@real2/db";
 import { drilldownMetricSchema } from "@real2/domain";
 
 import { AppShell } from "../../../components/app-shell";
-import { AttentionPanel } from "../../../components/dashboard/attention-panel";
+import { LeadRowsTable } from "../../../components/dashboard/attention-panel";
 import { DataState } from "../../../components/data-state";
 import { FreshnessBanner } from "../../../components/dashboard/freshness-banner";
 import { requireRole } from "../../../lib/auth/authorization";
@@ -92,7 +92,10 @@ export default async function DrilldownPage({
         emptyMessage="В этом срезе сделок нет."
       >
         {page.status === "ready" ? (
-          <AttentionPanel counters={{}} rows={page.data.rows} />
+          <LeadRowsTable
+            caption={`Сделки среза «${METRIC_TITLE[metric] ?? metric}» на момент снимка`}
+            rows={page.data.rows}
+          />
         ) : null}
       </DataState>
     </AppShell>

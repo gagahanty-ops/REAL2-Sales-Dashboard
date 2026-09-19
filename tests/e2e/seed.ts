@@ -158,6 +158,45 @@ export async function seedDashboardE2E(): Promise<Readonly<{ snapshotVersion: nu
       `;
     }
 
+    // The normalized layer as well: the lead card reads it, not the snapshot.
+    for (const [id, name, date, manager, channel, status, price, won] of [
+      [1001, 'Сделка #1001', E2E_FROM, 42, 'site', 772, '120000.00', true],
+      [1002, 'Сделка #1002', E2E_FROM, 42, 'site', 770, null, false],
+      [1003, 'Сделка #1003', E2E_FROM, 84, 'avito', 771, null, false],
+      [1004, 'Сделка #1004', E2E_TO, 84, 'site', 770, null, false],
+    ] as const) {
+      await sql`
+        insert into public.leads (
+          account_id, amo_lead_id, pipeline_id, current_status_id,
+          current_responsible_user_id, name, price_rub, created_at, created_date,
+          source_updated_at, normalized_channel, normalization_config_id, amo_url
+        ) values (
+          ${E2E_ACCOUNT_ID}, ${id}, 77, ${status}, ${manager}, ${name}, ${price},
+          ${`${date}T09:00:00Z`}, ${date}, ${`${date}T09:30:00Z`}, ${channel},
+          ${config.id}, ${`https://555151.amocrm.ru/leads/detail/${id}`}
+        )
+      `;
+      await sql`
+        insert into public.lead_milestones (
+          account_id, amo_lead_id, application_at, application_responsible_user_id,
+          won_at, won_responsible_user_id, currently_won
+        ) values (
+          ${E2E_ACCOUNT_ID}, ${id},
+          ${won || status >= 771 ? `${date}T10:00:00Z` : null}, ${manager},
+          ${won ? `${date}T12:00:00Z` : null}, ${won ? manager : null}, ${won}
+        )
+      `;
+      await sql`
+        insert into public.lead_stage_events (
+          account_id, amo_event_id, amo_lead_id, from_status_id, to_status_id,
+          responsible_user_id, occurred_at
+        ) values (
+          ${E2E_ACCOUNT_ID}, ${`e2e-stage-${id}`}, ${id}, 770, ${status}, ${manager},
+          ${`${date}T10:00:00Z`}
+        )
+      `;
+    }
+
     const [snapshot] = await sql<{ id: string; version: string }[]>`
       insert into public.metric_snapshots (
         sync_run_id, config_id, source_fresh_at, checksum, quality_summary

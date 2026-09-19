@@ -30,8 +30,8 @@ export function AppShell({
           </nav>
           {user.role === "admin" ? (
             <nav className="app-nav" aria-label="Администрирование">
-              <Link href="/settings/pipeline">Воронка</Link>
-              <Link href="/settings/channels">Каналы</Link>
+              <Link href="/settings/pipeline">Настройка воронки</Link>
+              <Link href="/settings/channels">Правила каналов</Link>
               <Link href="/settings/integrations/amo">amoCRM</Link>
               <Link href="/settings/users">Пользователи</Link>
               <Link href="/settings/plans">Планы</Link>
@@ -41,7 +41,7 @@ export function AppShell({
           {user.role === "admin" || user.role === "head" ? (
             <>
               <Link href="/quality">Качество данных</Link>
-              <Link href="/quality/config">Конфигурация</Link>
+              <Link href="/quality/config">Проверка конфигурации</Link>
               <Link href="/sync">Синхронизации</Link>
               <Link href="/snapshots/current">Снимок</Link>
               <Link href="/system">Система</Link>

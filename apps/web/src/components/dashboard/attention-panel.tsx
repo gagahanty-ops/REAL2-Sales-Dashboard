@@ -1,6 +1,11 @@
 import React from "react";
 
+import { CHANNEL_OPTIONS } from "../../lib/dashboard/filter-url";
 import { formatDate, formatRubles } from "../../lib/dashboard/format";
+
+function channelLabel(channel: string): string {
+  return CHANNEL_OPTIONS.find((option) => option.value === channel)?.label ?? channel;
+}
 
 export type AttentionRowView = Readonly<{
   amoLeadId: number;
@@ -44,6 +49,47 @@ export function groupByCode(
     .map(([code, grouped]) => ({ code, rows: grouped }));
 }
 
+export function LeadRowsTable({
+  caption,
+  rows,
+}: Readonly<{ caption: string; rows: readonly AttentionRowView[] }>) {
+  if (rows.length === 0) return <p>В этом срезе сделок нет.</p>;
+  return (
+    <div className="table-scroll">
+      <table className="metric-table">
+        <caption>{caption}</caption>
+        <thead>
+          <tr>
+            <th scope="col">Сделка</th>
+            <th scope="col">Создана</th>
+            <th scope="col">Менеджер</th>
+            <th scope="col">Канал</th>
+            <th scope="col">Сумма</th>
+            <th scope="col">Проблемы</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.amoLeadId}>
+              <th scope="row">
+                <a href={`/leads/${row.amoLeadId}`}>{row.name}</a>{" "}
+                <a href={row.amoUrl} rel="noreferrer noopener" target="_blank">
+                  (amoCRM)
+                </a>
+              </th>
+              <td>{formatDate(row.createdDate)}</td>
+              <td>{row.manager.name}</td>
+              <td>{channelLabel(row.channel)}</td>
+              <td>{formatRubles(row.price)}</td>
+              <td>{row.quality.map(qualityLabel).join(", ") || "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function AttentionPanel({
   counters,
   rows,
@@ -58,10 +104,12 @@ export function AttentionPanel({
 
   return (
     <section aria-label="Требует внимания">
-      <h2>Требует внимания</h2>
+      {/* The page already carries the heading; repeating it and the counters
+          above identical group headings would be noise. */}
+      {grouped ? null : <h2>Требует внимания</h2>}
       {codes.length === 0 ? (
         <p>В этом срезе проблемных сделок нет.</p>
-      ) : (
+      ) : grouped ? null : (
         <ul className="quality-counters">
           {codes.map(([code, count]) => (
             <li key={code}>
@@ -88,38 +136,10 @@ export function AttentionPanel({
           ))
         : null}
 
-      <div className="table-scroll">
-        <table className="metric-table">
-          <caption>Сделки с открытыми проблемами качества</caption>
-          <thead>
-            <tr>
-              <th scope="col">Сделка</th>
-              <th scope="col">Создана</th>
-              <th scope="col">Менеджер</th>
-              <th scope="col">Канал</th>
-              <th scope="col">Сумма</th>
-              <th scope="col">Проблемы</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr key={row.amoLeadId}>
-                <th scope="row">
-                  <a href={`/leads/${row.amoLeadId}`}>{row.name}</a>{" "}
-                  <a href={row.amoUrl} rel="noreferrer noopener" target="_blank">
-                    (amoCRM)
-                  </a>
-                </th>
-                <td>{formatDate(row.createdDate)}</td>
-                <td>{row.manager.name}</td>
-                <td>{row.channel}</td>
-                <td>{formatRubles(row.price)}</td>
-                <td>{row.quality.map(qualityLabel).join(", ")}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <LeadRowsTable
+        caption="Сделки с открытыми проблемами качества"
+        rows={rows}
+      />
     </section>
   );
 }

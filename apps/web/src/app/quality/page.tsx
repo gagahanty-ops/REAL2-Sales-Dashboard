@@ -4,6 +4,7 @@ import { listQualityIssues, summarizeOpenQualityIssues } from "@real2/db";
 import { QUALITY_CODE_POLICY, evaluateQualityGate, isQualityCode } from "@real2/domain";
 
 import { AppShell } from "../../components/app-shell";
+import { qualityLabel } from "../../components/dashboard/attention-panel";
 import { QualityAcceptForm } from "../../components/quality-accept-form";
 import { requireRole } from "../../lib/auth/authorization";
 import { requireUser } from "../../lib/auth/require-user";
@@ -64,10 +65,10 @@ export default async function QualityPage({
         {openCodes.length === 0 ? (
           <p>Открытых проблем нет.</p>
         ) : (
-          <ul>
+          <ul className="quality-counters">
             {openCodes.map(([counter, count]) => (
               <li key={counter}>
-                {counter}: {count}
+                {qualityLabel(counter.replace(/_count$/u, ""))}: {count}
               </li>
             ))}
           </ul>
@@ -79,7 +80,9 @@ export default async function QualityPage({
         {page.items.length === 0 ? (
           <p>Ничего не найдено.</p>
         ) : (
-          <table>
+          <div className="table-scroll">
+          <table className="metric-table">
+            <caption>Проблемы качества данных</caption>
             <thead>
               <tr>
                 <th scope="col">Код</th>
@@ -93,7 +96,7 @@ export default async function QualityPage({
             <tbody>
               {page.items.map((issue) => (
                 <tr key={issue.id}>
-                  <td>{issue.code}</td>
+                  <th scope="row">{qualityLabel(issue.code)}</th>
                   <td>{SEVERITY_LABEL[issue.severity]}</td>
                   <td>{STATUS_LABEL[issue.status]}</td>
                   <td>{issue.amoLeadId ?? "—"}</td>
@@ -116,6 +119,7 @@ export default async function QualityPage({
               ))}
             </tbody>
           </table>
+          </div>
         )}
         {page.nextCursor ? (
           <a href={`/quality?cursor=${encodeURIComponent(page.nextCursor)}`}>

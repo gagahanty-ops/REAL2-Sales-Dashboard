@@ -13,6 +13,7 @@ export type DailyPointView = Readonly<{
 export type DailyTrendProps = Readonly<{ points: readonly DailyPointView[] }>;
 
 const CHART_HEIGHT = 120;
+const CHART_WIDTH = 720;
 
 /**
  * A bar chart drawn as inline SVG, with the same numbers available as a table
@@ -20,7 +21,7 @@ const CHART_HEIGHT = 120;
  */
 export function DailyTrend({ points }: DailyTrendProps) {
   const maximum = Math.max(1, ...points.map((point) => point.leadsCreated));
-  const barWidth = points.length === 0 ? 0 : 100 / points.length;
+  const barWidth = points.length === 0 ? 0 : CHART_WIDTH / points.length;
 
   return (
     <section aria-label="Динамика по дням">
@@ -28,8 +29,8 @@ export function DailyTrend({ points }: DailyTrendProps) {
       {points.length > 0 ? (
         <svg
           className="daily-trend"
-          viewBox={`0 0 100 ${CHART_HEIGHT}`}
-          preserveAspectRatio="none"
+          viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+          preserveAspectRatio="xMidYMax meet"
           role="img"
           aria-label={`Лиды по дням, максимум ${maximum}`}
         >
@@ -40,7 +41,7 @@ export function DailyTrend({ points }: DailyTrendProps) {
                 key={point.date}
                 x={index * barWidth + barWidth * 0.15}
                 y={CHART_HEIGHT - height}
-                width={barWidth * 0.7}
+                width={Math.min(barWidth * 0.7, 48)}
                 height={height}
                 fill="currentColor"
               />
