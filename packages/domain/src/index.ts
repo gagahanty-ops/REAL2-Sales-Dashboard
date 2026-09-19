@@ -50,6 +50,19 @@ export {
   type NormalizedChannel,
 } from "./leads/channel.js";
 export {
+  compareManualReport,
+  isZeroDifference,
+  type ReconciliationDifference,
+  type ReconciliationResult,
+  type ReconciliationRow,
+} from "./reconciliation/compare.js";
+export {
+  MANUAL_REPORT_HEADERS,
+  parseManualReport,
+  type ManualReport,
+  type ManualReportRow,
+} from "./reconciliation/manual-report.js";
+export {
   evaluateSystemHealth,
   type HealthAlert,
   type SystemHealth,
