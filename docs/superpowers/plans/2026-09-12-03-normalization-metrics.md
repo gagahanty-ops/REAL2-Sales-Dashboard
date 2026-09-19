@@ -303,7 +303,7 @@ git commit -m "feat: normalize REAL2 lead snapshots deterministically"
 - Consumes: one successful sync run, previous normalized lead, ordered raw events, application/won status IDs.
 - Produces: `buildLeadHistory(input): LeadHistoryResult` and `normalizeSyncRun(syncRunId): NormalizeRunResult`.
 
-- [ ] **Step 1: Write failing milestone-order tests**
+- [x] **Step 1: Write failing milestone-order tests**
 
 ```ts
 it("uses event ID as a stable tie-breaker and keeps first application/won times", () => {
@@ -320,13 +320,13 @@ it("uses event ID as a stable tie-breaker and keeps first application/won times"
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify missing history builder**
+- [x] **Step 2: Run the focused test and verify missing history builder**
 
 Run: `pnpm vitest run packages/domain/src/leads/build-history.test.ts`
 
 Expected: FAIL because `buildLeadHistory` does not exist.
 
-- [ ] **Step 3: Implement pure history derivation and transactional persistence**
+- [x] **Step 3: Implement pure history derivation and transactional persistence**
 
 ```ts
 const ordered = [...events].sort((a, b) =>
@@ -339,13 +339,13 @@ const wonEvent = ordered.find((event) => event.kind === "stage" && event.toStatu
 
 Persist stable `lead_stage_events` and `lead_responsible_events`; calculate closed stage durations from adjacent events and current stage age against the snapshot timestamp without adding a mutable interval table. Capture responsible IDs at creation, first application, first won, and current snapshot. `normalizeSyncRun` upserts current normalized rows and replaces derived milestone rows for affected leads in one transaction; it never edits raw data.
 
-- [ ] **Step 4: Verify repeated events, missing pairs, reassignment, and rollback**
+- [x] **Step 4: Verify repeated events, missing pairs, reassignment, and rollback**
 
 Run: `pnpm vitest run packages/domain/src/leads/build-history.test.ts && pnpm test:integration -- apps/worker/src/jobs/normalize-sync-run.integration.test.ts`
 
 Expected: PASS; a repeated run yields byte-equivalent derived rows; malformed history opens `missing_stage_history`; transaction failure leaves prior normalized rows intact.
 
-- [ ] **Step 5: Commit history and milestone derivation**
+- [x] **Step 5: Commit history and milestone derivation**
 
 ```bash
 git add packages/domain/src/leads/build-history.ts packages/domain/src/leads/build-history.test.ts packages/db/src/normalize-run.ts apps/worker/src/jobs/normalize-sync-run.ts apps/worker/src/jobs/normalize-sync-run.integration.test.ts
@@ -367,7 +367,7 @@ git commit -m "feat: derive auditable lead timelines and milestones"
 - Consumes: issue candidates and current open issues.
 - Produces: exact quality codes, `evaluateQualityGate(summary): QualityGateResult`, paginated issue reads, and admin acceptance with a required reason.
 
-- [ ] **Step 1: Write failing blocking-gate tests**
+- [x] **Step 1: Write failing blocking-gate tests**
 
 ```ts
 it.each([
@@ -384,13 +384,13 @@ it("does not block solely for an unknown channel", () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify gate implementation is missing**
+- [x] **Step 2: Run tests and verify gate implementation is missing**
 
 Run: `pnpm vitest run packages/domain/src/quality/gates.test.ts`
 
 Expected: FAIL on missing quality module.
 
-- [ ] **Step 3: Implement issue lifecycle and explicit gates**
+- [x] **Step 3: Implement issue lifecycle and explicit gates**
 
 The worker upserts still-present issues, resolves absent ones, and never deletes history. Acceptance requires admin and a nonblank reason of 10–500 characters; the repository stores `{ acceptanceReason, acceptedBy, acceptedAt }` in `safe_details`, changes status to `accepted`, and sets `resolved_at`. Acceptance changes publication eligibility only for codes explicitly marked acceptable in `codes.ts`; source API errors and count-drop alerts remain unacceptable.
 
@@ -406,13 +406,13 @@ export const qualityCodePolicy = {
 } as const;
 ```
 
-- [ ] **Step 4: Verify permissions, pagination, issue resolution, and gates**
+- [x] **Step 4: Verify permissions, pagination, issue resolution, and gates**
 
 Run: `pnpm vitest run packages/domain/src/quality/gates.test.ts && pnpm test:integration -- apps/web/src/app/api/quality/issues/quality.integration.test.ts`
 
 Expected: PASS; head reads but cannot accept; manager cannot access quality endpoints; an accepted issue retains evidence and reason.
 
-- [ ] **Step 5: Commit quality issue workflows**
+- [x] **Step 5: Commit quality issue workflows**
 
 ```bash
 git add packages/domain/src/quality packages/db/src/quality.ts apps/web/src/app/api/quality apps/web/src/app/quality
@@ -435,7 +435,7 @@ git commit -m "feat: enforce explicit data-quality gates"
 - Consumes: `MetricLeadFact[]`, requested date interval, manager/channel filters.
 - Produces: `aggregateMetrics(input): MetricAggregate`, conversion/average/period-comparison functions, and explicit integer/decimal-string totals.
 
-- [ ] **Step 1: Write the failing core cohort test**
+- [x] **Step 1: Write the failing core cohort test**
 
 ```ts
 it("attributes later application and payment to the lead creation day", () => {
@@ -463,13 +463,13 @@ it("returns null ratios when the denominator is zero", () => {
 });
 ```
 
-- [ ] **Step 2: Run contract tests and verify missing metrics**
+- [x] **Step 2: Run contract tests and verify missing metrics**
 
 Run: `pnpm test:contracts -- tests/contracts/metrics.contract.test.ts`
 
 Expected: FAIL because the metrics package is missing.
 
-- [ ] **Step 3: Implement integer counts and decimal-safe sums**
+- [x] **Step 3: Implement integer counts and decimal-safe sums**
 
 ```ts
 export function aggregateMetrics(input: AggregateInput): MetricAggregate {
@@ -493,13 +493,13 @@ export function aggregateMetrics(input: AggregateInput): MetricAggregate {
 
 Golden fixtures cover all ten scenarios in METRICS_CATALOG section 13, including reopened won, changed responsible, unknown channel, invalid price, duplicate event, and Moscow midnight.
 
-- [ ] **Step 4: Verify daily, manager, channel, funnel, plan, and period totals**
+- [x] **Step 4: Verify daily, manager, channel, funnel, plan, and period totals**
 
 Run: `pnpm vitest run packages/domain/src/metrics && pnpm test:contracts -- tests/contracts/metrics.contract.test.ts`
 
 Expected: PASS with exact expected counts, one-decimal percentages, null zero-denominator ratios, and kopeck-exact revenue.
 
-- [ ] **Step 5: Commit canonical metric engine and golden data**
+- [x] **Step 5: Commit canonical metric engine and golden data**
 
 ```bash
 git add packages/domain/src/metrics packages/testkit/src/golden tests/contracts/metrics.contract.test.ts
@@ -523,7 +523,7 @@ git commit -m "feat: calculate canonical REAL2 metrics"
 - Consumes: a successful normalized run, metric engine, quality summary, active plan/config versions.
 - Produces: `buildMetricSnapshot(syncRunId, configId)`, `validateSnapshot(snapshotId)`, `approveSnapshot(snapshotId)`, `getCurrentSnapshot()`, `MetricLeadFact`, immutable daily/manager/channel/funnel rows, and versioned plans.
 
-- [ ] **Step 1: Write failing atomic-pointer tests**
+- [x] **Step 1: Write failing atomic-pointer tests**
 
 ```ts
 it("keeps the previous current snapshot when a candidate is blocked", async () => {
@@ -540,13 +540,13 @@ it("rebuilding identical input produces the same checksum", async () => {
 });
 ```
 
-- [ ] **Step 2: Run integration tests and verify missing snapshot relations**
+- [x] **Step 2: Run integration tests and verify missing snapshot relations**
 
 Run: `pnpm test:integration -- apps/worker/src/jobs/build-snapshot.integration.test.ts`
 
 Expected: FAIL with missing metric snapshot relation.
 
-- [ ] **Step 3: Add snapshot/fact/aggregate/plan schema and one approval transaction**
+- [x] **Step 3: Add snapshot/fact/aggregate/plan schema and one approval transaction**
 
 The migration creates `sales_plans`, `metric_snapshots`, `metric_cells`, `metric_lead_facts`, `stage_snapshot_rows`, and singleton `current_snapshot`. Snapshot rows reference one sync run and one configuration; channel rules are fixed through that configuration. Snapshot rows are immutable after creation.
 
@@ -654,13 +654,13 @@ export async function approveSnapshot(candidateId: string): Promise<ApprovedSnap
 
 The public `validateSnapshot(snapshotId)` opens a read-only transaction and delegates to the same `snapshots.validateCandidate` routine used by approval. It requires a successful source run, valid configuration, zero unaccepted blocking issues, `payments <= applications <= leads_created`, exact revenue cross-foot, and equality between `all/all`, manager sums, and channel sums for every date. Plan inserts require first-of-month `month`, supported metric key, strictly positive decimal target, actor, and a monotonically increasing version; they close the prior row's `valid_to` and never overwrite history. `/settings/plans` provides month, department/manager target, metric, history, and four states; `/snapshots/{version}` shows immutable checksum, source/config versions, quality summary, and cross-foot evidence.
 
-- [ ] **Step 4: Verify immutability, rollback, plan versions, and role access**
+- [x] **Step 4: Verify immutability, rollback, plan versions, and role access**
 
 Run: `supabase db reset && pnpm test:integration -- apps/worker/src/jobs/build-snapshot.integration.test.ts && pnpm test:security`
 
 Expected: PASS; candidate failure does not move pointer; approved rows reject update/delete; manager reads only its plan/facts.
 
-- [ ] **Step 5: Commit snapshot approval and plans**
+- [x] **Step 5: Commit snapshot approval and plans**
 
 ```bash
 git add supabase/migrations/0006_metric_snapshots.sql packages/db apps/worker/src/jobs/build-snapshot.ts apps/worker/src/jobs/build-snapshot.integration.test.ts apps/web/src/app/api/plans apps/web/src/app/api/snapshots apps/web/src/app/settings/plans apps/web/src/app/snapshots
@@ -679,7 +679,7 @@ git commit -m "feat: approve immutable metric snapshots"
 - Consumes: golden raw fixtures, complete mock sync, normalization, quality, and snapshot jobs.
 - Produces: one executable contract proving every catalog scenario and a manual reconciliation procedure keyed by amo lead ID.
 
-- [ ] **Step 1: Write a failing raw-to-snapshot contract**
+- [x] **Step 1: Write a failing raw-to-snapshot contract**
 
 ```ts
 it("matches the approved golden daily, manager, and channel rows", async () => {
@@ -691,13 +691,13 @@ it("matches the approved golden daily, manager, and channel rows", async () => {
 });
 ```
 
-- [ ] **Step 2: Run the contract and inspect the first semantic mismatch**
+- [x] **Step 2: Run the contract and inspect the first semantic mismatch**
 
 Run: `pnpm test:contracts -- tests/contracts/raw-to-snapshot.contract.test.ts`
 
 Expected: FAIL until the fixture adapters and export function are connected; failure prints stable IDs, not PII.
 
-- [ ] **Step 3: Connect the golden pipeline and catalog coverage assertion**
+- [x] **Step 3: Connect the golden pipeline and catalog coverage assertion**
 
 `metric-catalog-coverage.test.ts` asserts named coverage for leads, applications, payments, revenue, three conversions, average order value, current manager/channel attribution, funnel age, plans, period comparison, quality counters, freshness, and all ten golden scenarios.
 
@@ -716,13 +716,13 @@ it("has executable evidence for every catalog contract", () => {
 });
 ```
 
-- [ ] **Step 4: Run the complete metric gate twice**
+- [x] **Step 4: Run the complete metric gate twice**
 
 Run: `pnpm test:contracts && pnpm test:integration && pnpm test:contracts`
 
 Expected: all checks pass both times with identical snapshot checksums and no additional normalized/raw/event rows on the second execution.
 
-- [ ] **Step 5: Commit metric consistency evidence**
+- [x] **Step 5: Commit metric consistency evidence**
 
 ```bash
 git add tests/contracts docs/runbooks/metric-reconciliation.md packages/testkit

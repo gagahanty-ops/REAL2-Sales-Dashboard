@@ -37,7 +37,7 @@
 - Consumes: admin actor, spreadsheet copy ID, layout metadata, snapshot ID.
 - Produces: `sheet_targets`, `sheet_layout_mappings`, `sheet_publications`, `system_alerts`, and repositories with one-active-target/one-open-alert invariants; consumes the disabled `system_controls` created in migration 0001.
 
-- [ ] **Step 1: Write failing uniqueness and immutability tests**
+- [x] **Step 1: Write failing uniqueness and immutability tests**
 
 ```ts
 it("allows one successful publication per target and snapshot", async () => {
@@ -52,13 +52,13 @@ it("starts both database controls disabled after reset", async () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify missing relations**
+- [x] **Step 2: Run tests and verify missing relations**
 
 Run: `pnpm test:integration -- packages/db/src/sheets.integration.test.ts packages/db/src/alerts.integration.test.ts`
 
 Expected: FAIL because Sheet/alert relations do not exist.
 
-- [ ] **Step 3: Add exact M9/M10 schema and partial unique indexes**
+- [x] **Step 3: Add exact M9/M10 schema and partial unique indexes**
 
 ```sql
 create type sheet_target_status as enum ('draft', 'validated', 'active', 'disabled');
@@ -144,13 +144,13 @@ create unique index system_alerts_one_open_idx
 
 Enable RLS on all four tables. Admin/head receive SELECT policies; manager receives none. Mutations run through server repositories after explicit admin or `sheet_publisher` authorization. `sheet_publisher` may read the active target, its mappings, and an approved snapshot and may insert/update only its own publication row; it cannot read OAuth/raw tables or change `system_controls`. Migration 0007 asserts that both rows in `system_controls` exist and are false, but does not recreate or enable them.
 
-- [ ] **Step 4: Verify constraints, RLS, and disabled defaults**
+- [x] **Step 4: Verify constraints, RLS, and disabled defaults**
 
 Run: `supabase db reset && pnpm test:integration -- packages/db/src/sheets.integration.test.ts packages/db/src/alerts.integration.test.ts && pnpm test:security`
 
 Expected: PASS; manager cannot access target/mapping/alert rows; duplicate success is rejected; open alert deduplicates by code/resource; switches remain false.
 
-- [ ] **Step 5: Commit publication and operations schema**
+- [x] **Step 5: Commit publication and operations schema**
 
 ```bash
 git add supabase/migrations/0007_sheet_publication_and_alerts.sql packages/db
@@ -171,7 +171,7 @@ git commit -m "feat: add safe publication and alert persistence"
 - Consumes: target spreadsheet ID, environment/DB controls, service-account JSON from secret store, injected Google client factory.
 - Produces: `assertWritableSpreadsheetId(id)`, `createSheetReadClient(context)`, `createSheetWriteClient(context)`, `PROTECTED_SPREADSHEET_IDS`, and `E_SHEET_PROTECTED`.
 
-- [ ] **Step 1: Write failing zero-client/zero-request security tests**
+- [x] **Step 1: Write failing zero-client/zero-request security tests**
 
 ```ts
 const ORIGINAL_ID = "123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks";
@@ -191,13 +191,13 @@ it.each([[false, true], [true, false], [false, false]])("requires both switches"
 });
 ```
 
-- [ ] **Step 2: Run focused tests and verify policy is missing**
+- [x] **Step 2: Run focused tests and verify policy is missing**
 
 Run: `pnpm vitest run packages/integrations/src/google/policy.test.ts packages/integrations/src/google/client.integration.test.ts`
 
 Expected: FAIL on missing Google policy modules.
 
-- [ ] **Step 3: Implement immutable denylist and dual gate**
+- [x] **Step 3: Implement immutable denylist and dual gate**
 
 ```ts
 export const PROTECTED_SPREADSHEET_IDS = Object.freeze(new Set([
@@ -227,13 +227,13 @@ export async function createSheetWriteClient(context: PublicationContext): Promi
 
 The integration package owns all Google API imports. The metadata validator uses `createSheetReadClient`; only the publisher imports and calls `createSheetWriteClient`. The service account scope is limited to Sheets API, and repository docs require access only to the copy.
 
-- [ ] **Step 4: Prove environment cannot override protection**
+- [x] **Step 4: Prove environment cannot override protection**
 
 Run: `pnpm vitest run packages/integrations/src/google && pnpm test:security`
 
 Expected: PASS for original ID in request, DB, environment target, whitespace form, and alternate admin record; every protected case has zero credential reads/client creations/requests.
 
-- [ ] **Step 5: Commit the Sheet target security boundary**
+- [x] **Step 5: Commit the Sheet target security boundary**
 
 ```bash
 git add packages/integrations/src/google packages/domain/src/env.ts .env.example tests/security
@@ -258,7 +258,7 @@ git commit -m "feat: protect original Google Sheet from writes"
 - Consumes: admin-entered copy ID and read-only spreadsheet metadata/headers.
 - Produces: `computeLayoutFingerprint(metadata)`, `validateMapping(candidate, layout)`, transactionally replaced target mappings, and M9.3 configuration endpoints.
 
-- [ ] **Step 1: Write failing mapping overlap and expected-sheet tests**
+- [x] **Step 1: Write failing mapping overlap and expected-sheet tests**
 
 ```ts
 it("requires the two known September sheet names on initial validation", () => {
@@ -275,13 +275,13 @@ it("rejects overlapping output ranges", () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and verify missing validators**
+- [x] **Step 2: Run focused tests and verify missing validators**
 
 Run: `pnpm vitest run packages/integrations/src/google/layout.test.ts packages/domain/src/sheets/mapping.test.ts`
 
 Expected: FAIL because layout/mapping modules do not exist.
 
-- [ ] **Step 3: Implement canonical fingerprint and exact mappings**
+- [x] **Step 3: Implement canonical fingerprint and exact mappings**
 
 ```ts
 export function computeLayoutFingerprint(meta: SafeSpreadsheetMetadata): string {
@@ -294,13 +294,13 @@ export function computeLayoutFingerprint(meta: SafeSpreadsheetMetadata): string 
 
 Mappings identify report kind, logical field, exact sheet name, A1 range, value type, and required flag. Validation rejects missing fields, unexpected dimensions, formula destinations, overlaps, wrong row/column counts, and use of tab position instead of the saved sheet name. `PUT /api/sheets/mappings` validates the complete candidate first, then replaces all mappings for the draft/validated target in one transaction; active mappings cannot change until the target returns to `validated` status.
 
-- [ ] **Step 4: Verify target lifecycle and no-write validation**
+- [x] **Step 4: Verify target lifecycle and no-write validation**
 
 Run: `pnpm vitest run packages/integrations/src/google/layout.test.ts packages/domain/src/sheets/mapping.test.ts && pnpm test:integration -- apps/web/src/app/api/sheets/targets/targets.integration.test.ts`
 
 Expected: PASS; draft validation uses metadata/header reads only; activation requires exact fingerprint and complete mapping; layout changes block publication and set the target to `disabled`.
 
-- [ ] **Step 5: Commit copy validation and mapping UI**
+- [x] **Step 5: Commit copy validation and mapping UI**
 
 ```bash
 git add packages/integrations/src/google/layout.ts packages/integrations/src/google/layout.test.ts packages/domain/src/sheets apps/web/src/app/api/sheets apps/web/src/app/settings/google-sheet
@@ -324,7 +324,7 @@ git commit -m "feat: validate explicit Google Sheet copy layout"
 - Consumes: active validated target/mapping and one approved snapshot.
 - Produces: `buildSheetPayload(snapshot, mapping)`, `previewPublication`, `publishSnapshot(snapshotId, targetId): PublicationResult`, request checksum, and publication history.
 
-- [ ] **Step 1: Write failing original-ID, layout-drift, and checksum tests**
+- [x] **Step 1: Write failing original-ID, layout-drift, and checksum tests**
 
 ```ts
 it("builds one batch from one snapshot and verifies all mapped values", async () => {
@@ -340,13 +340,13 @@ it("does not write when preflight fingerprint changed", async () => {
 });
 ```
 
-- [ ] **Step 2: Run publisher tests and verify missing function**
+- [x] **Step 2: Run publisher tests and verify missing function**
 
 Run: `pnpm test:integration -- packages/integrations/src/google/publisher.integration.test.ts apps/worker/src/jobs/publish-sheet.integration.test.ts`
 
 Expected: FAIL because `publishSnapshot` does not exist.
 
-- [ ] **Step 3: Implement the fail-closed publication sequence**
+- [x] **Step 3: Implement the fail-closed publication sequence**
 
 ```ts
 export async function publishSnapshot(snapshotId: string, targetId: string): Promise<PublicationResult> {
@@ -381,13 +381,13 @@ export async function publishSnapshot(snapshotId: string, targetId: string): Pro
 
 The worker schedule polls for a new approved snapshot after each successful snapshot job and invokes publication only when an active target exists and both switches are true; it performs no credential read when disabled. Retries use fake-clock-tested delays 1, 3, 9, 27, and 60 seconds for 429/5xx. A prior successful `(target,snapshot)` returns its recorded result without a second write. A failed attempt keeps prior Sheet values and creates a critical alert; automatic publication remains disabled after checksum failure.
 
-- [ ] **Step 4: Verify retries, duplicate invocation, partial errors, and read-back**
+- [x] **Step 4: Verify retries, duplicate invocation, partial errors, and read-back**
 
 Run: `pnpm vitest run packages/domain/src/sheets/payload.test.ts && pnpm test:integration -- packages/integrations/src/google/publisher.integration.test.ts apps/worker/src/jobs/publish-sheet.integration.test.ts && pnpm test:security`
 
 Expected: PASS; one batch per new snapshot; duplicate success makes no request; layout/checksum failures block and alert; only mapped ranges are present in batch requests.
 
-- [ ] **Step 5: Commit preview and publisher**
+- [x] **Step 5: Commit preview and publisher**
 
 ```bash
 git add packages/domain/src/sheets packages/integrations/src/google/publisher.ts packages/integrations/src/google/publisher.integration.test.ts apps/worker/src/jobs/publish-sheet.ts apps/worker/src/jobs/publish-sheet.integration.test.ts apps/web/src/app/api/sheet-publications apps/web/src/app/sheet-publications
@@ -413,7 +413,7 @@ git commit -m "feat: publish verified snapshots to approved Sheet copy"
 - Consumes: DB reachability, active config, current snapshot, sync/publication history, open issues/alerts, SMTP secret.
 - Produces: liveness/readiness/system/alert APIs, `evaluateSystemHealth(now)`, deduplicated alerts, and redacted email notifications.
 
-- [ ] **Step 1: Write failing last-good and readiness tests**
+- [x] **Step 1: Write failing last-good and readiness tests**
 
 ```ts
 it("serves the last approved snapshot as stale when amoCRM sync fails", async () => {
@@ -431,13 +431,13 @@ it("returns ready only with DB, active config, and approved snapshot", async () 
 });
 ```
 
-- [ ] **Step 2: Run health tests and verify missing evaluator/routes**
+- [x] **Step 2: Run health tests and verify missing evaluator/routes**
 
 Run: `pnpm vitest run apps/worker/src/jobs/health-checks.test.ts apps/web/src/app/api/health/ready/route.integration.test.ts`
 
 Expected: FAIL because system health modules do not exist.
 
-- [ ] **Step 3: Implement safe status and thresholded alerts**
+- [x] **Step 3: Implement safe status and thresholded alerts**
 
 Open/dedupe alerts for sync freshness over 10 minutes, five consecutive sync failures, OAuth expiry/refresh failure, source count drop over 5%, blocking quality issue, missing current snapshot, Sheet layout drift, and checksum mismatch. Email includes environment, code, severity, first/last seen, trace ID, and runbook link only. JSON application logs have a 30-day retention policy; `system_alerts` records have a one-year retention job that preserves unresolved incidents.
 
@@ -450,13 +450,13 @@ export type Readiness = {
 
 Public readiness returns only `{ ready }`; authenticated system status returns safe detailed booleans and timestamps. Acknowledgement records admin/time without resolving the underlying condition.
 
-- [ ] **Step 4: Verify deduplication, recovery, safe email, and stale dashboard**
+- [x] **Step 4: Verify deduplication, recovery, safe email, and stale dashboard**
 
 Run: `pnpm vitest run apps/worker/src/jobs/health-checks.test.ts && pnpm test:integration -- apps/web/src/app/api/health/ready/route.integration.test.ts && pnpm test:security`
 
 Expected: PASS; repeated checks update one open alert; recovery resolves it; failed upstream does not delete/zero the current snapshot.
 
-- [ ] **Step 5: Commit operational health and alerts**
+- [x] **Step 5: Commit operational health and alerts**
 
 ```bash
 git add packages/domain/src/operations packages/db/src/system-status.ts apps/worker/src/jobs/health-checks.ts apps/worker/src/jobs/health-checks.test.ts apps/worker/src/alerts apps/web/src/app/api/health/ready apps/web/src/app/api/system apps/web/src/app/api/alerts apps/web/src/app/system
@@ -480,7 +480,7 @@ git commit -m "feat: monitor freshness and preserve last good data"
 - Consumes: reviewed images, secret-store references, Supabase connection, HTTPS domain, SMTP configuration.
 - Produces: reproducible `web`/`worker` deployment behind Caddy, configuration validator, restore rehearsal, and explicit disable/recovery procedures.
 
-- [ ] **Step 1: Write failing production-config safety test**
+- [x] **Step 1: Write failing production-config safety test**
 
 ```js
 test("production compose never enables network switches by default", async () => {
@@ -491,13 +491,13 @@ test("production compose never enables network switches by default", async () =>
 });
 ```
 
-- [ ] **Step 2: Run the test and verify deployment files are missing**
+- [x] **Step 2: Run the test and verify deployment files are missing**
 
 Run: `node --test tests/repo/deployment-config.test.mjs`
 
 Expected: FAIL with missing production Compose file.
 
-- [ ] **Step 3: Implement HTTPS deployment and exact runbooks**
+- [x] **Step 3: Implement HTTPS deployment and exact runbooks**
 
 ```yaml
 # deploy/docker-compose.production.yml
@@ -522,13 +522,13 @@ services:
 
 The deployment runbook targets an Ubuntu 24.04 LTS host with Docker, firewall ports 22/80/443, non-root deploy user, pinned image digests, and secret files mode 0600. It configures an external uptime monitor for `GET /api/health/live` and an authenticated freshness monitor for safe system status without embedding credentials in a URL. Restore rehearsal downloads a Supabase backup into an isolated local database, applies no production writes, runs migrations/checks, and verifies golden snapshot checksum within the four-hour RTO.
 
-- [ ] **Step 4: Validate Compose, secret references, and restore rehearsal**
+- [x] **Step 4: Validate Compose, secret references, and restore rehearsal**
 
 Run: `node --test tests/repo/deployment-config.test.mjs && node scripts/check-deployment-config.mjs deploy/docker-compose.production.yml && docker compose -f deploy/docker-compose.production.yml config && bash scripts/verify-backup-restore.sh --fixture packages/testkit/fixtures/backup.sql`
 
 Expected: all commands exit 0; no secret value is printed; restored DB passes migration version and golden checksum checks.
 
-- [ ] **Step 5: Commit operations package**
+- [x] **Step 5: Commit operations package**
 
 ```bash
 git add deploy scripts tests/repo/deployment-config.test.mjs docs/runbooks
@@ -551,7 +551,7 @@ git commit -m "ops: add reversible deployment and restore procedures"
 - Consumes: user-exported CSV from the manually maintained report and same-day approved snapshot rows; no API access to the original Sheet.
 - Produces: `compareManualReport(manual, snapshot): ReconciliationResult`, per-day/manager/channel differences, signed acceptance checklist, and separate sync/publication enable procedures.
 
-- [ ] **Step 1: Write a failing exact-difference test**
+- [x] **Step 1: Write a failing exact-difference test**
 
 ```ts
 it("reports exact count and kopeck differences without hiding missing rows", () => {
@@ -564,13 +564,13 @@ it("reports exact count and kopeck differences without hiding missing rows", () 
 });
 ```
 
-- [ ] **Step 2: Run the test and verify comparator is missing**
+- [x] **Step 2: Run the test and verify comparator is missing**
 
 Run: `pnpm vitest run packages/domain/src/reconciliation/compare.test.ts`
 
 Expected: FAIL because reconciliation modules do not exist.
 
-- [ ] **Step 3: Implement strict CSV parsing and comparison**
+- [x] **Step 3: Implement strict CSV parsing and comparison**
 
 ```ts
 export type ReconciliationDifference = {
@@ -593,7 +593,7 @@ Run automated checks and deploy with both switches false. The owner—not an imp
 
 Expected: each accepted day has zero unexplained difference for leads, applications, payments, revenue, manager, and channel; dashboard freshness is within ten minutes for at least 95% of observed time.
 
-- [ ] **Step 5: Record a production recommendation without enabling publication**
+- [x] **Step 5: Record a production recommendation without enabling publication**
 
 ```bash
 git add packages/domain/src/reconciliation apps/worker/src/jobs/reconcile-manual-report.ts apps/web/src/app/reconciliation docs/runbooks

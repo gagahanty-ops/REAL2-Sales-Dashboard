@@ -38,7 +38,7 @@
 - Consumes: untrusted URL parameters and authenticated `SessionUser`.
 - Produces: `DashboardFilters`, `DashboardScope`, `parseDashboardFilters(searchParams)`, `deriveDashboardScope(user, filters)`, and Zod response schemas for overview/managers/channels/funnel/attention/drill-down.
 
-- [ ] **Step 1: Write failing filter and privilege-escalation tests**
+- [x] **Step 1: Write failing filter and privilege-escalation tests**
 
 ```ts
 it("parses an inclusive Moscow creation-date interval", () => {
@@ -57,13 +57,13 @@ it("forces manager scope to the session amo user", () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and verify modules are missing**
+- [x] **Step 2: Run focused tests and verify modules are missing**
 
 Run: `pnpm vitest run packages/domain/src/dashboard/filters.test.ts packages/domain/src/dashboard/scope.test.ts`
 
 Expected: FAIL because dashboard contracts do not exist.
 
-- [ ] **Step 3: Implement strict filters and typed envelopes**
+- [x] **Step 3: Implement strict filters and typed envelopes**
 
 ```ts
 export const dashboardFiltersSchema = z.object({
@@ -88,13 +88,13 @@ export function deriveDashboardScope(user: SessionUser, filters: DashboardFilter
 
 Contracts use camelCase outward fields, decimal strings for rubles, ISO dates, nullable ratios, `trace_id`, snapshot version, generated time, source freshness, and stale flag.
 
-- [ ] **Step 4: Run contracts and property tests**
+- [x] **Step 4: Run contracts and property tests**
 
 Run: `pnpm vitest run packages/domain/src/dashboard && pnpm test:contracts`
 
 Expected: PASS for invalid dates, repeated query keys, unknown channels, 366-day boundary, manager without mapping, and ignored privilege-escalation input.
 
-- [ ] **Step 5: Commit shared dashboard contracts**
+- [x] **Step 5: Commit shared dashboard contracts**
 
 ```bash
 git add packages/domain/src/dashboard packages/domain/src/index.ts
@@ -120,7 +120,7 @@ git commit -m "feat: define role-scoped dashboard contracts"
 - Consumes: `DashboardFilters`, `DashboardScope`, current snapshot pointer.
 - Produces: `withCurrentSnapshot(query)`, `getOverview`, `getManagerMetrics`, `getChannelMetrics`, `getFunnelMetrics`, and four M7 API endpoints.
 
-- [ ] **Step 1: Write a failing snapshot-consistency test**
+- [x] **Step 1: Write a failing snapshot-consistency test**
 
 ```ts
 it("keeps one snapshot when current pointer changes during a request", async () => {
@@ -132,13 +132,13 @@ it("keeps one snapshot when current pointer changes during a request", async () 
 });
 ```
 
-- [ ] **Step 2: Run the integration test and verify repository modules are missing**
+- [x] **Step 2: Run the integration test and verify repository modules are missing**
 
 Run: `pnpm test:integration -- packages/db/src/dashboard/dashboard.integration.test.ts`
 
 Expected: FAIL because `withCurrentSnapshot` does not exist.
 
-- [ ] **Step 3: Implement transaction-scoped snapshot reads**
+- [x] **Step 3: Implement transaction-scoped snapshot reads**
 
 ```ts
 export async function withCurrentSnapshot<T>(
@@ -158,13 +158,13 @@ export async function withCurrentSnapshot<T>(
 
 All queries use half-open SQL boundaries `created_date >= from AND created_date < to + 1 day`, apply the server-derived manager scope, and compute totals from immutable fact/aggregate rows. `meta.stale` is true when the last successful sync ended more than ten minutes before request time.
 
-- [ ] **Step 4: Verify totals, filters, null ratios, and role scopes**
+- [x] **Step 4: Verify totals, filters, null ratios, and role scopes**
 
 Run: `pnpm test:integration -- packages/db/src/dashboard/dashboard.integration.test.ts && pnpm test:security`
 
 Expected: PASS; each table total equals overview under identical filters; manager cannot observe another manager by ID, totals, timing branch, or error difference.
 
-- [ ] **Step 5: Commit aggregate dashboard APIs**
+- [x] **Step 5: Commit aggregate dashboard APIs**
 
 ```bash
 git add packages/db/src/dashboard apps/web/src/lib/dashboard apps/web/src/app/api/dashboard/overview apps/web/src/app/api/dashboard/managers apps/web/src/app/api/dashboard/channels apps/web/src/app/api/dashboard/funnel
@@ -188,7 +188,7 @@ git commit -m "feat: serve snapshot-consistent dashboard aggregates"
 - Consumes: one snapshot, filters/scope, drill-down metric key, opaque cursor.
 - Produces: stable cursor pages of up to 100 masked lead rows, quality/attention groups, auditable lead detail, and UTF-8 semicolon CSV.
 
-- [ ] **Step 1: Write failing cursor and reconciliation tests**
+- [x] **Step 1: Write failing cursor and reconciliation tests**
 
 ```ts
 it("returns every payment exactly once across cursor pages", async () => {
@@ -204,13 +204,13 @@ it("returns every payment exactly once across cursor pages", async () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify drill-down repository is missing**
+- [x] **Step 2: Run tests and verify drill-down repository is missing**
 
 Run: `pnpm test:integration -- packages/db/src/dashboard/drilldown.integration.test.ts`
 
 Expected: FAIL on missing `getDrilldown`.
 
-- [ ] **Step 3: Implement signed opaque cursors and safe rows**
+- [x] **Step 3: Implement signed opaque cursors and safe rows**
 
 ```ts
 type DrilldownCursor = {
@@ -229,13 +229,13 @@ export function maskPhone(value: string | null): string | null {
 
 Cursor decode verifies HMAC, snapshot version, and filter hash. SQL orders by `(created_date DESC, amo_lead_id DESC)`. Lead detail includes safe name, status/responsible/channel, milestone and stage histories, issue codes, and exact amoCRM URL; it excludes raw payload/custom-field text/full phone.
 
-- [ ] **Step 4: Verify page boundaries, export formulas, escaping, and access**
+- [x] **Step 4: Verify page boundaries, export formulas, escaping, and access**
 
 Run: `pnpm test:integration -- packages/db/src/dashboard/drilldown.integration.test.ts && pnpm test:contracts -- apps/web/src/app/api/dashboard/export.contract.test.ts && pnpm test:security`
 
 Expected: PASS; CSV prefixes cells beginning `=`, `+`, `-`, or `@` with an apostrophe; manager export contains only self; drill-down count matches aggregate.
 
-- [ ] **Step 5: Commit auditable detail and export**
+- [x] **Step 5: Commit auditable detail and export**
 
 ```bash
 git add packages/db/src/dashboard packages/domain/src/dashboard/cursor.ts apps/web/src/app/api/dashboard/attention apps/web/src/app/api/dashboard/drilldown apps/web/src/app/api/dashboard/export.csv apps/web/src/app/api/leads
@@ -260,7 +260,7 @@ git commit -m "feat: add auditable dashboard drill-down and export"
 - Consumes: dashboard endpoints and `DashboardFilters` URL representation.
 - Produces: `AppShell`, `FilterBar`, `DataState`, `FreshnessBanner`, `useDashboardQuery`, and canonical URL search parameters.
 
-- [ ] **Step 1: Write failing URL/state behavior tests**
+- [x] **Step 1: Write failing URL/state behavior tests**
 
 ```tsx
 it("writes filters to the URL and keeps the prior result during refresh failure", async () => {
@@ -275,13 +275,13 @@ it("writes filters to the URL and keeps the prior result during refresh failure"
 });
 ```
 
-- [ ] **Step 2: Run the component test and verify missing components**
+- [x] **Step 2: Run the component test and verify missing components**
 
 Run: `pnpm vitest run apps/web/src/components/dashboard/filter-bar.test.tsx`
 
 Expected: FAIL because dashboard UI primitives do not exist.
 
-- [ ] **Step 3: Implement restrained visual tokens and four states**
+- [x] **Step 3: Implement restrained visual tokens and four states**
 
 ```css
 :root {
@@ -300,13 +300,13 @@ Expected: FAIL because dashboard UI primitives do not exist.
 
 Use a calm operational layout: light neutral canvas, dark navy navigation, blue interactive accents, green only for positive outcomes, amber/red only for attention. `DataState` renders a shape-matched skeleton, retryable error with trace ID, explanatory empty message, or content. TanStack Query uses `placeholderData: keepPreviousData`; stale errors show a banner without zeroing cards.
 
-- [ ] **Step 4: Verify keyboard, focus, URL restoration, and stale behavior**
+- [x] **Step 4: Verify keyboard, focus, URL restoration, and stale behavior**
 
 Run: `pnpm vitest run apps/web/src/components/dashboard apps/web/src/lib/dashboard && pnpm typecheck`
 
 Expected: PASS; filters survive reload/back/forward; every control has an accessible name and visible focus; previous content remains visible on refresh error.
 
-- [ ] **Step 5: Commit dashboard shell and state handling**
+- [x] **Step 5: Commit dashboard shell and state handling**
 
 ```bash
 git add apps/web/src/app apps/web/src/components/dashboard apps/web/src/components/data-state.tsx apps/web/src/lib/dashboard
@@ -335,7 +335,7 @@ git commit -m "feat: add resilient dashboard shell and filters"
 - Consumes: typed M7 responses and URL filters.
 - Produces: KPI cards, daily trend, plan/fact, manager/channel tables, funnel, attention list, and drill-down drawer using identical filters.
 
-- [ ] **Step 1: Write failing semantic rendering tests**
+- [x] **Step 1: Write failing semantic rendering tests**
 
 ```tsx
 it("renders null conversion as an em dash and opens reconciled drill-down", async () => {
@@ -347,13 +347,13 @@ it("renders null conversion as an em dash and opens reconciled drill-down", asyn
 });
 ```
 
-- [ ] **Step 2: Run view tests and verify components are missing**
+- [x] **Step 2: Run view tests and verify components are missing**
 
 Run: `pnpm vitest run apps/web/src/components/dashboard/metric-views.test.tsx`
 
 Expected: FAIL on missing `KpiGrid`.
 
-- [ ] **Step 3: Implement views with shared formatters and drill-down links**
+- [x] **Step 3: Implement views with shared formatters and drill-down links**
 
 Each numeric aggregate is a button/link when drill-down is permitted. Manager rows link to `/managers/{amoUserId}` with the same URL date/channel filters and plan/fact detail. Tables retain text labels outside color. Recharts receives numbers only after safe decimal-to-display conversion and never becomes a calculation source. Mobile uses scrollable tables with pinned first column; desktop keeps filters visible below the header.
 
@@ -365,13 +365,13 @@ export const formatRubles = (value: string) => new Intl.NumberFormat("ru-RU", {
 export const formatPercent = (value: number | null) => value === null ? "—" : `${value.toLocaleString("ru-RU", { maximumFractionDigits: 1 })}%`;
 ```
 
-- [ ] **Step 4: Verify totals, labels, responsive layouts, and detail links**
+- [x] **Step 4: Verify totals, labels, responsive layouts, and detail links**
 
 Run: `pnpm vitest run apps/web/src/components/dashboard && pnpm test:contracts && pnpm typecheck`
 
 Expected: PASS; table totals equal overview fixtures; null is never shown as zero; all chart information has a textual/table equivalent.
 
-- [ ] **Step 5: Commit complete dashboard views**
+- [x] **Step 5: Commit complete dashboard views**
 
 ```bash
 git add apps/web/src/components/dashboard apps/web/src/app/\(dashboard\)
@@ -394,7 +394,7 @@ git commit -m "feat: render REAL2 sales performance views"
 - Consumes: seeded approved snapshot and admin/head/manager browser states.
 - Produces: executable proof of role boundaries, four states, URL behavior, basic accessibility, and p95-compatible response budgets.
 
-- [ ] **Step 1: Write a failing manager-isolation E2E scenario**
+- [x] **Step 1: Write a failing manager-isolation E2E scenario**
 
 ```ts
 test("manager cannot reveal another manager through UI or API", async ({ page, request }) => {
@@ -408,13 +408,13 @@ test("manager cannot reveal another manager through UI or API", async ({ page, r
 });
 ```
 
-- [ ] **Step 2: Run E2E and verify fixtures/routes are incomplete**
+- [x] **Step 2: Run E2E and verify fixtures/routes are incomplete**
 
 Run: `pnpm test:e2e -- tests/e2e/dashboard-roles.spec.ts`
 
 Expected: FAIL until seeded auth states and app routes are connected.
 
-- [ ] **Step 3: Implement deterministic E2E seeding and state interception**
+- [x] **Step 3: Implement deterministic E2E seeding and state interception**
 
 Create synthetic identities and snapshot only. Network interception returns delayed success, retryable error, empty response, and stale metadata without calling amoCRM or Google. Accessibility checks include landmark names, heading order, keyboard-only filters/drawer, focus return, and automated serious/critical violation scan.
 
@@ -441,13 +441,13 @@ export async function failNextOverview(page: Page, traceId = "01J000000000000000
 }
 ```
 
-- [ ] **Step 4: Run the complete dashboard gate**
+- [x] **Step 4: Run the complete dashboard gate**
 
 Run: `pnpm lint && pnpm typecheck && pnpm test && pnpm test:contracts && pnpm test:integration && pnpm test:security && pnpm test:e2e && pnpm build`
 
 Expected: all checks pass; prepared overview API p95 is below 2 seconds, ready-filter query below 700 ms, and drill-down page below 1.5 seconds in the seeded CI profile.
 
-- [ ] **Step 5: Commit UI release evidence**
+- [x] **Step 5: Commit UI release evidence**
 
 ```bash
 git add playwright.config.ts tests/e2e docs/runbooks/dashboard-access.md
