@@ -146,6 +146,14 @@ export type WorkerCliDependencies = Readonly<{
   ): Promise<unknown>;
   runSync(kind: SyncKind): Promise<void>;
   processSyncQueue(db: Database): Promise<number>;
+  /** Normalization, snapshot building and, when configured, publication. */
+  runNormalizationPipeline(db: Database): Promise<Readonly<{
+    normalizedRuns: number;
+    snapshotsBuilt: number;
+    snapshotsApproved: number;
+    snapshotsBlocked: number;
+    published: number;
+  }>>;
   closeDbClient(db: Database): Promise<void>;
 }>;
 
@@ -183,6 +191,55 @@ const workerCliDependencies: WorkerCliDependencies = {
       claim: (input) => claimNextSyncWork(db, input),
       complete: (input) => completeSyncWork(db, input),
       run: runSync,
+    });
+  },
+  runNormalizationPipeline: async (db) => {
+    const { runNormalizationPipeline } = await import("./schedules/sheet-publication.js");
+    const {
+      approveSnapshot,
+      createNormalizeRunRepository,
+      getActivePipelineConfig,
+      raiseAlert,
+    } = await import("@real2/db");
+    const { normalizeSyncRun } = await import("./jobs/normalize-sync-run.js");
+    const { buildMetricSnapshot } = await import("./jobs/build-snapshot.js");
+
+    return runNormalizationPipeline({
+      async listPendingRuns() {
+        const rows = await db<{ id: string; config_id: string }[]>`
+          select runs.id, runs.config_id
+          from public.sync_runs as runs
+          left join public.metric_snapshots as snapshots
+            on snapshots.sync_run_id = runs.id
+          where runs.status = 'success' and snapshots.id is null
+          order by runs.finished_at
+          limit 5
+        `;
+        return rows.map((row) => ({ syncRunId: row.id, configId: row.config_id }));
+      },
+      normalizeRun: async (syncRunId) => {
+        await normalizeSyncRun(
+          {
+            repository: createNormalizeRunRepository(db),
+            loadActiveConfig: (connectionId) => getActivePipelineConfig(db, connectionId),
+          },
+          syncRunId,
+        );
+      },
+      buildSnapshot: (run) => buildMetricSnapshot({ db }, run.syncRunId, run.configId),
+      approveSnapshot: async (snapshotId) => {
+        await approveSnapshot(db, snapshotId);
+      },
+      onBlocked: async (snapshotId, code) => {
+        await raiseAlert(db, {
+          traceId: `pipeline-${snapshotId}`,
+          source: "metric_snapshot",
+          code,
+          severity: "warning",
+          safeSummary: "Снимок не утверждён: не пройдены проверки качества",
+          safeContext: { snapshotId },
+        });
+      },
     });
   },
   closeDbClient,
@@ -225,6 +282,11 @@ export async function runWorkerIteration(
       if (dispatched.length > 0) state.lastDispatchAt = now;
       await deps.processSyncQueue(workerDb);
     }
+
+    // Normalization and snapshot building read and write only this database:
+    // they run whether or not external synchronization is enabled, so the
+    // dashboard always reflects the raw pages that already arrived.
+    await deps.runNormalizationPipeline(workerDb);
 
     return runWorkerOnce(env);
   } finally {

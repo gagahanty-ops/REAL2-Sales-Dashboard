@@ -110,6 +110,34 @@ export async function requireActiveAppUser(
   return user;
 }
 
+/**
+ * Turns a switch off and records why. There is deliberately no counterpart
+ * that turns one on: enabling an external write is a manual decision of a
+ * person, never of code (SECURITY_READ_ONLY §9).
+ */
+export async function disableSystemControl(
+  db: Database,
+  key: SystemControlKey,
+  reason: string,
+): Promise<SystemControl> {
+  const safeReason = reason.trim().slice(0, 500);
+  if (safeReason === "") throw new AppIdentityError("E_CONFIGURATION");
+  const [row] = await db<SystemControlRow[]>`
+    update public.system_controls
+    set enabled = false, reason = ${safeReason}, updated_at = now()
+    where key = ${key}
+    returning key, enabled, reason, updated_by, updated_at
+  `;
+  if (!row) throw new AppIdentityError("E_CONFIGURATION");
+  return {
+    key: row.key,
+    enabled: row.enabled,
+    reason: row.reason,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at,
+  };
+}
+
 export async function getSystemControl(
   db: Database,
   key: SystemControlKey,

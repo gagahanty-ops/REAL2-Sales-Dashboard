@@ -7,6 +7,7 @@ export {
 } from "./client.js";
 export {
   AppIdentityError,
+  disableSystemControl,
   findAppUserByAuthId,
   getSystemControl,
   requireActiveAppUser,

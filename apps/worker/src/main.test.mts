@@ -76,6 +76,15 @@ test("worker CLI validates disabled switches and emits a safe one-shot result", 
     async processSyncQueue() {
       return 0;
     },
+    async runNormalizationPipeline() {
+      return {
+        normalizedRuns: 0,
+        snapshotsBuilt: 0,
+        snapshotsApproved: 0,
+        snapshotsBlocked: 0,
+        published: 0,
+      };
+    },
     async closeDbClient() {
       return undefined;
     },
@@ -139,6 +148,15 @@ test("worker CLI runs OAuth-state retention with its scoped database client", as
       },
       async processSyncQueue() {
         return 0;
+      },
+      async runNormalizationPipeline() {
+        return {
+          normalizedRuns: 0,
+          snapshotsBuilt: 0,
+          snapshotsApproved: 0,
+          snapshotsBlocked: 0,
+          published: 0,
+        };
       },
       async closeDbClient(db) {
         calls.push(`close-${db.name}`);
@@ -229,6 +247,15 @@ test("worker iteration runs watchdog and retention even when sync is disabled", 
         calls.push("queue");
         return 0;
       },
+      async runNormalizationPipeline() {
+        return {
+          normalizedRuns: 0,
+          snapshotsBuilt: 0,
+          snapshotsApproved: 0,
+          snapshotsBlocked: 0,
+          published: 0,
+        };
+      },
       async closeDbClient(db) {
         calls.push(`close:${db.name}`);
       },
@@ -285,6 +312,15 @@ test("worker iteration dispatches five-minute sync, nightly Moscow sync, and que
         calls.push("queue");
         return 1;
       },
+      async runNormalizationPipeline() {
+        return {
+          normalizedRuns: 0,
+          snapshotsBuilt: 0,
+          snapshotsApproved: 0,
+          snapshotsBlocked: 0,
+          published: 0,
+        };
+      },
       async closeDbClient() {
         return undefined;
       },
@@ -331,6 +367,15 @@ test("worker nightly scheduler catches up after 02:30 Moscow once per Moscow dat
     async processSyncQueue() {
       calls.push("queue");
       return 0;
+    },
+    async runNormalizationPipeline() {
+      return {
+        normalizedRuns: 0,
+        snapshotsBuilt: 0,
+        snapshotsApproved: 0,
+        snapshotsBlocked: 0,
+        published: 0,
+      };
     },
     async closeDbClient() {
       return undefined;

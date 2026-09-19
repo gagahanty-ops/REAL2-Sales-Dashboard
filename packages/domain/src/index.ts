@@ -50,6 +50,23 @@ export {
   type NormalizedChannel,
 } from "./leads/channel.js";
 export {
+  evaluateSystemHealth,
+  type HealthAlert,
+  type SystemHealth,
+  type SystemHealthInput,
+} from "./operations/status.js";
+export {
+  buildSheetPayload,
+  checksumOfUpdates,
+  readBackMatches,
+  type ChannelsDailyRow,
+  type PlanFactRow,
+  type SheetCellValue,
+  type SheetPayload,
+  type SheetPayloadInput,
+  type SheetUpdate,
+} from "./sheets/payload.js";
+export {
   REQUIRED_MAPPING_FIELDS,
   mappingIsComplete,
   parseA1Range,

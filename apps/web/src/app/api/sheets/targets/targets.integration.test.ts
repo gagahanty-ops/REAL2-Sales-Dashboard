@@ -219,7 +219,9 @@ describe("sheet target configuration", () => {
   it("refuses an overlapping mapping before anything is stored", async () => {
     const target = await createTarget();
     const overlapping = completeMappings();
-    overlapping[1] = { ...(overlapping[1] as never), rangeA1: "A2:B31" };
+    const second = overlapping[1];
+    if (!second) throw new Error("mapping fixture is missing");
+    overlapping[1] = { ...second, rangeA1: "A2:B31" };
 
     await replaceMappings(deps(), target.id, overlapping);
     await expect(validateSheetTarget(deps(), target.id)).rejects.toMatchObject({
