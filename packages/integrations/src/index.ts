@@ -52,3 +52,22 @@ export type {
   AmoTokenProvider,
   NormalizedAmoRequest,
 } from "./amo/types.js";
+export {
+  PROTECTED_SPREADSHEET_IDS,
+  assertWritableSpreadsheetId,
+  createSheetReadClient,
+  createSheetWriteClient,
+  type GoogleServiceAccount,
+  type SheetClient,
+  type SheetClientFactory,
+  type SheetContext,
+  type SheetGrid,
+  type SheetMetadata,
+  type SheetValueUpdate,
+} from "./google/policy.js";
+export {
+  GOOGLE_ENDPOINTS,
+  createGoogleSheetClient,
+  type CreateGoogleSheetClientOptions,
+  type GoogleEndpoints,
+} from "./google/client.js";
