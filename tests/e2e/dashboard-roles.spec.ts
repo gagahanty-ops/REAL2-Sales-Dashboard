@@ -21,9 +21,12 @@ test.describe("role boundaries", () => {
     const context = await browser.newContext({ storageState: STORAGE_STATE["manager-one"] });
     const page = await context.newPage();
 
+    // A manager is sent straight to their own card: the table could only ever
+    // show themselves.
     await page.goto("/managers?from=2026-09-05&to=2026-09-06");
-    await expect(page.getByRole("rowheader", { name: "Менеджер Один" })).toBeVisible();
-    await expect(page.getByRole("rowheader", { name: "Менеджер Два" })).toHaveCount(0);
+    await expect(page).toHaveURL(/\/managers\/42/u);
+    await expect(page.getByRole("heading", { level: 1, name: "Менеджер Один" })).toBeVisible();
+    await expect(page.getByText("Менеджер Два")).toHaveCount(0);
 
     // Asking for somebody else is refused, not silently rewritten.
     const forbidden = await context.request.get(

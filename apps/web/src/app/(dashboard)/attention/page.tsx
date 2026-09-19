@@ -64,7 +64,7 @@ export default async function AttentionPage({
         retryHref={dashboardHref("/attention", page.filters)}
       >
         {page.status === "ready" ? (
-          <AttentionPanel counters={page.data.counters} rows={page.data.rows} />
+          <AttentionPanel counters={page.data.counters} grouped rows={page.data.rows} />
         ) : null}
       </DataState>
     </AppShell>

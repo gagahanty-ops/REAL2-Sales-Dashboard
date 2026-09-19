@@ -38,7 +38,9 @@ export default defineConfig({
   ],
   webServer: {
     command: "pnpm --filter @real2/web exec next start --port 3100 --hostname 127.0.0.1",
-    url: BASE_URL,
+    // The root redirects an anonymous visitor to the login page, so readiness
+    // is probed on the endpoint built for it.
+    url: `${BASE_URL}/api/health/live`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
     env: { PORT: "3100" },

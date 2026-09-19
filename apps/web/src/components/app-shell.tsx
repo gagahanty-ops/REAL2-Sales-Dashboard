@@ -22,7 +22,7 @@ export function AppShell({
         </Link>
         <div className="header-actions">
           <nav className="app-nav" aria-label="Дашборд">
-            <Link href="/dashboard">Обзор</Link>
+            <Link href="/">Обзор</Link>
             <Link href="/managers">Менеджеры</Link>
             <Link href="/channels">Каналы</Link>
             <Link href="/funnel">Воронка</Link>
@@ -45,6 +45,7 @@ export function AppShell({
               <Link href="/sync">Синхронизации</Link>
               <Link href="/snapshots/current">Снимок</Link>
               <Link href="/system">Система</Link>
+              <Link href="/alerts">Оповещения</Link>
             </>
           ) : null}
           <div className="user-identity">

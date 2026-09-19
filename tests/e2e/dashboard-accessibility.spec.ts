@@ -6,8 +6,8 @@ test.use({ storageState: STORAGE_STATE.head });
 
 test.describe("accessibility basics", () => {
   test("every page has one first-level heading and named landmarks", async ({ page }) => {
-    for (const path of ["/dashboard", "/managers", "/channels", "/funnel", "/attention"]) {
-      await page.goto(`${path}?from=2026-09-05&to=2026-09-06`);
+    for (const path of ["/", "/managers", "/channels", "/funnel", "/attention"]) {
+      await page.goto(`${path === "/dashboard" ? "/" : path}?from=2026-09-05&to=2026-09-06`);
 
       await expect(page.getByRole("heading", { level: 1 })).toHaveCount(1);
       await expect(page.getByRole("main")).toHaveCount(1);
@@ -16,7 +16,7 @@ test.describe("accessibility basics", () => {
   });
 
   test("the filter form is usable with the keyboard alone", async ({ page }) => {
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06");
+    await page.goto("/?from=2026-09-05&to=2026-09-06");
 
     // A native date input consumes Tab between its own segments, so keyboard
     // order is checked between two checkboxes instead.
@@ -34,7 +34,7 @@ test.describe("accessibility basics", () => {
   });
 
   test("focus stays visible on every interactive control", async ({ page }) => {
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06");
+    await page.goto("/?from=2026-09-05&to=2026-09-06");
     const outline = await page.evaluate(() => {
       const input = document.querySelector("#filter-from") as HTMLElement | null;
       if (!input) return null;
@@ -56,7 +56,7 @@ test.describe("accessibility basics", () => {
   });
 
   test("the chart repeats its values as text", async ({ page }) => {
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06");
+    await page.goto("/?from=2026-09-05&to=2026-09-06");
 
     await expect(page.getByRole("img", { name: /Лиды по дням/u })).toBeVisible();
     await expect(page.getByRole("rowheader", { name: "05.09.2026" })).toBeVisible();

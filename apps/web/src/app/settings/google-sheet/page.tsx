@@ -8,6 +8,7 @@ import {
 } from "@real2/db";
 
 import { AppShell } from "../../../components/app-shell";
+import { SheetTargetManager } from "../../../components/sheet-target-manager";
 import { requireRole } from "../../../lib/auth/authorization";
 import { requireUser } from "../../../lib/auth/require-user";
 import { getDatabase } from "../../../lib/server/runtime";
@@ -69,6 +70,24 @@ export default async function GoogleSheetSettingsPage() {
             : "Пока он выключен, ни один запрос в Google невозможен."}
         </p>
       </section>
+
+      {user.role === "admin" ? (
+        <section aria-label="Настройка копии">
+          <h2>Настройка</h2>
+          <p>
+            Публикация включается отдельно и вручную: эти действия только
+            описывают, куда она пошла бы.
+          </p>
+          <SheetTargetManager
+            targets={targets.map((target) => ({
+              id: target.id,
+              spreadsheetId: target.spreadsheetId,
+              expectedTitle: target.expectedTitle,
+              status: target.status,
+            }))}
+          />
+        </section>
+      ) : null}
 
       <section>
         <h2>Копии</h2>

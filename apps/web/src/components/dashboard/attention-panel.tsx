@@ -29,12 +29,29 @@ export function qualityLabel(code: string): string {
   return CODE_LABEL[code] ?? code;
 }
 
+/** SPEC M8.4: the screen is read by reason, so rows are grouped by code. */
+export function groupByCode(
+  rows: readonly AttentionRowView[],
+): readonly Readonly<{ code: string; rows: readonly AttentionRowView[] }>[] {
+  const groups = new Map<string, AttentionRowView[]>();
+  for (const row of rows) {
+    for (const code of row.quality) {
+      groups.set(code, [...(groups.get(code) ?? []), row]);
+    }
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([code, grouped]) => ({ code, rows: grouped }));
+}
+
 export function AttentionPanel({
   counters,
   rows,
+  grouped = false,
 }: Readonly<{
   counters: Readonly<Record<string, number>>;
   rows: readonly AttentionRowView[];
+  grouped?: boolean;
 }>) {
   const codes = Object.entries(counters).sort(([left], [right]) =>
     left.localeCompare(right));
@@ -53,6 +70,24 @@ export function AttentionPanel({
           ))}
         </ul>
       )}
+      {grouped
+        ? groupByCode(rows).map((group) => (
+            <section aria-label={qualityLabel(group.code)} key={group.code}>
+              <h3>
+                {qualityLabel(group.code)}: {group.rows.length}
+              </h3>
+              <ul>
+                {group.rows.map((row) => (
+                  <li key={`${group.code}-${row.amoLeadId}`}>
+                    <a href={`/leads/${row.amoLeadId}`}>{row.name}</a> —{" "}
+                    {row.manager.name}, {formatDate(row.createdDate)}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))
+        : null}
+
       <div className="table-scroll">
         <table className="metric-table">
           <caption>Сделки с открытыми проблемами качества</caption>
@@ -70,8 +105,9 @@ export function AttentionPanel({
             {rows.map((row) => (
               <tr key={row.amoLeadId}>
                 <th scope="row">
+                  <a href={`/leads/${row.amoLeadId}`}>{row.name}</a>{" "}
                   <a href={row.amoUrl} rel="noreferrer noopener" target="_blank">
-                    {row.name}
+                    (amoCRM)
                   </a>
                 </th>
                 <td>{formatDate(row.createdDate)}</td>

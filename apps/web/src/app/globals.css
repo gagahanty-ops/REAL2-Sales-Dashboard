@@ -729,3 +729,21 @@ p {
 .hint {
   color: var(--dashboard-ink-muted, #5a6779);
 }
+
+.inline-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.stacked-forms {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.stacked-forms textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

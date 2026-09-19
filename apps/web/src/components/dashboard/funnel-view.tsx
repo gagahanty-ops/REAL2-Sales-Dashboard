@@ -21,7 +21,28 @@ export function formatAge(seconds: number | null): string {
   return hours > 0 ? `${hours} ч ${minutes} мин` : `${minutes} мин`;
 }
 
-export function FunnelView({ stages }: Readonly<{ stages: readonly FunnelStageView[] }>) {
+/** Leads that sat on a stage longer than this are listed separately. */
+export const STUCK_THRESHOLD_SECONDS = 7 * 24 * 60 * 60;
+
+export function shareOfEntry(
+  stage: FunnelStageView,
+  stages: readonly FunnelStageView[],
+): number | null {
+  const entry = stages[0]?.openCount ?? 0;
+  if (entry === 0) return null;
+  return Math.round((stage.openCount / entry) * 1_000) / 10;
+}
+
+export function FunnelView({
+  stages,
+  stuckThresholdSeconds = STUCK_THRESHOLD_SECONDS,
+}: Readonly<{
+  stages: readonly FunnelStageView[];
+  stuckThresholdSeconds?: number;
+}>) {
+  const stuck = stages.filter(
+    (stage) => (stage.medianAgeSeconds ?? stage.averageAgeSeconds ?? 0) > stuckThresholdSeconds,
+  );
   return (
     <section aria-label="Воронка">
       <h2>Открытые сделки по этапам</h2>
@@ -37,6 +58,7 @@ export function FunnelView({ stages }: Readonly<{ stages: readonly FunnelStageVi
               <th scope="col">Сумма</th>
               <th scope="col">Медианное время</th>
               <th scope="col">Среднее время</th>
+              <th scope="col">Доля от входа</th>
             </tr>
           </thead>
           <tbody>
@@ -47,6 +69,11 @@ export function FunnelView({ stages }: Readonly<{ stages: readonly FunnelStageVi
                 <td>{formatRubles(stage.openAmountRub)}</td>
                 <td>{formatAge(stage.medianAgeSeconds)}</td>
                 <td>{formatAge(stage.averageAgeSeconds)}</td>
+                <td>
+                  {shareOfEntry(stage, stages) === null
+                    ? "—"
+                    : `${shareOfEntry(stage, stages)?.toString().replace(".", ",")} %`}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -56,6 +83,20 @@ export function FunnelView({ stages }: Readonly<{ stages: readonly FunnelStageVi
         Медиана не показывается, когда в срез попало несколько менеджеров:
         медиана медиан не является медианой.
       </p>
+
+      <h3>Застряли дольше порога</h3>
+      {stuck.length === 0 ? (
+        <p>Этапов, где сделки стоят дольше семи дней, нет.</p>
+      ) : (
+        <ul className="quality-counters">
+          {stuck.map((stage) => (
+            <li key={stage.statusId}>
+              {stage.statusName}: {formatCount(stage.openCount)} сделок,{" "}
+              {formatAge(stage.medianAgeSeconds ?? stage.averageAgeSeconds)}
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }

@@ -20,19 +20,47 @@ export type MetricTableRow = Readonly<{
   totals: MetricTotalsView;
 }>;
 
+export type SortLink = Readonly<{ column: string; href: string; active: boolean }>;
+
 export type MetricTableProps = Readonly<{
   caption: string;
   firstColumn: string;
   rows: readonly MetricTableRow[];
   totals: MetricTotalsView;
+  /** Sorting links by column key; omitted when the table is not sortable. */
+  sortLinks?: Readonly<Record<string, SortLink>> | undefined;
+  /** Extra column shown after the ratios, for example a plan completion. */
+  extraColumn?: Readonly<{ title: string; render: (row: MetricTableRow) => string }> | undefined;
 }>;
+
+function header(
+  title: string,
+  key: string,
+  sortLinks: MetricTableProps["sortLinks"],
+): React.ReactNode {
+  const link = sortLinks?.[key];
+  if (!link) return title;
+  return (
+    <a aria-sort={link.active ? "other" : undefined} href={link.href}>
+      {title}
+      {link.active ? " ↕" : ""}
+    </a>
+  );
+}
 
 /**
  * One table shape for managers and channels: labels stay textual, ratios show
  * an em dash when undefined, and the totals row repeats the aggregate so a
  * reader can check that the parts add up.
  */
-export function MetricTable({ caption, firstColumn, rows, totals }: MetricTableProps) {
+export function MetricTable({
+  caption,
+  firstColumn,
+  rows,
+  totals,
+  sortLinks,
+  extraColumn,
+}: MetricTableProps) {
   return (
     <div className="table-scroll">
       <table className="metric-table">
@@ -40,13 +68,16 @@ export function MetricTable({ caption, firstColumn, rows, totals }: MetricTableP
         <thead>
           <tr>
             <th scope="col">{firstColumn}</th>
-            <th scope="col">Лиды</th>
-            <th scope="col">Заявки</th>
-            <th scope="col">Оплаты</th>
-            <th scope="col">Выручка</th>
-            <th scope="col">Лид → заявка</th>
-            <th scope="col">Заявка → оплата</th>
-            <th scope="col">Средний чек</th>
+            <th scope="col">{header("Лиды", "leadsCreated", sortLinks)}</th>
+            <th scope="col">{header("Заявки", "applications", sortLinks)}</th>
+            <th scope="col">{header("Оплаты", "payments", sortLinks)}</th>
+            <th scope="col">{header("Выручка", "revenueRub", sortLinks)}</th>
+            <th scope="col">{header("Лид → заявка", "leadToApplicationPct", sortLinks)}</th>
+            <th scope="col">
+              {header("Заявка → оплата", "applicationToPaymentPct", sortLinks)}
+            </th>
+            <th scope="col">{header("Средний чек", "averageOrderValueRub", sortLinks)}</th>
+            {extraColumn ? <th scope="col">{extraColumn.title}</th> : null}
           </tr>
         </thead>
         <tbody>
@@ -62,6 +93,7 @@ export function MetricTable({ caption, firstColumn, rows, totals }: MetricTableP
               <td>{formatPercent(row.totals.leadToApplicationPct)}</td>
               <td>{formatPercent(row.totals.applicationToPaymentPct)}</td>
               <td>{formatRubles(row.totals.averageOrderValueRub)}</td>
+              {extraColumn ? <td>{extraColumn.render(row)}</td> : null}
             </tr>
           ))}
         </tbody>
@@ -75,6 +107,7 @@ export function MetricTable({ caption, firstColumn, rows, totals }: MetricTableP
             <td>{formatPercent(totals.leadToApplicationPct)}</td>
             <td>{formatPercent(totals.applicationToPaymentPct)}</td>
             <td>{formatRubles(totals.averageOrderValueRub)}</td>
+            {extraColumn ? <td>—</td> : null}
           </tr>
         </tfoot>
       </table>

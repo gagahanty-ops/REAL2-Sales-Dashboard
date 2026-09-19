@@ -10,6 +10,7 @@ import { MetricTable } from "../../../components/dashboard/metric-table";
 import { requireRole } from "../../../lib/auth/authorization";
 import { requireUser } from "../../../lib/auth/require-user";
 import { dashboardHref, filtersToSearchParams } from "../../../lib/dashboard/filter-url";
+import { parseSort, sortHref, sortRows, SORTABLE_COLUMNS } from "../../../lib/dashboard/table-sort";
 import {
   loadDashboardPage,
   type SearchParamsInput,
@@ -27,7 +28,24 @@ export default async function ManagersPage({
     redirect("/");
   }
 
-  const page = await loadDashboardPage(user, (await searchParams) ?? {},
+  const query = (await searchParams) ?? {};
+  // A manager has exactly one row; sending them straight to their own card
+  // skips a table that can only ever show themselves.
+  if (user.role === "manager" && user.amoUserId !== null) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || key === "manager") continue;
+      for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
+    }
+    const suffix = params.toString();
+    redirect(`/managers/${user.amoUserId}${suffix === "" ? "" : `?${suffix}`}`);
+  }
+
+  const sort = parseSort(
+    typeof query.sort === "string" ? query.sort : undefined,
+    typeof query.dir === "string" ? query.dir : undefined,
+  );
+  const page = await loadDashboardPage(user, query,
     (transaction, snapshot, context) =>
       getManagerMetrics(transaction, snapshot, {
         filters: context.filters,
@@ -74,7 +92,17 @@ export default async function ManagersPage({
           <MetricTable
             caption="Показатели по менеджерам за выбранный период"
             firstColumn="Менеджер"
-            rows={page.data.rows.map((row) => ({
+            sortLinks={Object.fromEntries(
+              SORTABLE_COLUMNS.map((column) => [
+                column,
+                {
+                  column,
+                  href: sortHref("/managers", filtersToSearchParams(page.filters), column, sort),
+                  active: sort.column === column,
+                },
+              ]),
+            )}
+            rows={sortRows(page.data.rows, sort).map((row) => ({
               key: row.managerKey,
               label: row.managerName,
               href: row.managerKey === "unassigned"

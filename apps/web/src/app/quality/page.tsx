@@ -4,6 +4,7 @@ import { listQualityIssues, summarizeOpenQualityIssues } from "@real2/db";
 import { QUALITY_CODE_POLICY, evaluateQualityGate, isQualityCode } from "@real2/domain";
 
 import { AppShell } from "../../components/app-shell";
+import { QualityAcceptForm } from "../../components/quality-accept-form";
 import { requireRole } from "../../lib/auth/authorization";
 import { requireUser } from "../../lib/auth/require-user";
 import { getDatabase } from "../../lib/server/runtime";
@@ -86,7 +87,7 @@ export default async function QualityPage({
                 <th scope="col">Статус</th>
                 <th scope="col">Сделка</th>
                 <th scope="col">Последнее наблюдение</th>
-                <th scope="col">Можно принять</th>
+                <th scope="col">Решение</th>
               </tr>
             </thead>
             <tbody>
@@ -98,10 +99,18 @@ export default async function QualityPage({
                   <td>{issue.amoLeadId ?? "—"}</td>
                   <td>{formatMoscowDateTime(issue.lastSeenAt)}</td>
                   <td>
-                    {isQualityCode(issue.code)
-                    && QUALITY_CODE_POLICY[issue.code].acceptable
-                      ? "да"
-                      : "нет"}
+                    {user.role === "admin" && issue.status === "open" ? (
+                      <QualityAcceptForm
+                        acceptable={
+                          isQualityCode(issue.code)
+                          && QUALITY_CODE_POLICY[issue.code].acceptable
+                        }
+                        issueId={issue.id}
+                      />
+                    ) : isQualityCode(issue.code)
+                      && QUALITY_CODE_POLICY[issue.code].acceptable
+                      ? "можно принять"
+                      : "принять нельзя"}
                   </td>
                 </tr>
               ))}

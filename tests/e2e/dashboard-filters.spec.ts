@@ -6,7 +6,7 @@ test.use({ storageState: STORAGE_STATE.head });
 
 test.describe("filters live in the URL", () => {
   test("submitting the filter form writes the slice into the address", async ({ page }) => {
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06");
+    await page.goto("/?from=2026-09-05&to=2026-09-06");
 
     await page.getByLabel("Сайт", { exact: true }).check();
     await page.getByRole("button", { name: "Применить" }).click();
@@ -16,11 +16,11 @@ test.describe("filters live in the URL", () => {
   });
 
   test("the address survives reload and the back button", async ({ page }) => {
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06&channel=avito");
+    await page.goto("/?from=2026-09-05&to=2026-09-06&channel=avito");
     await page.reload();
     await expect(page.getByLabel("Avito", { exact: true })).toBeChecked();
 
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06&channel=site");
+    await page.goto("/?from=2026-09-05&to=2026-09-06&channel=site");
     await page.goBack();
     await expect(page).toHaveURL(/channel=avito/u);
     await expect(page.getByLabel("Avito", { exact: true })).toBeChecked();
@@ -45,7 +45,7 @@ test.describe("filters live in the URL", () => {
   });
 
   test("a drill-down opens the rows behind a number", async ({ page }) => {
-    await page.goto("/dashboard?from=2026-09-05&to=2026-09-06");
+    await page.goto("/?from=2026-09-05&to=2026-09-06");
 
     await page.getByRole("link", { name: "Открыть сделки: Оплаты" }).click();
 

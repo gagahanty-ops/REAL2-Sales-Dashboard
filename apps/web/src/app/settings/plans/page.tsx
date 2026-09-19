@@ -1,8 +1,10 @@
 import { redirect } from "next/navigation";
 
-import { listSalesPlans } from "@real2/db";
+import { listSalesPlans, withCurrentSnapshot, getManagerMetrics } from "@real2/db";
+import { parseDashboardFilters, toMoscowDate } from "@real2/domain";
 
 import { AppShell } from "../../../components/app-shell";
+import { PlanTargetForm } from "../../../components/plan-target-form";
 import { requireRole } from "../../../lib/auth/authorization";
 import { requireUser } from "../../../lib/auth/require-user";
 import { getDatabase } from "../../../lib/server/runtime";
@@ -29,7 +31,29 @@ export default async function SalesPlansPage({
 
   const requested = (await searchParams)?.month;
   const month = requested && /^\d{4}-\d{2}-01$/.test(requested) ? requested : undefined;
-  const plans = await listSalesPlans(getDatabase(), month ? { month } : {});
+  const db = getDatabase();
+  const plans = await listSalesPlans(db, month ? { month } : {});
+
+  // Manager names come from the current snapshot so a target is set for a
+  // person the report actually knows.
+  let managers: readonly Readonly<{ value: string; label: string }>[] = [];
+  if (user.role === "admin") {
+    try {
+      const now = new Date();
+      const today = toMoscowDate(now.toISOString()) ?? now.toISOString().slice(0, 10);
+      const filters = parseDashboardFilters(new URLSearchParams(), { today });
+      const result = await withCurrentSnapshot(db, (transaction, snapshot) =>
+        getManagerMetrics(transaction, snapshot, {
+          filters,
+          scope: { kind: "department", amoUserIds: [], includeUnassigned: false },
+        }));
+      managers = result.data.rows
+        .filter((row) => row.managerKey !== "unassigned")
+        .map((row) => ({ value: row.managerKey, label: row.managerName }));
+    } catch {
+      managers = [];
+    }
+  }
   const current = plans.filter((plan) => plan.validTo === null);
   const history = plans.filter((plan) => plan.validTo !== null);
 
@@ -44,6 +68,13 @@ export default async function SalesPlansPage({
           </p>
         </div>
       </div>
+
+      {user.role === "admin" ? (
+        <section aria-label="Новая цель">
+          <h2>Задать цель</h2>
+          <PlanTargetForm managers={managers} />
+        </section>
+      ) : null}
 
       <section>
         <h2>Действующие цели</h2>
