@@ -21,7 +21,9 @@ async function clearDatabaseFixtures(): Promise<void> {
     do $$
     begin
       if to_regclass('public.data_quality_issues') is not null then
-        execute 'truncate table public.current_snapshot, public.stage_snapshot_rows,
+        execute 'truncate table public.system_alerts, public.sheet_publications,
+          public.sheet_layout_mappings, public.sheet_targets,
+          public.current_snapshot, public.stage_snapshot_rows,
           public.metric_lead_facts, public.metric_cells, public.metric_snapshots,
           public.sales_plans, public.data_quality_issues, public.lead_milestones,
           public.lead_responsible_events, public.lead_stage_events, public.leads,
@@ -31,7 +33,9 @@ async function clearDatabaseFixtures(): Promise<void> {
           public.config_recalculation_requests, public.config_validations,
           public.channel_rules, public.pipeline_configs';
       else
-        execute 'truncate table public.current_snapshot, public.stage_snapshot_rows,
+        execute 'truncate table public.system_alerts, public.sheet_publications,
+          public.sheet_layout_mappings, public.sheet_targets,
+          public.current_snapshot, public.stage_snapshot_rows,
           public.metric_lead_facts, public.metric_cells, public.metric_snapshots,
           public.sales_plans, public.amo_api_audit, public.raw_amo_quarantine,
           public.raw_amo_events, public.raw_amo_objects, public.sync_pages,
@@ -774,5 +778,87 @@ describe("metric snapshot and plan RLS", () => {
     } finally {
       await closeDbClient(workerDb);
     }
+  });
+});
+
+describe("sheet publication RLS", () => {
+  async function seedTarget(): Promise<string> {
+    const [target] = await adminDb<{ id: string }[]>`
+      insert into public.sheet_targets (spreadsheet_id, expected_title, status)
+      values ('copy-rls-spreadsheet', 'Копия отчёта', 'draft')
+      returning id
+    `;
+    if (!target) throw new Error("sheet target fixture is missing");
+    await adminDb`
+      insert into public.sheet_layout_mappings (
+        target_id, report_kind, logical_field, sheet_name, range_a1, value_type
+      ) values (${target.id}, 'channels_daily', 'leads_created', 'Каналы', 'B2:B32', 'integer')
+    `;
+    await adminDb`
+      insert into public.system_alerts (trace_id, source, code, severity, safe_summary)
+      values ('trace-rls', 'sheet_publication', 'E_SHEET_UPSTREAM', 'critical', 'Ошибка публикации')
+    `;
+    return target.id;
+  }
+
+  async function visibleSheetCounts(authUserId: string) {
+    return adminDb.begin(async (transaction) => {
+      await transaction.unsafe("set local role authenticated");
+      await transaction`
+        select set_config('request.jwt.claim.sub', ${authUserId}, true)
+      `;
+      const [counts] = await transaction<{
+        targets: number;
+        mappings: number;
+        alerts: number;
+      }[]>`
+        select
+          (select count(*)::integer from public.sheet_targets) as targets,
+          (select count(*)::integer from public.sheet_layout_mappings) as mappings,
+          (select count(*)::integer from public.system_alerts) as alerts
+      `;
+      if (!counts) throw new Error("sheet counts are missing");
+      return counts;
+    });
+  }
+
+  it.each([testUsers.admin, testUsers.head])(
+    "$role reads publication configuration and alerts",
+    async (user) => {
+      await seedTarget();
+      await expect(visibleSheetCounts(user.authUserId)).resolves.toEqual({
+        targets: 1,
+        mappings: 1,
+        alerts: 1,
+      });
+    },
+  );
+
+  it("hides publication configuration and alerts from a manager", async () => {
+    await seedTarget();
+    await expect(visibleSheetCounts(testUsers.managerOne.authUserId)).resolves.toEqual({
+      targets: 0,
+      mappings: 0,
+      alerts: 0,
+    });
+  });
+
+  it("keeps the protected original spreadsheet unusable as a target", async () => {
+    await expect(adminDb`
+      insert into public.sheet_targets (spreadsheet_id, expected_title)
+      values ('123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks', 'Оригинал')
+    `).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("keeps both external switches disabled", async () => {
+    const rows = await adminDb<{ key: string; enabled: boolean }[]>`
+      select key, enabled from public.system_controls
+      where key in ('sync_enabled', 'sheet_publish_enabled')
+      order by key
+    `;
+    expect(rows).toEqual([
+      { key: "sheet_publish_enabled", enabled: false },
+      { key: "sync_enabled", enabled: false },
+    ]);
   });
 });

@@ -114,6 +114,41 @@ export {
   type RawLeadSnapshot,
 } from "./normalize-run.js";
 export {
+  PROTECTED_SPREADSHEET_ID,
+  activateSheetTarget,
+  createSheetTarget,
+  finishSheetPublication,
+  getActiveSheetTarget,
+  getSuccessfulPublication,
+  listSheetLayoutMappings,
+  listSheetPublications,
+  markSheetTargetValidated,
+  replaceSheetLayoutMappings,
+  startSheetPublication,
+  type CreateSheetTargetInput,
+  type FinishPublicationInput,
+  type PublicationStatus,
+  type ReplaceLayoutMappingInput,
+  type SheetLayoutMapping,
+  type SheetPublication,
+  type SheetReportKind,
+  type SheetTarget,
+  type SheetTargetStatus,
+  type SheetValueType,
+  type StartPublicationInput,
+} from "./sheets.js";
+export {
+  acknowledgeAlert,
+  countOpenAlerts,
+  listAlerts,
+  raiseAlert,
+  resolveAlert,
+  type AlertSeverity,
+  type AlertStatus,
+  type RaiseAlertInput,
+  type SystemAlert,
+} from "./alerts.js";
+export {
   withCurrentSnapshot,
   type SnapshotMeta,
 } from "./dashboard/with-snapshot.js";
