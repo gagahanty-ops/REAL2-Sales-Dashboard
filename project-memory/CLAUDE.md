@@ -1,40 +1,58 @@
-# REAL2 Project Memory Vault Instructions
+# Инструкция по работе с памятью проекта REAL2
 
-This folder is the long-term project memory for REAL2 Sales Dashboard.
+Эта папка — долговременная память проекта REAL2 Sales Dashboard. Она лежит внутри рабочего репозитория, поэтому код и память всегда передаются вместе.
 
-## On session start
+Репозиторий публичный. Всё, что записано здесь, становится общедоступным: секреты, токены, значения переменных окружения, персональные данные клиентов и содержимое `.env` сюда не попадают никогда.
 
-Read:
+## В начале сессии
+
+Прочитай по порядку:
 
 1. `00-home/index.md`
 2. `00-home/текущие приоритеты и точка продолжения.md`
 3. `00-home/как продолжить проект новому агенту.md`
 
-If the task touches code, also read:
+Если задача касается кода, дополнительно открой в живом репозитории (не в копии):
 
-- `raw-context/project-docs/SPEC.md`
-- `raw-context/project-docs/METRICS_CATALOG.md`
-- `raw-context/project-docs/SECURITY_READ_ONLY.md`
-- the active plan in `raw-context/project-docs/docs/superpowers/plans/`
-- the relevant SDD ledger/report in `raw-context/sdd/`
+- `SPEC.md`
+- `METRICS_CATALOG.md`
+- `SECURITY_READ_ONLY.md`
+- активный план в `docs/superpowers/plans/`
+- соответствующий журнал и отчёт в `project-memory/raw-context/sdd/`
 
-## Non-negotiable constraints
+Копии в `raw-context/` — это слепок на момент снятия. При расхождении истина всегда в живых файлах репозитория.
 
-- Use external amoCRM OAuth only.
-- Never use a private amoCRM integration.
-- Never modify amoCRM business data.
-- Never write to source Google Sheet `123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks`.
-- Do not put secrets, tokens, OAuth codes, private keys, `.env` values, or personal client data into this vault.
-- Treat `raw-context/` as copied evidence; if the live repo changed, verify against `/Users/arlandorizzi/Desktop/REAL2-Sales-Dashboard`.
+## Запреты, которые не обсуждаются
 
-## On session finish
+- Интеграция с amoCRM только внешняя OAuth. Приватная интеграция запрещена.
+- Бизнес-данные amoCRM не изменяются. Разрешён только метод чтения; единственное исключение — обмен кода на токен.
+- Исходная Google-таблица `123QVhKGG3Y6ZlyHYnuKG_1BPhS82FcYaqY96nsB7Iks` не получает записи никогда. Публикация возможна только в отдельно созданную копию.
+- Переключатели синхронизации и публикации стартуют выключенными. Код умеет их только выключать. Включает их человек, вручную, двумя независимыми действиями.
+- Ни миграция, ни тест, ни развёртывание, ни агент не включают производственные переключатели.
 
-Create or update a note in `sessions/`.
+## В конце сессии
 
-If a new decision was made, create a note in `knowledge/decisions/`.
+Обязательно:
 
-If a bug/risk/review finding was found or fixed, create a note in `knowledge/debugging/`.
+- заметка в `sessions/` — что делалось, какими файлами, с какими числами проверок и хешами коммитов;
+- обнови `00-home/текущие приоритеты и точка продолжения.md`, если изменилась точка продолжения; убирай устаревшие утверждения, а не дописывай новые рядом с ними.
 
-If a reusable implementation pattern emerged, create a note in `knowledge/patterns/`.
+По ситуации:
 
-Update `00-home/текущие приоритеты и точка продолжения.md` when the next action changes.
+- новое инженерное решение — заметка в `knowledge/decisions/` с причиной и отвергнутыми вариантами;
+- найденная или закрытая ошибка, риск, замечание ревью — заметка в `knowledge/debugging/` с симптомом, истинной причиной и лечением;
+- переиспользуемый приём — заметка в `knowledge/patterns/`.
+
+## Как писать заметки
+
+- По-русски, плотно, без воды и без маркетингового тона.
+- Имя файла — человеческая фраза, а не код или дата.
+- В начале файла YAML-фронтматтер с `tags` и `date`.
+- Связи между заметками — двойными квадратными скобками вокруг имени заметки без расширения. Ставь их щедро.
+- Конкретика вместо общих слов: пути файлов, команды целиком, числа, хеши коммитов.
+- Пиши для агента, который видит проект впервые и должен продолжить работу.
+- Если факт не установлен — так и напиши. Не выдумывай.
+
+## Проверка качества памяти
+
+Память считается годной, если новый агент, прочитав `00-home/index.md` и две заметки, на которые она указывает, сумеет без дополнительных вопросов поднять окружение, прогнать полный гейт и назвать следующий шаг.
